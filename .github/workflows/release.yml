@@ -41,6 +41,11 @@ jobs:
 
       - name: Проверки перед публикацией
         if: steps.meta.outputs.exists == 'false'
+        env:
+          # Список внутренних доменов организации хранится в секретах, а не в коде:
+          # иначе проверяющий файл сам раскрывает то, что ищет.
+          AUDIT_INTERNAL_DOMAINS: ${{ secrets.AUDIT_INTERNAL_DOMAINS }}
+          AUDIT_ALLOW: ${{ secrets.AUDIT_ALLOW }}
         run: |
           bun add -d typescript bun-types
           bunx tsc --noEmit

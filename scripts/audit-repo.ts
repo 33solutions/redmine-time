@@ -46,13 +46,50 @@ const STRONG_RULES = new Set([
   "passport",
 ]);
 
-/** Внутренняя инфраструктура компании не должна упоминаться в публичном репозитории. */
-const INTERNAL_PATTERNS: { pattern: RegExp; title: string }[] = [
-  { pattern: /redmine\.33solutions\.(?:ru|company)/gi, title: "внутренний адрес Redmine" },
-  { pattern: /\b33solutions\.(?:ru|company)\b/gi, title: "внутренний домен компании" },
-];
-/** Ссылка на сам репозиторий — не утечка. */
-const INTERNAL_ALLOW = /github\.com\/33solutions\//i;
+/**
+ * Внутренняя инфраструктура не должна упоминаться в публичном репозитории.
+ * Сами адреса в коде не хранятся — иначе проверяющий файл сам становится утечкой.
+ * Источник списка: переменная AUDIT_INTERNAL_DOMAINS (через запятую) или
+ * ~/.redmine/config.json → { "audit": { "internalDomains": [...], "allow": [...] } }.
+ */
+type AuditConfig = { internalDomains?: string[]; allow?: string[] };
+
+async function readAuditConfig(): Promise<AuditConfig> {
+  const fromEnv = (name: string): string[] =>
+    (process.env[name] ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+  const envDomains = fromEnv("AUDIT_INTERNAL_DOMAINS");
+  const envAllow = fromEnv("AUDIT_ALLOW");
+  if (envDomains.length > 0 || envAllow.length > 0) {
+    return { internalDomains: envDomains, allow: envAllow };
+  }
+
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? ".";
+  const file = Bun.file(`${home}/.redmine/config.json`);
+  if (!(await file.exists())) return {};
+  const raw: unknown = await file.json().catch(() => ({}));
+  if (typeof raw !== "object" || raw === null) return {};
+  const audit = (raw as Record<string, unknown>).audit;
+  if (typeof audit !== "object" || audit === null) return {};
+  const a = audit as Record<string, unknown>;
+  return {
+    internalDomains: Array.isArray(a.internalDomains) ? a.internalDomains.map(String) : undefined,
+    allow: Array.isArray(a.allow) ? a.allow.map(String) : undefined,
+  };
+}
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const auditConfig = await readAuditConfig();
+const INTERNAL_PATTERNS: { pattern: RegExp; title: string }[] = (auditConfig.internalDomains ?? []).map((domain) => ({
+  pattern: new RegExp(`(?:[\\w-]+\\.)*${escapeRegExp(domain)}\\b`, "gi"),
+  title: "внутренний адрес организации",
+}));
+/** Контексты, в которых совпадение допустимо (например, адрес самого репозитория). */
+const INTERNAL_ALLOW = (auditConfig.allow ?? []).map((source) => new RegExp(source, "i"));
 
 async function sh(command: string[]): Promise<string> {
   const proc = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
@@ -65,9 +102,14 @@ async function sh(command: string[]): Promise<string> {
   return out;
 }
 
+/** Файлы без расширения (VERSION, LICENSE) — тоже текст и тоже проверяются. */
+const TEXT_NAMES = new Set(["version", "license", "changelog", "readme", "dockerfile", "makefile"]);
+
 function isTextFile(path: string): boolean {
-  const ext = path.includes(".") ? path.slice(path.lastIndexOf(".") + 1).toLowerCase() : path.replace(/^\./, "");
-  return TEXT_EXTENSIONS.has(ext);
+  const name = path.split("/").pop() ?? path;
+  if (!name.includes(".")) return TEXT_NAMES.has(name.toLowerCase());
+  const ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+  return TEXT_EXTENSIONS.has(ext) || TEXT_NAMES.has(name.toLowerCase());
 }
 
 type Problem = { file: string; line: number | null; title: string; detail: string };
@@ -112,7 +154,7 @@ for (const file of files) {
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
       const around = text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 20);
-      if (INTERNAL_ALLOW.test(around)) continue;
+      if (INTERNAL_ALLOW.some((re) => re.test(around))) continue;
       const line = text.slice(0, m.index).split("\n").length;
       problems.push({ file, line, title, detail: m[0] });
     }
@@ -163,7 +205,7 @@ if (process.argv.includes("--history")) {
       let m: RegExpExecArray | null;
       while ((m = re.exec(text)) !== null) {
         const around = text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 20);
-        if (INTERNAL_ALLOW.test(around)) continue;
+        if (INTERNAL_ALLOW.some((re) => re.test(around))) continue;
         const line = text.slice(0, m.index).split("\n").length;
         problems.push({ file: `история ${where}`, line, title, detail: m[0] });
       }
@@ -184,6 +226,12 @@ if (process.argv.includes("--history")) {
 
 // ── итог ──────────────────────────────────────────────────────────────
 console.log(`Файлов под контролем версий: ${files.length}, просмотрено как текст: ${scanned}`);
+if (INTERNAL_PATTERNS.length === 0) {
+  console.log("  список внутренних доменов не задан — проверяются только секреты по форме.");
+  console.log("  Задайте AUDIT_INTERNAL_DOMAINS или audit.internalDomains в ~/.redmine/config.json.");
+} else {
+  console.log(`  внутренних доменов в проверке: ${INTERNAL_PATTERNS.length}`);
+}
 for (const n of notes) console.log(`  ${n}`);
 
 if (problems.length === 0) {
