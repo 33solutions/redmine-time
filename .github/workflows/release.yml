@@ -11,6 +11,12 @@ on:
 permissions:
   contents: write
 
+# Ручной запуск и push одной и той же версии не должны бежать наперегонки:
+# второй иначе падает на уже созданном теге.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     name: Проверить, собрать и опубликовать
@@ -31,7 +37,9 @@ jobs:
           TAG="v${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+          # Смотрим и локально, и на стороне сервера: тег мог появиться параллельным запуском.
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null ||
+             [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "Тег ${TAG} уже существует — релиз пропускается."
           else
