@@ -1249,21 +1249,56 @@ async function cmdClose(rm: Resolved, args: Args): Promise<void> {
 
   if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
 
+  /**
+   * Redmine проверяет все поля задачи, а не только изменяемые. Если категорию или версию
+   * удалили из проекта, задача перестаёт сохраняться целиком — и закрыть её нельзя,
+   * пока битое значение не сброшено.
+   */
+  const STALE_FIELDS: { probe: RegExp; field: string; label: string }[] = [
+    { probe: /категори|category/i, field: "category_id", label: "категория" },
+    { probe: /верси|version/i, field: "fixed_version_id", label: "версия" },
+  ];
+
   const closed: number[] = [];
+  const cleared: { id: number; fields: string[] }[] = [];
   const failed: { id: number; error: string }[] = [];
+
   for (const issue of closable) {
+    const payload: Record<string, unknown> = { status_id: status.id, notes: note };
     try {
-      await request(rm, "PUT", `issues/${issue.id}.json`, undefined, {
-        issue: { status_id: status.id, notes: note },
-      });
+      await request(rm, "PUT", `issues/${issue.id}.json`, undefined, { issue: payload });
       closed.push(issue.id);
+      continue;
     } catch (e) {
-      failed.push({ id: issue.id, error: e instanceof Error ? e.message : String(e) });
+      const message = e instanceof Error ? e.message : String(e);
+      const broken = STALE_FIELDS.filter((f) => f.probe.test(message));
+      if (broken.length === 0 || !bool(args, "clear-invalid")) {
+        failed.push({
+          id: issue.id,
+          error:
+            broken.length > 0
+              ? `${message}\n      поле «${broken.map((b) => b.label).join(", ")}» ссылается на значение, ` +
+                `удалённое из проекта; сбросить его при закрытии — флаг --clear-invalid`
+              : message,
+        });
+        continue;
+      }
+      for (const f of broken) payload[f.field] = "";
+      try {
+        await request(rm, "PUT", `issues/${issue.id}.json`, undefined, { issue: payload });
+        closed.push(issue.id);
+        cleared.push({ id: issue.id, fields: broken.map((b) => b.label) });
+      } catch (retry) {
+        failed.push({ id: issue.id, error: retry instanceof Error ? retry.message : String(retry) });
+      }
     }
   }
 
-  emit({ closed, failed, locked: locked.map((i) => i.id), missing }, () =>
+  emit({ closed, cleared, failed, locked: locked.map((i) => i.id), missing }, () =>
     `Закрыто: ${closed.length} из ${ids.length} (${closed.map((id) => `#${id}`).join(", ") || "—"})` +
+      (cleared.length
+        ? `\nСброшены недействительные поля: ${cleared.map((c) => `#${c.id} (${c.fields.join(", ")})`).join(", ")}`
+        : "") +
       (locked.length ? `\nПропущено в закрытых проектах: ${locked.map((i) => `#${i.id}`).join(", ")}` : "") +
       (missing.length ? `\nНе найдены: ${missing.map((id) => `#${id}`).join(", ")}` : "") +
       (failed.length ? `\nОшибки:\n${failed.map((f) => `  #${f.id}: ${f.error}`).join("\n")}` : ""),
