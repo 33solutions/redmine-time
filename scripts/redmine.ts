@@ -340,6 +340,21 @@ type ProjectRef = {
   parent?: { id: number; name: string };
   trackers?: IdName[];
   enabled_modules?: IdName[];
+  custom_fields?: CustomFieldValue[];
+};
+
+/** Значение пользовательского поля так, как его отдаёт Redmine в карточке объекта. */
+type CustomFieldValue = { id: number; name: string; value: unknown };
+
+/** Описание пользовательского поля из справочника: доступно только администратору. */
+type CustomFieldDef = {
+  id: number;
+  name: string;
+  customized_type?: string;
+  field_format?: string;
+  is_required?: boolean;
+  multiple?: boolean;
+  possible_values?: (string | { value: string; label?: string })[];
 };
 
 type CurrentUser = {
@@ -555,7 +570,12 @@ export function slugIdentifier(name: string): string {
     .replace(/-+$/, "");
 }
 
-/** Что не так с идентификатором, или null — если он годится. */
+/**
+ * Что не так с идентификатором, или null — если он годится.
+ * Правило ровно то же, что у самого Redmine: строчная латиница, цифры, дефис и подчёркивание,
+ * не длиннее 100 символов, и запрещён только идентификатор из одних цифр — он неотличим от id
+ * проекта в адресе. Цифра в начале при этом допустима: «33 Решения» → `33-resheniya`.
+ */
 export function identifierProblem(identifier: string): string | null {
   if (identifier.length === 0) return "он пустой";
   if (identifier.length > 100) return `в нём ${identifier.length} символов, допустимо не больше 100`;
@@ -564,7 +584,9 @@ export function identifierProblem(identifier: string): string | null {
     const shown = bad.map((c) => (c === " " ? "пробел" : `«${c}»`)).join(", ");
     return `недопустимые символы: ${shown} — разрешены строчные латинские буквы, цифры, дефис и подчёркивание`;
   }
-  if (!/^[a-z]/.test(identifier)) return "он должен начинаться со строчной латинской буквы";
+  if (/^\d+$/.test(identifier)) {
+    return "он состоит из одних цифр — Redmine такой не принимает, потому что не отличит его от номера проекта в адресе";
+  }
   return null;
 }
 
@@ -683,6 +705,210 @@ function resolveModules(available: string[], names: string[]): string[] {
   return picked;
 }
 
+// ─────────────────── пользовательские поля проектов ───────────────────
+
+/**
+ * Что скилл знает о пользовательском поле проекта — и откуда узнал.
+ * Справочник `custom_fields.json` открыт только администратору, поэтому имена и номера полей
+ * собираются ещё и из карточек видимых проектов: без этого `--field` был бы бесполезен
+ * на инстансе, где ключ выдан обычному пользователю.
+ */
+export type ProjectField = {
+  id: number;
+  name: string;
+  /** Формат поля из справочника: list, bool, string, … — пусто, если справочник закрыт. */
+  format?: string;
+  /** Обязательность известна только из справочника. */
+  required?: boolean;
+  multiple?: boolean;
+  /** Допустимые значения списка; пусто — набор неизвестен. */
+  allowed: string[];
+  /** Значения, встреченные в видимых проектах: подсказка, когда справочник закрыт. */
+  seen: string[];
+};
+
+type ProjectFieldsInfo = {
+  fields: ProjectField[];
+  /** Справочник не отдан: прав администратора нет, полнота набора не гарантируется. */
+  adminDenied: boolean;
+};
+
+function customFieldValues(value: unknown): string[] {
+  if (typeof value === "string") return value.trim() ? [value.trim()] : [];
+  if (typeof value === "number" || typeof value === "boolean") return [String(value)];
+  if (Array.isArray(value)) return value.flatMap((v) => customFieldValues(v));
+  return [];
+}
+
+async function projectFields(rm: Resolved): Promise<ProjectFieldsInfo> {
+  const reference = await cached(rm, "project-custom-fields", async () => {
+    try {
+      const r = await request<{ custom_fields: CustomFieldDef[] }>(rm, "GET", "custom_fields.json");
+      const defs = (r.custom_fields ?? []).filter((f) => (f.customized_type ?? "project") === "project");
+      return { denied: false, defs };
+    } catch (error) {
+      // 403 — ключ не администраторский; 404 — эндпоинта нет (Redmine старше 4.1) или закрыт прокси.
+      if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
+        return { denied: true, defs: [] as CustomFieldDef[] };
+      }
+      throw error;
+    }
+  });
+
+  const observed = new Map<number, { name: string; values: Set<string> }>();
+  for (const p of await projects(rm)) {
+    for (const f of p.custom_fields ?? []) {
+      const slot = observed.get(f.id) ?? { name: f.name, values: new Set<string>() };
+      for (const v of customFieldValues(f.value)) slot.values.add(v);
+      observed.set(f.id, slot);
+    }
+  }
+
+  const fields = new Map<number, ProjectField>();
+  for (const def of reference.defs) {
+    fields.set(def.id, {
+      id: def.id,
+      name: def.name,
+      format: def.field_format,
+      required: def.is_required === true,
+      multiple: def.multiple === true,
+      allowed: (def.possible_values ?? []).map((v) => (typeof v === "string" ? v : v.value)),
+      seen: [],
+    });
+  }
+  for (const [id, slot] of observed) {
+    const known = fields.get(id);
+    const seen = [...slot.values].sort((a, b) => a.localeCompare(b, "ru"));
+    if (known) known.seen = seen;
+    else fields.set(id, { id, name: slot.name, allowed: [], seen });
+  }
+  return { fields: [...fields.values()].sort((a, b) => a.id - b.id), adminDenied: reference.denied };
+}
+
+/** Разбор одного `--field "имя=значение"`. Значение может содержать запятые и знаки «=». */
+export function parseFieldSpec(raw: string): { key: string; value: string } {
+  const eq = raw.indexOf("=");
+  if (eq === -1) {
+    throw new UserError(`Флаг --field ожидает «имя=значение», получено "${raw}". Пример: --field "Статус=Проект".`);
+  }
+  const key = raw.slice(0, eq).trim();
+  if (!key) throw new UserError(`В «--field ${raw}» не указано имя поля.`);
+  return { key, value: raw.slice(eq + 1).trim() };
+}
+
+export type FieldAssignment = { id: number; name: string; value: string; note: string };
+
+const BOOL_TRUE = ["1", "да", "true", "yes", "истина", "включено"];
+const BOOL_FALSE = ["0", "нет", "false", "no", "ложь", "выключено"];
+
+/**
+ * Имя поля превращается в номер до отправки: Redmine на неизвестное имя ответит 422 без
+ * пояснения, а на неизвестный номер — молча проигнорирует значение.
+ */
+export function assignProjectFields(
+  known: ProjectField[],
+  specs: { key: string; value: string }[],
+): FieldAssignment[] {
+  const out: FieldAssignment[] = [];
+  const catalogue = known.map((f) => `«${f.name}» (id=${f.id})`).join(", ");
+
+  for (const { key, value } of specs) {
+    let field: ProjectField | undefined;
+    if (/^\d+$/.test(key)) {
+      field = known.find((f) => f.id === Number(key));
+      if (!field && known.length > 0) {
+        throw new UserError(
+          `Пользовательского поля проекта с номером ${key} на этом инстансе нет.\n` +
+            `  Известные поля: ${catalogue}. Полный список — redmine.ts project-fields.`,
+        );
+      }
+      if (!field) {
+        out.push({ id: Number(key), name: `поле #${key}`, value, note: "номер задан вручную, имя неизвестно" });
+        continue;
+      }
+    } else {
+      const low = key.toLowerCase();
+      field = known.find((f) => f.name.toLowerCase() === low);
+      if (!field) {
+        const partial = known.filter((f) => f.name.toLowerCase().includes(low));
+        if (partial.length === 1) field = partial[0];
+        else if (partial.length > 1) {
+          throw new UserError(
+            `Поле "${key}" неоднозначно: ${partial.map((f) => `«${f.name}»`).join(", ")}. Назовите его полностью или номером.`,
+          );
+        }
+      }
+      if (!field) {
+        throw new UserError(
+          known.length > 0
+            ? `Пользовательского поля проекта "${key}" на этом инстансе нет.\n` +
+              `  Доступно: ${catalogue}. Подробности — redmine.ts project-fields.`
+            : `Пользовательские поля проектов на этом инстансе не видны, поэтому имя "${key}" распознать нечем.\n` +
+              `  Если поле существует, задайте его номером: --field "12=${value || "значение"}".\n` +
+              `  Номер видно в адресе поля в интерфейсе: «Администрирование → Поля → нужное поле».`,
+        );
+      }
+    }
+
+    let normalized = value;
+    let note = "";
+    if (field.format === "bool") {
+      const low = value.toLowerCase();
+      if (BOOL_TRUE.includes(low)) normalized = "1";
+      else if (BOOL_FALSE.includes(low)) normalized = "0";
+      else throw new UserError(`Поле «${field.name}» логическое: допустимо «да» или «нет», получено "${value}".`);
+      note = normalized === "1" ? "да" : "нет";
+    } else if (field.allowed.length > 0 && value !== "") {
+      const hit = field.allowed.find((v) => v.toLowerCase() === value.toLowerCase());
+      if (!hit) {
+        throw new UserError(
+          `Значение "${value}" не подходит полю «${field.name}»: это список.\n` +
+            `  Допустимые значения: ${field.allowed.join(", ")}.`,
+        );
+      }
+      normalized = hit;
+    } else if (field.allowed.length === 0 && field.seen.length > 0 && value !== "") {
+      const seen = field.seen.some((v) => v.toLowerCase() === value.toLowerCase());
+      note = seen ? "" : `значение не встречалось в видимых проектах (встречались: ${field.seen.join(", ")})`;
+    }
+    if (value === "") note = note || "значение пустое — поле будет очищено";
+
+    out.push({ id: field.id, name: field.name, value: normalized, note });
+  }
+  return out;
+}
+
+/** Читает повторяемый `--field` и сразу разворачивает имена в номера. */
+async function fieldAssignments(rm: Resolved, args: Args): Promise<{ list: FieldAssignment[]; info: ProjectFieldsInfo }> {
+  // values() режет значения по запятым, а значение поля запятую содержать может — берём сырые.
+  const raw = (args.repeated.get("field") ?? []).map((v) => v.trim()).filter((v) => v.length > 0);
+  const info = await projectFields(rm);
+  if (raw.length === 0) return { list: [], info };
+  return { list: assignProjectFields(info.fields, raw.map(parseFieldSpec)), info };
+}
+
+/**
+ * 422 «поле не может быть пустым» — самая частая причина отказа на инстансе с обязательными
+ * полями проекта. Разворачиваем её в подсказку: какое поле и чем его заполнить.
+ */
+function explainRequiredFields(details: string[], info: ProjectFieldsInfo): string | null {
+  const flat = details.join("; ").toLowerCase();
+  const named = info.fields.filter((f) => flat.includes(f.name.toLowerCase()));
+  const candidates = named.length > 0 ? named : info.fields.filter((f) => f.required === true);
+  if (candidates.length === 0) return null;
+  return candidates
+    .map((f) => {
+      const allowed = f.allowed.length > 0 ? f.allowed : f.seen;
+      return (
+        `  Поле «${f.name}» (id=${f.id}) обязательно на этом инстансе. Задайте его: --field "${f.name}=<значение>"` +
+        (allowed.length > 0
+          ? `\n    ${f.allowed.length > 0 ? "Допустимые значения" : "Значения из других проектов"}: ${allowed.join(", ")}`
+          : "")
+      );
+    })
+    .join("\n");
+}
+
 /**
  * Отказ Redmine по проекту почти всегда про права владельца ключа, а не про запрос.
  * Голый «403» читателю ничего не объясняет, поэтому называем недостающее разрешение.
@@ -691,9 +917,14 @@ async function withProjectRights<T>(
   what: "create" | "update" | "archive",
   context: string,
   fn: () => Promise<T>,
-  /** Известно ли, что проект существует: от этого зависит, чем на самом деле был 404. */
-  projectExists = false,
+  options: {
+    /** Известно ли, что проект существует: от этого зависит, чем на самом деле был 404. */
+    projectExists?: boolean;
+    /** Чем объяснить 422: обязательные пользовательские поля инстанса. */
+    fields?: ProjectFieldsInfo;
+  } = {},
 ): Promise<T> {
+  const projectExists = options.projectExists === true;
   try {
     return await fn();
   } catch (error) {
@@ -720,9 +951,13 @@ async function withProjectRights<T>(
       throw new UserError(reason[what]);
     }
     if (error.status === 422) {
+      const required = options.fields ? explainRequiredFields(error.details, options.fields) : null;
       throw new UserError(
         `Redmine отклонил данные проекта: ${error.details.join("; ") || "без пояснения"}.\n` +
-          `  Проверьте идентификатор (должен быть свободен), родителя и обязательные поля проекта на этом инстансе.`,
+          (required
+            ? `${required}\n  Весь список полей инстанса — redmine.ts project-fields.`
+            : `  Проверьте идентификатор (должен быть свободен), родителя и обязательные поля проекта на этом инстансе:\n` +
+              `  redmine.ts project-fields.`),
       );
     }
     if (error.status === 404 && what === "archive") {
@@ -1136,6 +1371,48 @@ async function cmdProjects(rm: Resolved, args: Args): Promise<void> {
   );
 }
 
+async function cmdProjectFields(rm: Resolved, _args: Args): Promise<void> {
+  const info = await projectFields(rm);
+  const denied =
+    `Справочник полей (custom_fields.json) отдаётся только администратору Redmine — этому ключу отказано.\n` +
+    `  Показано то, что видно по карточкам проектов: номер, имя и значения, которые уже используются.\n` +
+    `  Тип поля, обязательность и полный список допустимых значений так не узнать — возьмите их\n` +
+    `  из формы создания проекта в интерфейсе («Проекты → Новый проект») или спросите администратора.`;
+
+  emit(info, () => {
+    if (info.fields.length === 0) {
+      return info.adminDenied
+        ? `Пользовательских полей у проектов на инстансе ${rm.name} не видно: в карточках проектов их нет,\n` +
+          `  а справочник (custom_fields.json) отдаётся только администратору — этому ключу отказано.\n` +
+          `  Если поле всё же есть, возьмите его номер и значения из формы создания проекта в интерфейсе\n` +
+          `  («Проекты → Новый проект») и задайте номером: --field "12=значение".`
+        : `У проектов на инстансе ${rm.name} пользовательских полей нет.`;
+    }
+    const rows = info.fields.map((f) => [
+      String(f.id),
+      f.name,
+      f.format ?? "неизвестен",
+      f.required === undefined ? "?" : f.required ? "да" : "нет",
+      f.allowed.length > 0
+        ? f.allowed.join(", ")
+        : f.seen.length > 0
+          ? `встречались: ${f.seen.join(", ")}`
+          : "—",
+    ]);
+    // Для примера берём поле с понятным значением: «Статус=Контроль» читается, «…=0» — нет.
+    const example =
+      info.fields.find((f) => f.allowed.length > 0) ?? info.fields.find((f) => f.seen.some((v) => /\p{L}/u.test(v))) ?? info.fields[0]!;
+    const value = example.allowed[0] ?? example.seen.find((v) => /\p{L}/u.test(v)) ?? example.seen[0] ?? "значение";
+    return (
+      `ПОЛЬЗОВАТЕЛЬСКИЕ ПОЛЯ ПРОЕКТОВ · инстанс ${rm.name}\n` +
+      table([["ID", "ПОЛЕ", "ТИП", "ОБЯЗАТ.", "ЗНАЧЕНИЯ"], ...rows]) +
+      `\n\nЗадать при создании или правке: --field "${example.name}=${value}" (флаг повторяется; ` +
+      `вместо имени допустим номер: --field "${example.id}=${value}").` +
+      (info.adminDenied ? `\n\n${denied}` : "")
+    );
+  });
+}
+
 /** Состав проекта одинаково нужен и предпросмотру создания, и предпросмотру правки. */
 function describeAccess(isPublic: boolean): string {
   return isPublic ? "публичный (виден всем, у кого есть учётная запись)" : "закрытый (только участники проекта)";
@@ -1181,6 +1458,7 @@ async function cmdCreateProject(rm: Resolved, args: Args): Promise<void> {
   const pickedTrackers = trackerNames.length > 0 ? resolveManyByName(await trackers(rm), trackerNames, "Трекеры") : [];
   const moduleNames = values(args, "module");
   const pickedModules = moduleNames.length > 0 ? resolveModules(await instanceModules(rm), moduleNames) : [];
+  const { list: fields, info: fieldsInfo } = await fieldAssignments(rm, args);
 
   checkOutgoing({ "название проекта": name, "описание проекта": description }, args);
 
@@ -1190,6 +1468,7 @@ async function cmdCreateProject(rm: Resolved, args: Args): Promise<void> {
   if (parent && inheritMembers) payload.inherit_members = true;
   if (pickedTrackers.length > 0) payload.tracker_ids = pickedTrackers.map((t) => t.id);
   if (pickedModules.length > 0) payload.enabled_module_names = pickedModules;
+  if (fields.length > 0) payload.custom_fields = fields.map((f) => ({ id: f.id, value: f.value }));
 
   const rows: string[][] = [
     ["Название", name],
@@ -1208,6 +1487,16 @@ async function cmdCreateProject(rm: Resolved, args: Args): Promise<void> {
     ["Модули", pickedModules.length > 0 ? pickedModules.join(", ") : "набор инстанса по умолчанию"],
     ["Адрес", projectUrl(rm, identifier)],
   ];
+  for (const f of fields) {
+    rows.push([`Поле «${f.name}»`, (f.value === "" ? "(пусто)" : f.value) + (f.note ? ` — ${f.note}` : "")]);
+  }
+  const missing = fieldsInfo.fields.filter((f) => f.required === true && !fields.some((a) => a.id === f.id));
+  if (missing.length > 0) {
+    rows.push([
+      "Не заполнено",
+      `обязательные поля инстанса: ${missing.map((f) => `«${f.name}»`).join(", ")} — задайте --field "Имя=значение"`,
+    ]);
+  }
   if (!parent && inheritMembers) rows.push(["Внимание", "--inherit-members без --parent ничего не делает"]);
 
   const preview =
@@ -1219,15 +1508,20 @@ async function cmdCreateProject(rm: Resolved, args: Args): Promise<void> {
     (parent ? `«Создание подпроектов» в проекте «${parent.name}».` : "«Создание проекта».");
   if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
 
-  const created = await withProjectRights("create", `Проект «${name}» не создан.`, async () =>
-    (await request<{ project: ProjectRef }>(rm, "POST", "projects.json", undefined, { project: payload })).project,
+  const created = await withProjectRights(
+    "create",
+    `Проект «${name}» не создан.`,
+    async () =>
+      (await request<{ project: ProjectRef }>(rm, "POST", "projects.json", undefined, { project: payload })).project,
+    { fields: fieldsInfo },
   );
   await cacheDrop(rm, "projects");
   emit(created, () =>
     `Создан проект «${created.name}» (${created.identifier}, id=${created.id})\n${projectUrl(rm, created.identifier)}\n` +
       `Родитель: ${parent ? parent.name : "нет"} | Доступ: ${describeAccess(created.is_public ?? isPublic)}` +
       (pickedTrackers.length > 0 ? ` | Трекеры: ${pickedTrackers.map((t) => t.name).join(", ")}` : "") +
-      (pickedModules.length > 0 ? ` | Модули: ${pickedModules.join(", ")}` : ""),
+      (pickedModules.length > 0 ? ` | Модули: ${pickedModules.join(", ")}` : "") +
+      (fields.length > 0 ? ` | Поля: ${fields.map((f) => `${f.name}=${f.value}`).join(", ")}` : ""),
   );
 }
 
@@ -1283,9 +1577,20 @@ async function cmdUpdateProject(rm: Resolved, args: Args): Promise<void> {
       `${(project.enabled_modules ?? []).map((m) => m.name).join(", ") || "—"} → ${picked.join(", ")}`,
     ]);
   }
+  const { list: fields, info: fieldsInfo } = await fieldAssignments(rm, args);
+  if (fields.length > 0) {
+    patch.custom_fields = fields.map((f) => ({ id: f.id, value: f.value }));
+    const current = new Map((project.custom_fields ?? []).map((f) => [f.id, customFieldValues(f.value).join(", ")]));
+    for (const f of fields) {
+      rows.push([
+        `Поле «${f.name}»`,
+        `${current.get(f.id) || "—"} → ${f.value === "" ? "(пусто)" : f.value}` + (f.note ? ` — ${f.note}` : ""),
+      ]);
+    }
+  }
   if (Object.keys(patch).length === 0) {
     throw new UserError(
-      "Нечего менять: задайте --name / --description(-file) / --parent / --public|--private / --tracker / --module.",
+      "Нечего менять: задайте --name / --description(-file) / --parent / --public|--private / --tracker / --module / --field.",
     );
   }
 
@@ -1303,8 +1608,11 @@ async function cmdUpdateProject(rm: Resolved, args: Args): Promise<void> {
       : "");
   if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
 
-  await withProjectRights("update", `Проект «${project.name}» не изменён.`, () =>
-    request(rm, "PUT", `projects/${project.id}.json`, undefined, { project: patch }),
+  await withProjectRights(
+    "update",
+    `Проект «${project.name}» не изменён.`,
+    () => request(rm, "PUT", `projects/${project.id}.json`, undefined, { project: patch }),
+    { projectExists: true, fields: fieldsInfo },
   );
   await cacheDrop(rm, "projects");
   const after = (await request<{ project: ProjectRef }>(rm, "GET", `projects/${project.id}.json`)).project;
@@ -1364,7 +1672,7 @@ async function cmdArchiveProject(rm: Resolved, args: Args): Promise<void> {
     "archive",
     `Проект ${title} не тронут.`,
     () => request(rm, "PUT", `projects/${key}/${unarchive ? "unarchive" : "archive"}.json`),
-    found !== null,
+    { projectExists: found !== null },
   );
   await cacheDrop(rm, "projects");
   emit({ project: key, archived: !unarchive }, () =>
@@ -1534,6 +1842,17 @@ async function previewIssuePayload(
   if (payload.estimated_hours) rows.push(["Оценка", h(Number(payload.estimated_hours))]);
   if (payload.priority_id) rows.push(["Приоритет", await nameOf(priorities(rm), payload.priority_id)]);
   if (payload.status_id) rows.push(["Статус", await nameOf(statuses(rm), payload.status_id)]);
+
+  // Задача заводится задним числом: сказать про created_on заранее, а не дать обнаружить самому.
+  const today = fmtDate(new Date());
+  const retro = [payload.start_date, payload.due_date].some((d) => typeof d === "string" && d < today);
+  if (retro) {
+    rows.push([
+      "Дата создания",
+      `${today} — created_on через API не задаётся ни при каких флагах. ` +
+        `Реальный период читается по полям начала и срока, датам списаний и тексту задачи.`,
+    ]);
+  }
 
   const head = `${title} · инстанс ${rm.name}\n${table(rows)}`;
   if (!description?.trim()) return head;
@@ -2702,6 +3021,57 @@ async function cmdDue(args: Args): Promise<void> {
 
 // ──────────────────────────── трудозатраты ────────────────────────────
 
+/** Сумма часов по каждому календарному дню: ретроспективу читают по дням, а не по записям. */
+export function dayTotals(entries: { date: string; hours: number }[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const e of entries) out.set(e.date, round2((out.get(e.date) ?? 0) + e.hours));
+  return new Map([...out.entries()].sort((a, b) => a[0].localeCompare(b[0])));
+}
+
+/**
+ * Проверка правдоподобия перед отправкой: день длиннее суток не бывает, будущее не списывают.
+ * Это предупреждение, а не запрет: бывают дежурства и переносы, решает человек.
+ */
+export function loadWarnings(
+  entries: { date: string; hours: number }[],
+  options: { limit?: number; today?: string } = {},
+): string[] {
+  const limit = options.limit ?? 12;
+  const today = options.today ?? fmtDate(new Date());
+  const out: string[] = [];
+  for (const [date, hours] of dayTotals(entries)) {
+    if (hours > limit) {
+      out.push(
+        `${date}: ${h(hours)} за один день — больше ${limit}. ` +
+          `Если это период, а не день, разнесите списание по дням фактической работы.`,
+      );
+    }
+    if (date > today) out.push(`${date}: дата в будущем (сегодня ${today}) — часы списываются задним числом, не вперёд.`);
+  }
+  return out;
+}
+
+/**
+ * Сверка сумм до и после переразноса. Redmine хранит часы с потерей точности — 1,99 возвращается
+ * как 1,98, — поэтому допуск растёт с числом записей, а не сравнивается «в ноль».
+ */
+export function reconcileHours(
+  before: number,
+  after: number,
+  expectedDelta: number,
+  entries: number,
+): { ok: boolean; diff: number; tolerance: number } {
+  const tolerance = round2(0.01 * Math.max(1, entries)) + 1e-9;
+  const diff = round2(after - (before + expectedDelta));
+  return { ok: Math.abs(diff) <= tolerance, diff, tolerance };
+}
+
+/** Сумма всех часов задачи — по всем авторам: для сверки «до» и «после». */
+async function issueHours(rm: Resolved, issueId: number): Promise<number> {
+  const entries = await fetchAll<TimeEntry>(rm, "time_entries.json", "time_entries", { issue_id: issueId }, 500);
+  return round2(entries.reduce((sum, e) => sum + e.hours, 0));
+}
+
 type LogInput = {
   issue?: number;
   project?: string;
@@ -2758,6 +3128,7 @@ async function cmdLog(rm: Resolved, args: Args): Promise<void> {
   const activityName = input.activityId
     ? ((await activities(rm)).find((a) => a.id === input.activityId)?.name ?? String(input.activityId))
     : "по умолчанию";
+  const warnings = loadWarnings([{ date: String(payload.spent_on), hours: Number(payload.hours) }]);
   const preview =
     `СПИСАНИЕ ЧАСОВ · инстанс ${rm.name}\n` +
     table([
@@ -2766,7 +3137,8 @@ async function cmdLog(rm: Resolved, args: Args): Promise<void> {
       ["Часы", h(Number(payload.hours))],
       ["Вид деятельности", activityName],
       ["Комментарий", String(payload.comments || "—")],
-    ]);
+    ]) +
+    (warnings.length > 0 ? `\n\nПРОВЕРКА ПРАВДОПОДОБИЯ:\n${warnings.map((w) => `  ${w}`).join("\n")}` : "");
   if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
 
   const entry = await postEntry(rm, payload);
@@ -2814,6 +3186,8 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
     args,
   );
 
+  const byDay = dayTotals(payloads.map((p) => ({ date: String(p.spent_on), hours: Number(p.hours) })));
+  const warnings = loadWarnings(payloads.map((p) => ({ date: String(p.spent_on), hours: Number(p.hours) })));
   const preview =
     `СПИСАНИЕ ЧАСОВ ПАЧКОЙ · инстанс ${rm.name} · ${payloads.length} записей, итого ${h(total)}\n` +
     table([
@@ -2824,8 +3198,18 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
         h(Number(p.hours)),
         clip(String(p.comments ?? ""), 60),
       ]),
-    ]);
+    ]) +
+    (byDay.size > 1
+      ? `\n\nПО ДНЯМ: ${[...byDay].map(([d, hrs]) => `${d} — ${h(hrs)}`).join(", ")}`
+      : `\n\nВсё списание приходится на один день (${[...byDay.keys()][0] ?? "—"}). ` +
+        `Если работа шла несколько дней, разнесите её по дням: одна запись на период — огрубление.`) +
+    (warnings.length > 0 ? `\n\nПРОВЕРКА ПРАВДОПОДОБИЯ:\n${warnings.map((w) => `  ${w}`).join("\n")}` : "");
   if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  // Сверка «до и после» имеет смысл только по задачам: суммы проекта меняют и чужие записи.
+  const targets = [...new Set(payloads.map((p) => p.issue_id).filter((id): id is number => typeof id === "number"))];
+  const before = new Map<number, number>();
+  for (const id of targets) before.set(id, await issueHours(rm, id));
 
   const created: TimeEntry[] = [];
   const failed: { index: number; error: string }[] = [];
@@ -2836,12 +3220,35 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
       failed.push({ index, error: e instanceof Error ? e.message : String(e) });
     }
   }
-  emit({ created, failed, totalHours: round2(created.reduce((s, e) => s + e.hours, 0)) }, () => {
+  // Сумма по задаче должна сойтись: иначе часть часов легла не туда, и это видно сразу, а не через месяц.
+  const audit: { issue: number; before: number; after: number; expected: number; diff: number; ok: boolean }[] = [];
+  for (const id of targets) {
+    const planned = round2(
+      created.filter((e) => e.issue?.id === id).reduce((sum, e) => sum + e.hours, 0),
+    );
+    const after = await issueHours(rm, id);
+    const wasBefore = before.get(id) ?? 0;
+    const check = reconcileHours(wasBefore, after, planned, created.length);
+    audit.push({ issue: id, before: wasBefore, after, expected: round2(wasBefore + planned), diff: check.diff, ok: check.ok });
+  }
+
+  emit({ created, failed, audit, totalHours: round2(created.reduce((s, e) => s + e.hours, 0)) }, () => {
     const lines = created.map((e) => describeEntry(rm, e));
     if (failed.length) {
       lines.push("", `ОШИБКИ (${failed.length}):`, ...failed.map((f) => `  запись #${f.index}: ${f.error}`));
     }
     lines.push("", `Итого записано: ${h(created.reduce((s, e) => s + e.hours, 0))} в ${created.length} записях.`);
+    if (audit.length > 0) {
+      lines.push(
+        "",
+        "СВЕРКА ПО ЗАДАЧАМ (было → стало):",
+        ...audit.map(
+          (a) =>
+            `  #${a.issue}: ${h(a.before)} → ${h(a.after)} (ожидалось ${h(a.expected)})` +
+            (a.ok ? "" : ` — РАСХОЖДЕНИЕ ${h(a.diff)}, проверьте записи задачи`),
+        ),
+      );
+    }
     return lines.join("\n");
   });
   if (failed.length) process.exitCode = 1;
@@ -2969,6 +3376,137 @@ async function cmdGaps(rm: Resolved, args: Args): Promise<void> {
   );
 }
 
+// ───────────────────── ретроспективное заполнение ─────────────────────
+
+/**
+ * С чего начинается разговор о прошлом: где в проекте дыры. Команда только читает —
+ * задачи без списаний, месяцы без часов, дни с нечеловеческой нагрузкой.
+ */
+async function cmdBackfillCheck(rm: Resolved, args: Args): Promise<void> {
+  const projectArg = str(args, "project") ?? args.positional[0] ?? rm.defaultProject;
+  if (!projectArg) throw new UserError("Нужен --project <identifier|часть названия>.");
+  const project = await findProject(rm, projectArg);
+
+  const issues = await fetchAll<Issue>(
+    rm,
+    "issues.json",
+    "issues",
+    { project_id: project.id, status_id: "*", subproject_id: "!*" },
+    1000,
+  );
+  const explicitRange = str(args, "from") !== undefined || str(args, "to") !== undefined;
+  const period = str(args, "period");
+  const [pFrom, pTo] = period ? parsePeriod(period) : ["", ""];
+  const earliest = issues.map((i) => i.created_on.slice(0, 10)).sort()[0];
+  const today = fmtDate(new Date());
+  const from = str(args, "from") ? parseDate(required(args, "from")) : period ? pFrom : (earliest ?? today);
+  const to = str(args, "to") ? parseDate(required(args, "to")) : period ? pTo : today;
+
+  const entries = await fetchAll<TimeEntry>(
+    rm,
+    "time_entries.json",
+    "time_entries",
+    { project_id: project.id, from, to },
+    2000,
+  );
+
+  const hoursByIssue = new Map<number, number>();
+  for (const e of entries) {
+    if (!e.issue) continue;
+    hoursByIssue.set(e.issue.id, round2((hoursByIssue.get(e.issue.id) ?? 0) + e.hours));
+  }
+  // Задача относится к периоду, если она в нём заведена или в нём же ещё двигалась.
+  const inPeriod = issues.filter((i) => i.created_on.slice(0, 10) <= to && i.updated_on.slice(0, 10) >= from);
+  const silent = inPeriod.filter((i) => !hoursByIssue.has(i.id) && (i.spent_hours ?? 0) === 0);
+
+  const byMonth = new Map<string, number>();
+  for (let d = new Date(`${from}T00:00:00`); fmtDate(d) <= to; d = shiftDays(d, 1)) {
+    byMonth.set(fmtDate(d).slice(0, 7), byMonth.get(fmtDate(d).slice(0, 7)) ?? 0);
+  }
+  for (const e of entries) {
+    const key = e.spent_on.slice(0, 7);
+    if (byMonth.has(key)) byMonth.set(key, round2((byMonth.get(key) ?? 0) + e.hours));
+  }
+  const emptyMonths = [...byMonth].filter(([, hours]) => hours === 0).map(([month]) => month);
+
+  const warnings = loadWarnings(entries.map((e) => ({ date: e.spent_on, hours: e.hours })), { today });
+  const totalHours = round2(entries.reduce((s, e) => s + e.hours, 0));
+  const workedDays = new Set(entries.map((e) => e.spent_on)).size;
+
+  emit(
+    { project: project.identifier, from, to, totalHours, issues: issues.length, silent: silent.map((i) => i.id), emptyMonths, warnings },
+    () =>
+      `ПРОБЕЛЫ ПО ПРОЕКТУ «${project.name}» (${project.identifier}) · инстанс ${rm.name}\n` +
+      table([
+        ["Период", `${from} .. ${to}`],
+        ["Задач в проекте", `${issues.length} всего, из них в периоде ${inPeriod.length} (без подпроектов)`],
+        ["Списано", `${h(totalHours)} в ${entries.length} записях, дней с часами ${workedDays}`],
+        [
+          "Задач без списаний",
+          inPeriod.length === 0
+            ? "в периоде задач нет"
+            : silent.length > 0
+              ? String(silent.length)
+              : "нет — по каждой задаче периода есть часы",
+        ],
+        ["Месяцев без часов", emptyMonths.length > 0 ? emptyMonths.join(", ") : "нет"],
+      ]) +
+      (silent.length > 0
+        ? `\n\nЗАДАЧИ БЕЗ СПИСАНИЙ (${silent.length}, показаны первые 15):\n` +
+          table(
+            silent
+              .slice(0, 15)
+              .map((i) => [`#${i.id}`, i.status.name, (i.start_date ?? i.created_on.slice(0, 10)), clip(i.subject, 60)]),
+          )
+        : "") +
+      (warnings.length > 0 ? `\n\nПОДОЗРИТЕЛЬНАЯ НАГРУЗКА:\n${warnings.map((w) => `  ${w}`).join("\n")}` : "") +
+      `\n\nЧем заполнять: готовые отчёты, история git (redmine.ts harvest), журналы рабочих сессий ` +
+      `(redmine.ts hours-prompt — готовый текст для машины, где шла работа).`,
+  );
+}
+
+/** Путь к файлу навыка рядом со скриптом: скилл ставится в произвольный каталог. */
+function skillFile(relative: string): string {
+  return join(import.meta.dir, "..", relative);
+}
+
+/**
+ * Готовый текст для сбора часов по журналам рабочих сессий. Запускается не здесь, а на машине,
+ * где шла работа, поэтому команда ничего не отправляет — только печатает промпт с методикой.
+ */
+async function cmdHoursPrompt(rm: Resolved, args: Args): Promise<void> {
+  const period = str(args, "period") ?? "последние три месяца";
+  const [from, to] = /\d{4}/.test(period) ? parsePeriod(period) : ["", ""];
+  const threshold = num(args, "threshold") ?? 30;
+  const projectArg = str(args, "project");
+  const project = projectArg ? await findProject(rm, projectArg) : undefined;
+
+  const methodology = await Bun.file(skillFile("references/hours-methodology.md"))
+    .text()
+    .catch(() => "");
+  if (!methodology.trim()) {
+    throw new UserError(
+      "Не найден файл методики references/hours-methodology.md рядом со скриптом — переустановите скилл.",
+    );
+  }
+
+  const window = from && to ? `${from} .. ${to}` : period;
+  const prompt =
+    `Восстанови трудозатраты за период ${window} по журналам рабочих сессий и истории git на этой машине.\n` +
+    (project ? `Работа относится к проекту «${project.name}» (${project.identifier}).\n` : "") +
+    `Порог склейки блока: ${threshold} минут — назови его в каждом отчёте.\n\n` +
+    `Работай строго по методике ниже. Где данных нет — так и пиши «данных нет»; ` +
+    `не подставляй правдоподобные числа вместо измеренных.\n\n` +
+    `${"─".repeat(72)}\n${methodology.trim()}\n${"─".repeat(72)}\n`;
+
+  emit({ period: window, threshold, project: project?.identifier ?? null, prompt }, () =>
+    `ПРОМПТ ДЛЯ СБОРА ЧАСОВ · запускать на машине, где шла работа\n` +
+      `${"═".repeat(72)}\n${prompt}${"═".repeat(72)}\n` +
+      `Что делать дальше: отдать этот текст агенту на той машине, забрать отчёты, ` +
+      `свериться с redmine.ts backfill-check --project <проект> и списать часы пачкой: redmine.ts batch --file entries.json.`,
+  );
+}
+
 async function cmdEdit(rm: Resolved, args: Args): Promise<void> {
   const id = Number(args.positional[0] ?? required(args, "id"));
   if (!Number.isInteger(id)) throw new UserError("Укажите id записи: redmine.ts edit 4567 --hours 3");
@@ -3028,14 +3566,15 @@ update-issue, edit, create-project, update-project, archive-project без --yes
   projects [строка] [--flat]        проекты деревом: родитель → подпроекты (--flat — плоским списком)
 
 Проекты и подпроекты
+  project-fields                    пользовательские поля проектов: номер, тип, обязательность, значения
   create-project --name "..." [--identifier <строка>] [--parent <identifier|id>]
                  [--description "..."|--description-file f] [--public|--private] [--inherit-members]
-                 [--tracker <имя> ...] [--module <имя> ...] [--yes]
+                 [--tracker <имя> ...] [--module <имя> ...] [--field "<имя|id>=<значение>" ...] [--yes]
         идентификатор без --identifier генерируется из названия транслитерацией и проверяется
         на занятость; без --public проект создаётся закрытым
   update-project <identifier|id> [--name "..."] [--description "..."|--description-file f]
                  [--parent <identifier|id>|none] [--public|--private] [--tracker <имя> ...]
-                 [--module <имя> ...] [--yes]
+                 [--module <имя> ...] [--field "<имя|id>=<значение>" ...] [--yes]
   archive-project <identifier|id> --yes | unarchive-project <identifier|id> --yes
         только для администратора Redmine; обычному ключу инстанс ответит отказом
 
@@ -3081,6 +3620,13 @@ update-issue, edit, create-project, update-project, archive-project без --yes
   entries [--period week|last-week|month|last-month|YYYY-MM|A..B] [--from --to]
           [--user me|id|all] [--project X] [--issue N] [--group issue|date|project|activity|user]
   gaps [--period ...] [--target 8] [--weekends]      дни с недобором часов
+
+Ретроспектива: заполнить прошлое
+  backfill-check --project X [--period 2026-07..2026-09|--from --to]
+        пробелы: задачи без списаний, месяцы без часов, дни с нечеловеческой нагрузкой
+  hours-prompt [--period 2026-07..2026-09] [--project X] [--threshold 30|90]
+        готовый промпт для машины, где шла работа: восстановить часы по журналам сессий и git
+        (методика — references/hours-methodology.md; batch разносит результат по дням)
   edit <entryId> [--hours|--date|--comment|--activity|--issue] [--dry-run]
   delete <entryId> --yes
 
@@ -3130,6 +3676,7 @@ async function main(): Promise<void> {
     activities: cmdActivities,
     statuses: cmdStatuses,
     projects: cmdProjects,
+    "project-fields": cmdProjectFields,
     "create-project": cmdCreateProject,
     "update-project": cmdUpdateProject,
     "archive-project": cmdArchiveProject,
@@ -3151,6 +3698,8 @@ async function main(): Promise<void> {
     entries: cmdEntries,
     report: cmdEntries,
     gaps: cmdGaps,
+    "backfill-check": cmdBackfillCheck,
+    "hours-prompt": cmdHoursPrompt,
     edit: cmdEdit,
     delete: cmdDelete,
     "update-issue": cmdUpdateIssue,
