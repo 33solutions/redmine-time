@@ -8,6 +8,7 @@
  */
 
 import { join } from "node:path";
+import { guard, scanText, formatFindings, type Audience, type Finding } from "./guard.ts";
 
 // ─────────────────────────────── конфиг ───────────────────────────────
 
@@ -18,6 +19,8 @@ type Instance = {
   defaultProject?: string;
   dailyTargetHours?: number;
   projectAliases?: Record<string, string>;
+  /** Разметка описаний и комментариев: textile (по умолчанию), markdown или html. */
+  markup?: "textile" | "markdown" | "html";
 };
 
 type ConfigFile = {
@@ -76,6 +79,8 @@ async function readConfigFile(): Promise<ConfigFile | null> {
             Object.entries(value.projectAliases).filter((e): e is [string, string] => typeof e[1] === "string"),
           )
         : undefined,
+      markup:
+        value.markup === "textile" || value.markup === "markdown" || value.markup === "html" ? value.markup : undefined,
     };
   }
   return { default: typeof raw.default === "string" ? raw.default : undefined, instances: parsed };
@@ -267,6 +272,9 @@ type Issue = {
   done_ratio: number;
   estimated_hours?: number | null;
   spent_hours?: number;
+  /** Суммы с учётом подзадач — Redmine считает их сам для родительских задач. */
+  total_estimated_hours?: number | null;
+  total_spent_hours?: number | null;
   start_date?: string | null;
   due_date?: string | null;
   created_on: string;
@@ -610,6 +618,42 @@ function issueUrl(rm: Resolved, id: number): string {
   return `${rm.base}issues/${id}`;
 }
 
+// ───────────────── предотправочная проверка и подтверждение ───────────────
+
+/**
+ * Любой текст, уходящий в Redmine, проходит проверку на компрометацию.
+ * Запрет снимается только явным --override-guard, предупреждения печатаются всегда.
+ */
+function checkOutgoing(fields: Record<string, string | undefined>, args: Args): Finding[] {
+  const audience: Audience = str(args, "audience") === "internal" ? "internal" : "client";
+  const result = guard(fields, { audience });
+  if (result.findings.length === 0) return [];
+
+  if (result.blocked && !bool(args, "override-guard")) {
+    throw new UserError(
+      `Отправка остановлена: в тексте есть то, что наружу уходить не должно.\n${result.report}\n` +
+        `  Исправьте текст. Если находка ложная — повторите с --override-guard.`,
+    );
+  }
+  console.error(
+    (result.blocked ? "ПРОВЕРКА ОБОЙДЕНА (--override-guard):\n" : "Предупреждения проверки:\n") + result.report,
+  );
+  return result.findings;
+}
+
+/**
+ * Запись в Redmine требует явного --yes. Без него команда печатает предпросмотр и выходит:
+ * так инструмент не может отправить ничего, что пользователь не видел.
+ */
+function requireConfirmation(args: Args, preview: string, hint: string): boolean {
+  if (bool(args, "yes") && !bool(args, "dry-run")) return true;
+  const tail = bool(args, "dry-run")
+    ? "Предпросмотр: ничего не отправлено."
+    : `Ничего не отправлено. Показать это пользователю, дождаться согласия и повторить с --yes:\n  ${hint}`;
+  emit({ dryRun: true, preview, command: hint }, () => `${preview}\n\n${tail}`);
+  return false;
+}
+
 const HTML_ENTITIES: Record<string, string> = {
   nbsp: " ",
   amp: "&",
@@ -750,7 +794,10 @@ async function cmdIssue(rm: Resolved, args: Args): Promise<void> {
       `Исполнитель: ${i.assigned_to?.name ?? "—"} | Автор: ${i.author.name} | Готовность: ${i.done_ratio}%`,
       `Оценка: ${i.estimated_hours != null ? h(i.estimated_hours) : "—"} | Списано: ${
         i.spent_hours != null ? h(i.spent_hours) : "—"
-      }`,
+      }` +
+        (i.total_estimated_hours != null && i.total_estimated_hours !== (i.estimated_hours ?? 0)
+          ? ` | С подзадачами: оценка ${h(i.total_estimated_hours)}, списано ${h(i.total_spent_hours ?? 0)}`
+          : ""),
       `Начало: ${i.start_date ?? "—"} | Срок: ${i.due_date ?? "—"}${
         i.due_date ? ` (${daysUntil(i.due_date)} дн.)` : ""
       } | Обновлена: ${i.updated_on}`,
@@ -826,6 +873,43 @@ async function cmdSearch(rm: Resolved, args: Args): Promise<void> {
   );
 }
 
+/** Предпросмотр должен читаться человеком: идентификаторы разворачиваем в названия. */
+async function previewIssuePayload(
+  rm: Resolved,
+  payload: Record<string, unknown>,
+  subject: string,
+  description: string | undefined,
+  title = "НОВАЯ ЗАДАЧА",
+): Promise<string> {
+  const nameOf = async (list: Promise<IdName[]>, id: unknown): Promise<string> =>
+    (await list).find((x) => x.id === Number(id))?.name ?? String(id);
+
+  const rows: string[][] = [
+    ["Проект", String(payload.project_id ?? "—")],
+    ["Тема", subject],
+  ];
+  if (payload.tracker_id) rows.push(["Трекер", await nameOf(trackers(rm), payload.tracker_id)]);
+  if (payload.parent_issue_id) rows.push(["Родительская", `#${payload.parent_issue_id}`]);
+  if (payload.assigned_to_id) {
+    const me = await currentUser(rm);
+    rows.push([
+      "Исполнитель",
+      Number(payload.assigned_to_id) === me.id
+        ? `${me.firstname} ${me.lastname} (вы)`
+        : String(payload.assigned_to_id),
+    ]);
+  }
+  if (payload.start_date) rows.push(["Начало", String(payload.start_date)]);
+  if (payload.due_date) rows.push(["Срок", String(payload.due_date)]);
+  if (payload.estimated_hours) rows.push(["Оценка", h(Number(payload.estimated_hours))]);
+  if (payload.priority_id) rows.push(["Приоритет", await nameOf(priorities(rm), payload.priority_id)]);
+  if (payload.status_id) rows.push(["Статус", await nameOf(statuses(rm), payload.status_id)]);
+
+  const head = `${title} · инстанс ${rm.name}\n${table(rows)}`;
+  if (!description?.trim()) return head;
+  return `${head}\n\nОПИСАНИЕ (как уйдёт в Redmine):\n${"─".repeat(60)}\n${description.trim()}\n${"─".repeat(60)}`;
+}
+
 async function cmdTrackers(rm: Resolved, _args: Args): Promise<void> {
   const [tr, pr] = await Promise.all([trackers(rm), priorities(rm)]);
   emit({ trackers: tr, priorities: pr }, () =>
@@ -868,12 +952,11 @@ async function cmdCreateIssue(rm: Resolved, args: Args): Promise<void> {
   const done = num(args, "done");
   if (done !== undefined) payload.done_ratio = done;
 
-  if (bool(args, "dry-run")) {
-    emit({ dryRun: true, instance: rm.name, issue: payload }, () =>
-      `ПРЕДПРОСМОТР новой задачи (инстанс ${rm.name}, ничего не создано):\n${JSON.stringify(payload, null, 2)}`,
-    );
-    return;
-  }
+  checkOutgoing({ тема: subject, описание: description }, args);
+
+  const preview = await previewIssuePayload(rm, payload, subject, description);
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
   const r = await request<{ issue: Issue }>(rm, "POST", "issues.json", undefined, { issue: payload });
   const i = r.issue;
   emit(i, () =>
@@ -892,24 +975,319 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   if (status) patch.status_id = matchByName(await statuses(rm), status, "Статус").id;
   const done = num(args, "done");
   if (done !== undefined) patch.done_ratio = done;
-  const note = str(args, "note");
+  const noteFile = str(args, "note-file");
+  const note = noteFile ? await Bun.file(noteFile).text() : str(args, "note");
   if (note) patch.notes = note;
+  const descriptionFile = str(args, "description-file");
+  const description = descriptionFile ? await Bun.file(descriptionFile).text() : str(args, "description");
+  if (description) patch.description = description;
+  const subject = str(args, "subject");
+  if (subject) patch.subject = subject;
+  const parent = str(args, "parent");
+  if (parent) patch.parent_issue_id = Number(parent.replace("#", ""));
+  const estimated = str(args, "estimated");
+  if (estimated) patch.estimated_hours = round2(parseHours(estimated));
   const assignee = str(args, "assignee");
   if (assignee) patch.assigned_to_id = assignee === "me" ? (await currentUser(rm)).id : Number(assignee);
   const due = str(args, "due");
   if (due) patch.due_date = parseDate(due);
   if (Object.keys(patch).length === 0) {
-    throw new UserError("Нечего менять: задайте --status/--done/--note/--assignee/--due.");
+    throw new UserError("Нечего менять: задайте --status/--done/--note/--description/--subject/--assignee/--due/--parent/--estimated.");
   }
 
-  if (bool(args, "dry-run")) {
-    emit({ dryRun: true, issue: id, patch }, () => `ПРЕДПРОСМОТР изменения #${id}:\n${JSON.stringify(patch, null, 2)}`);
-    return;
-  }
+  checkOutgoing({ комментарий: note, описание: description, тема: subject }, args);
+
+  const rows = Object.entries(patch)
+    .filter(([k]) => k !== "notes" && k !== "description")
+    .map(([k, v]) => [k, clip(String(v), 70)]);
+  const preview =
+    `ИЗМЕНЕНИЕ #${id} · инстанс ${rm.name}\n${issueUrl(rm, id)}\n` +
+    (rows.length ? table(rows) : "(только текст)") +
+    (description
+      ? `\n\nНОВОЕ ОПИСАНИЕ (заменит текущее целиком):\n${"─".repeat(60)}\n${description.trim()}\n${"─".repeat(60)}`
+      : "") +
+    (note ? `\n\nКОММЕНТАРИЙ:\n${"─".repeat(60)}\n${note.trim()}\n${"─".repeat(60)}` : "");
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
   await request(rm, "PUT", `issues/${id}.json`, undefined, { issue: patch });
   const r = await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`);
   const i = r.issue;
   emit(i, () => `#${i.id} обновлена: статус ${i.status.name}, готовность ${i.done_ratio}%\n${issueUrl(rm, i.id)}`);
+}
+
+// ───────────────────────── дерево задач ───────────────────────────────
+
+type TreeNode = { issue: Issue; children: TreeNode[] };
+
+async function loadTree(rm: Resolved, rootId: number): Promise<TreeNode> {
+  const root = (await request<{ issue: Issue }>(rm, "GET", `issues/${rootId}.json`)).issue;
+  const build = async (node: Issue, depth: number): Promise<TreeNode> => {
+    if (depth > 4) return { issue: node, children: [] };
+    const kids = await fetchAll<Issue>(rm, "issues.json", "issues", { parent_id: node.id, status_id: "*" }, 100);
+    const children = await mapLimit(kids, 4, (k) => build(k, depth + 1));
+    return { issue: node, children };
+  };
+  return build(root, 0);
+}
+
+type TreeTotals = { estimated: number; spent: number; done: number; count: number; closedLike: number };
+
+function sumTree(node: TreeNode): TreeTotals {
+  const self: TreeTotals = {
+    estimated: node.issue.estimated_hours ?? 0,
+    spent: node.issue.spent_hours ?? 0,
+    done: node.issue.done_ratio,
+    count: 1,
+    closedLike: node.issue.done_ratio === 100 ? 1 : 0,
+  };
+  for (const child of node.children) {
+    const sub = sumTree(child);
+    self.estimated += sub.estimated;
+    self.spent += sub.spent;
+    self.count += sub.count;
+    self.closedLike += sub.closedLike;
+  }
+  return self;
+}
+
+/** Взвешенная готовность: по оценкам, а при их отсутствии — по числу подзадач. */
+function weightedDone(node: TreeNode): number {
+  const leaves: Issue[] = [];
+  const walk = (n: TreeNode): void => {
+    if (n.children.length === 0) leaves.push(n.issue);
+    else n.children.forEach(walk);
+  };
+  node.children.forEach(walk);
+  if (leaves.length === 0) return node.issue.done_ratio;
+  const totalWeight = leaves.reduce((s, i) => s + (i.estimated_hours ?? 0), 0);
+  if (totalWeight > 0) {
+    return Math.round(leaves.reduce((s, i) => s + (i.estimated_hours ?? 0) * i.done_ratio, 0) / totalWeight);
+  }
+  return Math.round(leaves.reduce((s, i) => s + i.done_ratio, 0) / leaves.length);
+}
+
+async function cmdTree(rm: Resolved, args: Args): Promise<void> {
+  const raw = args.positional[0] ?? required(args, "issue");
+  const rootId = Number(raw.replace("#", ""));
+  if (!Number.isInteger(rootId)) throw new UserError("Укажите номер задачи: redmine.ts tree 25127");
+  const tree = await loadTree(rm, rootId);
+  const totals = sumTree(tree);
+  const computedDone = weightedDone(tree);
+
+  const rows: string[][] = [];
+  const walk = (node: TreeNode, depth: number): void => {
+    const i = node.issue;
+    rows.push([
+      `${"  ".repeat(depth)}${depth > 0 ? "└ " : ""}#${i.id}`,
+      clip(i.status.name, 14),
+      `${i.done_ratio}%`,
+      i.estimated_hours != null ? h(i.estimated_hours) : "—",
+      i.spent_hours != null ? h(i.spent_hours) : "—",
+      i.due_date ?? "—",
+      clip(i.subject, 52 - depth * 2),
+    ]);
+    node.children
+      .slice()
+      .sort((a, b) => (a.issue.due_date ?? "9999").localeCompare(b.issue.due_date ?? "9999") || a.issue.id - b.issue.id)
+      .forEach((c) => walk(c, depth + 1));
+  };
+  walk(tree, 0);
+
+  emit({ root: rootId, totals: { ...totals, computedDone }, tree }, () => {
+    const root = tree.issue;
+    const overrun = totals.estimated > 0 ? Math.round((totals.spent / totals.estimated) * 100) : null;
+    return (
+      `${table([["ЗАДАЧА", "СТАТУС", "ГОТОВ", "ОЦЕНКА", "СПИСАНО", "СРОК", "ТЕМА"], ...rows])}\n\n` +
+      `Дерево #${root.id}: ${totals.count - 1} подзадач, закрыто по готовности ${totals.closedLike}/${totals.count}.\n` +
+      (root.total_estimated_hours != null
+        ? `По данным Redmine: оценка ${h(root.total_estimated_hours)}, списано ${h(root.total_spent_hours ?? 0)}.\n`
+        : "") +
+      `Оценка ${h(totals.estimated)} · списано ${h(totals.spent)}` +
+      (overrun !== null ? ` (${overrun}% от оценки)` : "") +
+      ` · готовность по весам ${computedDone}%, в карточке родителя ${root.done_ratio}%.\n` +
+      `${issueUrl(rm, root.id)}`
+    );
+  });
+}
+
+type TreePlan = {
+  project?: string;
+  tracker?: string;
+  assignee?: string;
+  parent: {
+    subject: string;
+    description?: string;
+    descriptionFile?: string;
+    tracker?: string;
+    priority?: string;
+    start?: string;
+    due?: string;
+    estimated?: string | number;
+  };
+  children: {
+    subject: string;
+    description?: string;
+    descriptionFile?: string;
+    tracker?: string;
+    priority?: string;
+    assignee?: string;
+    start?: string;
+    due?: string;
+    estimated?: string | number;
+  }[];
+};
+
+async function readPlanText(base: string | undefined, inline: string | undefined, file: string | undefined): Promise<string | undefined> {
+  if (inline !== undefined) return inline;
+  if (file === undefined) return undefined;
+  const path = base && !file.includes(":") && !file.startsWith("/") ? join(base, file) : file;
+  return Bun.file(path).text();
+}
+
+async function cmdCreateTree(rm: Resolved, args: Args): Promise<void> {
+  const file = str(args, "file") ?? args.positional[0];
+  const raw = file ? await Bun.file(file).text() : await new Response(Bun.stdin.stream()).text();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new UserError("Ожидается JSON-план дерева (--file plan.json или stdin). Структура: {project, parent, children[]}.");
+  }
+  if (!isRecord(parsed)) throw new UserError("План должен быть объектом {project, parent, children}.");
+  const plan = parsed as unknown as TreePlan;
+  if (!isRecord(plan.parent) || !Array.isArray(plan.children)) {
+    throw new UserError("В плане нужны поля parent (объект) и children (массив).");
+  }
+  const baseDir = str(args, "base") ?? (file ? file.replace(/[\\/][^\\/]*$/, "") : undefined);
+
+  const project = str(args, "project") ?? plan.project ?? rm.defaultProject;
+  if (!project) throw new UserError("Не задан проект: --project или поле project в плане.");
+  const projectKey = await resolveProjectKey(rm, project);
+  const me = await currentUser(rm);
+
+  const build = async (
+    node: TreePlan["parent"] | TreePlan["children"][number],
+    fallbackTracker: string | undefined,
+  ): Promise<{ payload: Record<string, unknown>; description?: string }> => {
+    const description = await readPlanText(baseDir, node.description, node.descriptionFile);
+    const payload: Record<string, unknown> = { project_id: projectKey, subject: node.subject };
+    if (description) payload.description = description;
+    const trackerName = node.tracker ?? fallbackTracker;
+    if (trackerName) payload.tracker_id = matchByName(await trackers(rm), trackerName, "Трекер").id;
+    if (node.priority) payload.priority_id = matchByName(await priorities(rm), node.priority, "Приоритет").id;
+    const assignee = "assignee" in node ? node.assignee : undefined;
+    const who = assignee ?? plan.assignee;
+    if (who) payload.assigned_to_id = who === "me" ? me.id : Number(who);
+    if (node.start) payload.start_date = parseDate(node.start);
+    if (node.due) payload.due_date = parseDate(node.due);
+    if (node.estimated !== undefined) payload.estimated_hours = round2(parseHours(String(node.estimated)));
+    return { payload, description };
+  };
+
+  const parent = await build(plan.parent, plan.tracker);
+  const children = await mapLimit(plan.children, 1, (c) => build(c, plan.tracker));
+
+  const guardFields: Record<string, string | undefined> = {
+    "тема родителя": plan.parent.subject,
+    "описание родителя": parent.description,
+  };
+  children.forEach((c, i) => {
+    guardFields[`тема подзадачи ${i + 1}`] = plan.children[i]!.subject;
+    guardFields[`описание подзадачи ${i + 1}`] = c.description;
+  });
+  checkOutgoing(guardFields, args);
+
+  const totalEstimate = children.reduce((s, c) => s + Number(c.payload.estimated_hours ?? 0), 0);
+  const parts = [
+    await previewIssuePayload(rm, parent.payload, plan.parent.subject, parent.description, "РОДИТЕЛЬСКАЯ ЗАДАЧА"),
+  ];
+  for (const [i, child] of children.entries()) {
+    parts.push(
+      await previewIssuePayload(
+        rm,
+        child.payload,
+        plan.children[i]!.subject,
+        child.description,
+        `ПОДЗАДАЧА ${i + 1}/${children.length}`,
+      ),
+    );
+  }
+  parts.push(`ИТОГО: 1 родительская + ${children.length} подзадач, суммарная оценка ${h(totalEstimate)}.`);
+  const preview = parts.join("\n\n");
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  const created: Issue[] = [];
+  const parentIssue = (await request<{ issue: Issue }>(rm, "POST", "issues.json", undefined, { issue: parent.payload }))
+    .issue;
+  created.push(parentIssue);
+  const failed: { subject: string; error: string }[] = [];
+  for (const child of children) {
+    try {
+      const issue = (
+        await request<{ issue: Issue }>(rm, "POST", "issues.json", undefined, {
+          issue: { ...child.payload, parent_issue_id: parentIssue.id },
+        })
+      ).issue;
+      created.push(issue);
+    } catch (e) {
+      failed.push({ subject: String(child.payload.subject), error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  emit({ parent: parentIssue, children: created.slice(1), failed }, () => {
+    const lines = [
+      `Создано дерево #${parentIssue.id} — ${parentIssue.subject}`,
+      issueUrl(rm, parentIssue.id),
+      ...created.slice(1).map((i) => `  └ #${i.id} — ${i.subject}`),
+    ];
+    if (failed.length) lines.push("", `ОШИБКИ (${failed.length}):`, ...failed.map((f) => `  ${f.subject}: ${f.error}`));
+    return lines.join("\n");
+  });
+  if (failed.length) process.exitCode = 1;
+}
+
+// ───────────────────── проверка текста и разметка ─────────────────────
+
+async function cmdScan(rm: Resolved | null, args: Args): Promise<void> {
+  const file = str(args, "file");
+  const text = file ? await Bun.file(file).text() : (str(args, "text") ?? args.positional.join(" "));
+  if (!text.trim()) throw new UserError('Нечего проверять: --text "..." или --file <файл>.');
+  const audience: Audience = str(args, "audience") === "internal" ? "internal" : "client";
+  const findings = scanText(text, { audience });
+  const blocked = findings.some((f) => f.severity === "block");
+  emit({ audience, blocked, findings }, () =>
+    findings.length === 0
+      ? `Проверка пройдена (аудитория: ${audience === "client" ? "заказчик" : "внутренняя"}). Отправлять можно.`
+      : `${blocked ? "ОТПРАВЛЯТЬ НЕЛЬЗЯ" : "Замечания"} (аудитория: ${audience === "client" ? "заказчик" : "внутренняя"}):\n` +
+        formatFindings(findings),
+  );
+  if (blocked) process.exitCode = 2;
+}
+
+/** Определяет, какую разметку понимает инстанс: textile или markdown. */
+async function cmdDetectMarkup(rm: Resolved, args: Args): Promise<void> {
+  const project = str(args, "project");
+  const query: Query = { status_id: "*", sort: "updated_on:desc", limit: 50 };
+  if (project) query.project_id = await resolveProjectKey(rm, project);
+  const issues = await fetchAll<Issue>(rm, "issues.json", "issues", query, 50);
+  const texts = await mapLimit(issues.slice(0, 12), 4, async (i) => {
+    const r = await request<{ issue: Issue }>(rm, "GET", `issues/${i.id}.json`);
+    return r.issue.description ?? "";
+  });
+
+  let textile = 0;
+  let markdown = 0;
+  let html = 0;
+  for (const t of texts) {
+    if (/^h[1-6]\.\s/m.test(t) || /(?:^|\s)\*[^*\n]+\*(?:\s|$)/m.test(t) || /%\{color:/.test(t)) textile++;
+    if (/^#{1,6}\s/m.test(t) || /\*\*[^*\n]+\*\*/.test(t) || /^[-*]\s+\S/m.test(t)) markdown++;
+    if (/<(?:p|br|div|strong|ul|li)\b/i.test(t)) html++;
+  }
+  const verdict = html > textile && html >= markdown ? "html" : markdown > textile ? "markdown" : "textile";
+  emit({ instance: rm.name, sampled: texts.length, votes: { textile, markdown, html }, verdict }, () =>
+    `Инстанс ${rm.name}: по ${texts.length} описаниям — textile ${textile}, markdown ${markdown}, html ${html}.\n` +
+      `Вывод: ${verdict}. Пропишите "markup": "${verdict}" в профиль ${CONFIG_PATH}, чтобы не гадать.`,
+  );
 }
 
 async function cmdComment(rm: Resolved, args: Args): Promise<void> {
@@ -921,11 +1299,13 @@ async function cmdComment(rm: Resolved, args: Args): Promise<void> {
   if (!text.trim()) throw new UserError('Нужен текст комментария: --text "..." или --text-file <файл>.');
   const patch: Record<string, unknown> = { notes: text };
   if (bool(args, "private")) patch.private_notes = true;
+  checkOutgoing({ комментарий: text }, args);
 
-  if (bool(args, "dry-run")) {
-    emit({ dryRun: true, issue: id, patch }, () => `ПРЕДПРОСМОТР комментария к #${id}:\n${text}`);
-    return;
-  }
+  const preview =
+    `КОММЕНТАРИЙ К #${id} · инстанс ${rm.name}${patch.private_notes ? " · приватный" : " · видим заказчику"}\n` +
+    `${issueUrl(rm, id)}\n${"─".repeat(60)}\n${text.trim()}\n${"─".repeat(60)}`;
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
   await request(rm, "PUT", `issues/${id}.json`, undefined, { issue: patch });
   emit({ issue: id, added: true }, () => `Комментарий добавлен к #${id}: ${issueUrl(rm, id)}`);
 }
@@ -1266,13 +1646,23 @@ async function cmdLog(rm: Resolved, args: Args): Promise<void> {
     activityId: await resolveActivityId(rm, str(args, "activity")),
   };
   const payload = await buildEntryPayload(rm, input);
+  checkOutgoing({ комментарий: input.comment }, args);
 
-  if (bool(args, "dry-run")) {
-    emit({ dryRun: true, instance: rm.name, time_entry: payload }, () =>
-      `ПРЕДПРОСМОТР (ничего не записано), инстанс ${rm.name}:\n${JSON.stringify(payload, null, 2)}`,
-    );
-    return;
-  }
+  const target = payload.issue_id ? `#${payload.issue_id}` : `проект ${payload.project_id}`;
+  const activityName = input.activityId
+    ? ((await activities(rm)).find((a) => a.id === input.activityId)?.name ?? String(input.activityId))
+    : "по умолчанию";
+  const preview =
+    `СПИСАНИЕ ЧАСОВ · инстанс ${rm.name}\n` +
+    table([
+      ["Дата", String(payload.spent_on)],
+      ["Цель", target],
+      ["Часы", h(Number(payload.hours))],
+      ["Вид деятельности", activityName],
+      ["Комментарий", String(payload.comments || "—")],
+    ]);
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
   const entry = await postEntry(rm, payload);
   emit(entry, () => `Записано: ${describeEntry(rm, entry)}`);
 }
@@ -1313,21 +1703,23 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
   }
 
   const total = payloads.reduce((sum, p) => sum + Number(p.hours), 0);
-  if (bool(args, "dry-run")) {
-    emit({ dryRun: true, instance: rm.name, count: payloads.length, totalHours: round2(total), entries: payloads }, () =>
-      `ПРЕДПРОСМОТР ${payloads.length} записей, итого ${h(total)} — инстанс ${rm.name}, ничего не записано:\n` +
-        table([
-          ["ДАТА", "ЦЕЛЬ", "ЧАСЫ", "КОММЕНТАРИЙ"],
-          ...payloads.map((p) => [
-            String(p.spent_on),
-            p.issue_id ? `#${p.issue_id}` : String(p.project_id),
-            h(Number(p.hours)),
-            clip(String(p.comments ?? ""), 60),
-          ]),
-        ]),
-    );
-    return;
-  }
+  checkOutgoing(
+    Object.fromEntries(payloads.map((p, i) => [`запись ${i + 1}`, String(p.comments ?? "")])),
+    args,
+  );
+
+  const preview =
+    `СПИСАНИЕ ЧАСОВ ПАЧКОЙ · инстанс ${rm.name} · ${payloads.length} записей, итого ${h(total)}\n` +
+    table([
+      ["ДАТА", "ЦЕЛЬ", "ЧАСЫ", "КОММЕНТАРИЙ"],
+      ...payloads.map((p) => [
+        String(p.spent_on),
+        p.issue_id ? `#${p.issue_id}` : String(p.project_id),
+        h(Number(p.hours)),
+        clip(String(p.comments ?? ""), 60),
+      ]),
+    ]);
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
 
   const created: TimeEntry[] = [];
   const failed: { index: number; error: string }[] = [];
@@ -1489,10 +1881,13 @@ async function cmdEdit(rm: Resolved, args: Args): Promise<void> {
     throw new UserError("Нечего менять: задайте --hours/--date/--comment/--activity/--issue.");
   }
 
-  if (bool(args, "dry-run")) {
-    emit({ dryRun: true, id, patch }, () => `ПРЕДПРОСМОТР правки записи ${id}:\n${JSON.stringify(patch, null, 2)}`);
-    return;
-  }
+  checkOutgoing({ комментарий: comment }, args);
+
+  const preview =
+    `ПРАВКА ЗАПИСИ ${id} · инстанс ${rm.name}\n` +
+    table(Object.entries(patch).map(([k, v]) => [k, String(v)]));
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
   await request(rm, "PUT", `time_entries/${id}.json`, undefined, { time_entry: patch });
   const r = await request<{ time_entry: TimeEntry }>(rm, "GET", `time_entries/${id}.json`);
   emit(r.time_entry, () => `Обновлено: ${describeEntry(rm, r.time_entry)}`);
@@ -1513,6 +1908,12 @@ function cmdHelp(): void {
 
 Общие флаги: --instance <имя|хост>  --all-instances (для inbox/due)  --json  --no-cache
 
+ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: команды log, batch, comment, create-issue, create-tree,
+update-issue, edit без --yes печатают полный предпросмотр и ничего не отправляют.
+Любой уходящий текст проверяется на компрометацию (секреты, ПДн, внутренние адреса,
+самооговор). Запрет снимается только флагом --override-guard.
+  scan --text "..."|--file f [--audience client|internal]   проверить текст отдельно
+
 Настройка
   instances                         профили из конфига и их состояние
   whoami                            кто я на этом инстансе
@@ -1532,7 +1933,11 @@ function cmdHelp(): void {
   search "фраза" [--project X]      полнотекстовый поиск
   create-issue --project X --subject "..." [--description "..."|--description-file f]
                [--tracker имя] [--priority имя] [--assignee me] [--start дата] [--due дата]
-               [--estimated 8] [--parent N] [--dry-run]
+               [--estimated 8] [--parent N] [--yes]
+  create-tree --file plan.json [--project X] [--yes]
+               родитель + подзадачи одной операцией; тексты описаний — из descriptionFile
+  tree <id>                         дерево задачи с агрегатами оценок, списаний и готовности
+  detect-markup [--project X]       какая разметка принята на инстансе (textile/markdown/html)
   comment <id> --text "..."|--text-file f [--private] [--dry-run]
   update-issue <id> [--status имя] [--done N] [--note текст] [--assignee me] [--due дата] [--dry-run]
 
@@ -1573,6 +1978,10 @@ async function main(): Promise<void> {
     await cmdDue(args);
     return;
   }
+  if (args.cmd === "scan" || args.cmd === "check") {
+    await cmdScan(null, args);
+    return;
+  }
 
   const rm = await resolveInstance(str(args, "instance"));
   const handlers: Record<string, (rm: Resolved, a: Args) => Promise<void>> = {
@@ -1585,6 +1994,9 @@ async function main(): Promise<void> {
     search: cmdSearch,
     trackers: cmdTrackers,
     "create-issue": cmdCreateIssue,
+    "create-tree": cmdCreateTree,
+    tree: cmdTree,
+    "detect-markup": cmdDetectMarkup,
     comment: cmdComment,
     log: cmdLog,
     batch: cmdBatch,
