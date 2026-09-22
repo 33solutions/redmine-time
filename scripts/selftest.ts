@@ -8,6 +8,7 @@ import { parseHours, parseDate, parsePeriod, plain } from "./redmine.ts";
 import { scanText, guard } from "./guard.ts";
 import { buildSessions, buildGroups, plural, draftDescription, type Commit } from "./harvest.ts";
 import { categorize, monthsSince } from "./redmine.ts";
+import { translit, slugIdentifier, identifierProblem } from "./redmine.ts";
 
 let passed = 0;
 const failures: string[] = [];
@@ -207,6 +208,25 @@ check("категория: новая и свежая", categorize(issue("Нов
 check("категория: в работе на границе", categorize(issue("В работе", "2026-03-20"), NOW, 6), "no-movement");
 check("категория: порог сдвигается", categorize(issue("В работе", "2026-03-20"), NOW, 12), "active");
 check("возраст в месяцах", monthsSince("2026-03-22", NOW), 6);
+
+// ── идентификатор проекта ─────────────────────────────────────────────
+check("транслит: шипящие", translit("Щука, чай и ёж"), "schuka, chay i ezh");
+check("транслит: мягкий и твёрдый знаки исчезают", translit("Объявление"), "obyavlenie");
+check("транслит: латиница не трогается", translit("Eurobrands UNF"), "eurobrands unf");
+
+check("идентификатор: из русского названия", slugIdentifier("Пример: сопровождение УНФ"), "primer-soprovozhdenie-unf");
+check("идентификатор: дефисы не задваиваются", slugIdentifier("Обмен — сайт / 1С"), "obmen-sayt-1s");
+check("идентификатор: края без дефисов", slugIdentifier("  «Вармора»  "), "varmora");
+check("идентификатор: длина обрезается", slugIdentifier("а".repeat(120)).length, 100);
+check("идентификатор: хвостовой дефис после обрезки", slugIdentifier("х".repeat(99) + " слово").endsWith("-"), false);
+
+check("проверка: обычный", identifierProblem("primer-unf_2"), null);
+check("проверка: пустой", identifierProblem("") !== null, true);
+check("проверка: начинается с цифры", identifierProblem("33-resheniya") !== null, true);
+check("проверка: верхний регистр", identifierProblem("Primer") !== null, true);
+check("проверка: пробел", identifierProblem("primer unf") !== null, true);
+check("проверка: кириллица", identifierProblem("проект") !== null, true);
+check("проверка: слишком длинный", identifierProblem("a".repeat(101)) !== null, true);
 
 // ── итог ──────────────────────────────────────────────────────────────
 console.log(`Проверок пройдено: ${passed}`);

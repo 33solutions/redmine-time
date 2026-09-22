@@ -328,9 +328,29 @@ type TimeEntry = {
   updated_on: string;
 };
 
-type ProjectRef = { id: number; name: string; identifier: string; status: number };
+type ProjectRef = {
+  id: number;
+  name: string;
+  identifier: string;
+  status: number;
+  description?: string | null;
+  homepage?: string | null;
+  is_public?: boolean;
+  inherit_members?: boolean;
+  parent?: { id: number; name: string };
+  trackers?: IdName[];
+  enabled_modules?: IdName[];
+};
 
-type CurrentUser = { id: number; login: string; firstname: string; lastname: string; mail?: string };
+type CurrentUser = {
+  id: number;
+  login: string;
+  firstname: string;
+  lastname: string;
+  mail?: string;
+  /** Redmine отдаёт признак администратора только про самого себя — по нему видно, пройдёт ли архивирование. */
+  admin?: boolean;
+};
 
 // ─────────────────────────── кэш и состояние ──────────────────────────
 
@@ -354,6 +374,13 @@ async function cacheGet<T>(key: string): Promise<T | null> {
 async function cacheSet(key: string, data: unknown): Promise<void> {
   if (cacheMemo === null) cacheMemo = {};
   cacheMemo[key] = { at: Date.now(), data };
+  await Bun.write(CACHE_PATH, JSON.stringify(cacheMemo));
+}
+
+/** После создания или правки проекта кэш врёт до конца суток — запись сбрасывается сразу. */
+async function cacheDrop(rm: Resolved, key: string): Promise<void> {
+  if (cacheMemo === null) return;
+  delete cacheMemo[`${rm.name}:${key}`];
   await Bun.write(CACHE_PATH, JSON.stringify(cacheMemo));
 }
 
@@ -397,7 +424,9 @@ async function statuses(rm: Resolved): Promise<StatusRef[]> {
 }
 
 async function projects(rm: Resolved): Promise<ProjectRef[]> {
-  return cached(rm, "projects", async () => fetchAll<ProjectRef>(rm, "projects.json", "projects", {}, 1000));
+  return cached(rm, "projects", async () =>
+    fetchAll<ProjectRef>(rm, "projects.json", "projects", { include: "trackers,enabled_modules" }, 1000),
+  );
 }
 
 /**
@@ -471,6 +500,244 @@ async function resolveProjectKey(rm: Resolved, value: string): Promise<string | 
     );
   }
   throw new UserError(`Проект "${value}" не найден. Список: redmine.ts projects`);
+}
+
+// ───────────────────────────── проекты ────────────────────────────────
+
+/** Карточка проекта целиком — для предпросмотра и разбора иерархии. */
+async function findProject(rm: Resolved, value: string): Promise<ProjectRef> {
+  const key = (rm.projectAliases?.[value] ?? value).trim().replace(/^#/, "");
+  const list = await projects(rm);
+  if (/^\d+$/.test(key)) {
+    const byId = list.find((p) => p.id === Number(key));
+    if (byId) return byId;
+  }
+  const byIdent = list.find((p) => p.identifier.toLowerCase() === key.toLowerCase());
+  if (byIdent) return byIdent;
+  const low = key.toLowerCase();
+  const byName = list.filter((p) => p.name.toLowerCase().includes(low));
+  if (byName.length === 1) return byName[0]!;
+  if (byName.length > 1) {
+    throw new UserError(
+      `Проект "${value}" неоднозначен: ${byName.map((p) => `${p.name} (${p.identifier})`).join(", ")}.`,
+    );
+  }
+  throw new UserError(`Проект "${value}" не найден. Список: redmine.ts projects`);
+}
+
+function projectUrl(rm: Resolved, identifier: string): string {
+  return `${rm.base}projects/${identifier}`;
+}
+
+/** Транслитерация кириллицы: идентификатор проекта Redmine принимает только латиницу. */
+const TRANSLIT: Record<string, string> = {
+  а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "e", ж: "zh", з: "z", и: "i",
+  й: "y", к: "k", л: "l", м: "m", н: "n", о: "o", п: "p", р: "r", с: "s", т: "t",
+  у: "u", ф: "f", х: "h", ц: "c", ч: "ch", ш: "sh", щ: "sch", ъ: "", ы: "y", ь: "",
+  э: "e", ю: "yu", я: "ya", і: "i", ї: "yi", є: "ye", ґ: "g", ў: "u",
+};
+
+export function translit(text: string): string {
+  let out = "";
+  for (const ch of text.toLowerCase()) out += TRANSLIT[ch] ?? ch;
+  return out;
+}
+
+/**
+ * Идентификатор из названия: транслитерация, нижний регистр, дефисы вместо остального,
+ * не длиннее 100 символов. Результат всё равно проверяется — `identifierProblem`.
+ */
+export function slugIdentifier(name: string): string {
+  return translit(name)
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+/, "")
+    .slice(0, 100)
+    .replace(/-+$/, "");
+}
+
+/** Что не так с идентификатором, или null — если он годится. */
+export function identifierProblem(identifier: string): string | null {
+  if (identifier.length === 0) return "он пустой";
+  if (identifier.length > 100) return `в нём ${identifier.length} символов, допустимо не больше 100`;
+  const bad = [...new Set([...identifier].filter((c) => !/[a-z0-9_-]/.test(c)))];
+  if (bad.length > 0) {
+    const shown = bad.map((c) => (c === " " ? "пробел" : `«${c}»`)).join(", ");
+    return `недопустимые символы: ${shown} — разрешены строчные латинские буквы, цифры, дефис и подчёркивание`;
+  }
+  if (!/^[a-z]/.test(identifier)) return "он должен начинаться со строчной латинской буквы";
+  return null;
+}
+
+type IdentifierState = "free" | "taken" | "hidden";
+
+/**
+ * Занятость идентификатора проверяется до отправки: Redmine иначе отвечает 422 уже по факту.
+ * Проект может быть закрыт или архивирован — тогда его нет в списке, но идентификатор занят.
+ */
+async function identifierState(rm: Resolved, identifier: string): Promise<IdentifierState> {
+  const known = (await projects(rm)).find((p) => p.identifier.toLowerCase() === identifier.toLowerCase());
+  if (known) return "taken";
+  try {
+    await request(rm, "GET", `projects/${identifier}.json`);
+    return "taken";
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return "free";
+    if (error instanceof ApiError && error.status === 403) return "hidden";
+    throw error;
+  }
+}
+
+/** Штатные модули Redmine: есть на любом инстансе, даже если сейчас нигде не включены. */
+const CORE_MODULES = [
+  "issue_tracking",
+  "time_tracking",
+  "news",
+  "documents",
+  "files",
+  "wiki",
+  "repository",
+  "boards",
+  "calendar",
+  "gantt",
+];
+
+/** Набор модулей инстанса: штатные плюс всё, что реально включено в видимых проектах. */
+async function instanceModules(rm: Resolved): Promise<string[]> {
+  const seen = new Set(CORE_MODULES);
+  for (const p of await projects(rm)) for (const m of p.enabled_modules ?? []) seen.add(m.name);
+  return [...seen].sort();
+}
+
+/** Разбирает список имён целиком и сообщает обо всех промахах разом, а не о первом. */
+function resolveManyByName<T extends IdName>(items: T[], names: string[], kind: string): T[] {
+  const picked: T[] = [];
+  const unknown: string[] = [];
+  const ambiguous: string[] = [];
+  for (const name of names) {
+    const low = name.trim().toLowerCase();
+    const exact = items.find((i) => i.name.toLowerCase() === low);
+    if (exact) {
+      if (!picked.includes(exact)) picked.push(exact);
+      continue;
+    }
+    if (/^\d+$/.test(low)) {
+      const byId = items.find((i) => i.id === Number(low));
+      if (byId) {
+        if (!picked.includes(byId)) picked.push(byId);
+        continue;
+      }
+    }
+    const partial = items.filter((i) => i.name.toLowerCase().includes(low));
+    if (partial.length === 1) {
+      if (!picked.includes(partial[0]!)) picked.push(partial[0]!);
+      continue;
+    }
+    if (partial.length > 1) ambiguous.push(`${name} → ${partial.map((i) => i.name).join(", ")}`);
+    else unknown.push(name);
+  }
+  if (unknown.length > 0 || ambiguous.length > 0) {
+    throw new UserError(
+      [
+        unknown.length > 0 ? `${kind}: не найдено — ${unknown.join(", ")}.` : "",
+        ambiguous.length > 0 ? `${kind}: неоднозначно — ${ambiguous.join("; ")}.` : "",
+        `Доступно на этом инстансе: ${items.map((i) => i.name).join(", ")}.`,
+      ]
+        .filter(Boolean)
+        .join("\n  "),
+    );
+  }
+  return picked;
+}
+
+/** То же для модулей: они опознаются техническим именем (issue_tracking, wiki, …). */
+function resolveModules(available: string[], names: string[]): string[] {
+  const picked: string[] = [];
+  const unknown: string[] = [];
+  const ambiguous: string[] = [];
+  for (const name of names) {
+    const low = name.trim().toLowerCase();
+    const exact = available.find((m) => m.toLowerCase() === low);
+    if (exact) {
+      if (!picked.includes(exact)) picked.push(exact);
+      continue;
+    }
+    const partial = available.filter((m) => m.toLowerCase().includes(low));
+    if (partial.length === 1) {
+      if (!picked.includes(partial[0]!)) picked.push(partial[0]!);
+      continue;
+    }
+    if (partial.length > 1) ambiguous.push(`${name} → ${partial.join(", ")}`);
+    else unknown.push(name);
+  }
+  if (unknown.length > 0 || ambiguous.length > 0) {
+    throw new UserError(
+      [
+        unknown.length > 0 ? `Модули: не найдено — ${unknown.join(", ")}.` : "",
+        ambiguous.length > 0 ? `Модули: неоднозначно — ${ambiguous.join("; ")}.` : "",
+        `Известные модули этого инстанса: ${available.join(", ")}.`,
+      ]
+        .filter(Boolean)
+        .join("\n  "),
+    );
+  }
+  return picked;
+}
+
+/**
+ * Отказ Redmine по проекту почти всегда про права владельца ключа, а не про запрос.
+ * Голый «403» читателю ничего не объясняет, поэтому называем недостающее разрешение.
+ */
+async function withProjectRights<T>(
+  what: "create" | "update" | "archive",
+  context: string,
+  fn: () => Promise<T>,
+  /** Известно ли, что проект существует: от этого зависит, чем на самом деле был 404. */
+  projectExists = false,
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    if (error.status === 403) {
+      const reason: Record<typeof what, string> = {
+        create:
+          `Создание проекта отклонено: у владельца ключа нет на это права. ${context}\n` +
+          `  Верхнеуровневый проект заводит администратор Redmine либо пользователь, которому это разрешено ` +
+          `в «Администрирование → Настройки → Проекты».\n` +
+          `  Подпроект может завести тот, у кого в родительском проекте есть роль с разрешением ` +
+          `«Создание подпроектов».\n` +
+          `  Что делать: попросить администратора выдать право или создать проект самому — через интерфейс Redmine.`,
+        update:
+          `Правка проекта отклонена: не хватает прав. ${context}\n` +
+          `  Настройки проекта меняет тот, у кого в проекте есть роль с разрешением «Редактирование проекта».\n` +
+          `  Смена родителя доступна администратору или тому, кому разрешено добавлять подпроекты к новому родителю.\n` +
+          `  Что делать: попросить администратора изменить настройки либо выдать роль.`,
+        archive:
+          `Архивирование отклонено: операция доступна только администратору Redmine. ${context}\n` +
+          `  Архивирует администратор — в интерфейсе: «Администрирование → Проекты → нужный проект → Архивировать».\n` +
+          `  Ключ обычного пользователя прав на это не даёт: просите администратора, обходного пути нет.`,
+      };
+      throw new UserError(reason[what]);
+    }
+    if (error.status === 422) {
+      throw new UserError(
+        `Redmine отклонил данные проекта: ${error.details.join("; ") || "без пояснения"}.\n` +
+          `  Проверьте идентификатор (должен быть свободен), родителя и обязательные поля проекта на этом инстансе.`,
+      );
+    }
+    if (error.status === 404 && what === "archive") {
+      throw new UserError(
+        projectExists
+          ? `Инстанс не поддерживает архивирование через API: эндпоинт появился в Redmine 5.0. ${context}\n` +
+            `  Архивируйте через интерфейс: «Администрирование → Проекты».`
+          : `Redmine ответил «не найдено». ${context}\n` +
+            `  Либо проекта с таким идентификатором нет — проверьте списком: redmine.ts projects,\n` +
+            `  либо инстанс старше Redmine 5.0: архивирование через API появилось только там.\n` +
+            `  Надёжный путь в обоих случаях — интерфейс: «Администрирование → Проекты».`,
+      );
+    }
+    throw error;
+  }
 }
 
 // ─────────────────────────── даты и часы ──────────────────────────────
@@ -575,12 +842,23 @@ function daysUntil(dateIso: string): number {
 
 // ────────────────────────────── argv ──────────────────────────────────
 
-type Args = { cmd: string; positional: string[]; flags: Map<string, string | true> };
+type Args = {
+  cmd: string;
+  positional: string[];
+  flags: Map<string, string | true>;
+  /** Флаги, которые можно повторять (--tracker A --tracker B): здесь копятся все значения. */
+  repeated: Map<string, string[]>;
+};
 
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
   const flags = new Map<string, string | true>();
+  const repeated = new Map<string, string[]>();
   const short: Record<string, string> = { i: "instance", q: "query", p: "project", d: "date", n: "limit" };
+  const set = (name: string, value: string | true): void => {
+    flags.set(name, value);
+    if (typeof value === "string") repeated.set(name, [...(repeated.get(name) ?? []), value]);
+  };
 
   for (let index = 0; index < argv.length; index++) {
     const token = argv[index]!;
@@ -588,31 +866,31 @@ function parseArgs(argv: string[]): Args {
       const body = token.slice(2);
       const eq = body.indexOf("=");
       if (eq !== -1) {
-        flags.set(body.slice(0, eq), body.slice(eq + 1));
+        set(body.slice(0, eq), body.slice(eq + 1));
         continue;
       }
       const next = argv[index + 1];
       if (next !== undefined && !next.startsWith("--")) {
-        flags.set(body, next);
+        set(body, next);
         index++;
       } else {
-        flags.set(body, true);
+        set(body, true);
       }
     } else if (/^-[a-z]$/i.test(token)) {
       const name = short[token[1]!] ?? token[1]!;
       const next = argv[index + 1];
       if (next !== undefined && !next.startsWith("-")) {
-        flags.set(name, next);
+        set(name, next);
         index++;
       } else {
-        flags.set(name, true);
+        set(name, true);
       }
     } else {
       positional.push(token);
     }
   }
   const cmd = positional.shift() ?? "help";
-  return { cmd, positional, flags };
+  return { cmd, positional, flags, repeated };
 }
 
 function str(args: Args, name: string): string | undefined {
@@ -622,6 +900,14 @@ function str(args: Args, name: string): string | undefined {
 
 function bool(args: Args, name: string): boolean {
   return args.flags.has(name) && args.flags.get(name) !== "false";
+}
+
+/** Значения повторяемого флага: --tracker A --tracker B, либо одним списком через запятую. */
+function values(args: Args, name: string): string[] {
+  return (args.repeated.get(name) ?? [])
+    .flatMap((value) => value.split(","))
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
 }
 
 function num(args: Args, name: string): number | undefined {
@@ -793,11 +1079,296 @@ async function cmdStatuses(rm: Resolved, _args: Args): Promise<void> {
 
 async function cmdProjects(rm: Resolved, args: Args): Promise<void> {
   const q = (str(args, "query") ?? args.positional[0] ?? "").toLowerCase();
-  const list = (await projects(rm)).filter(
+  const all = await projects(rm);
+  const matches = all.filter(
     (p) => !q || p.name.toLowerCase().includes(q) || p.identifier.toLowerCase().includes(q),
   );
-  emit(list, () =>
-    table([["ID", "IDENTIFIER", "НАЗВАНИЕ"], ...list.map((p) => [String(p.id), p.identifier, p.name])]),
+
+  if (bool(args, "flat")) {
+    emit(matches, () =>
+      matches.length === 0
+        ? "Проектов не найдено."
+        : table([["ID", "IDENTIFIER", "НАЗВАНИЕ"], ...matches.map((p) => [String(p.id), p.identifier, p.name])]),
+    );
+    return;
+  }
+
+  // Подпроект без родителя в выдаче читается как отдельный проект, поэтому предков совпадений оставляем.
+  const byId = new Map(all.map((p) => [p.id, p]));
+  const keep = new Set<number>();
+  for (const p of matches) {
+    let cursor: ProjectRef | undefined = p;
+    while (cursor && !keep.has(cursor.id)) {
+      keep.add(cursor.id);
+      cursor = cursor.parent ? byId.get(cursor.parent.id) : undefined;
+    }
+  }
+
+  const children = new Map<number, ProjectRef[]>();
+  const roots: ProjectRef[] = [];
+  for (const p of all) {
+    if (!keep.has(p.id)) continue;
+    const parentId = p.parent && keep.has(p.parent.id) ? p.parent.id : null;
+    if (parentId === null) roots.push(p);
+    else children.set(parentId, [...(children.get(parentId) ?? []), p]);
+  }
+  const byName = (a: ProjectRef, b: ProjectRef): number => a.name.localeCompare(b.name, "ru");
+
+  const rows: string[][] = [];
+  const walk = (p: ProjectRef, depth: number): void => {
+    rows.push([
+      String(p.id),
+      p.identifier,
+      p.is_public === true ? "публ." : "",
+      `${"  ".repeat(depth)}${depth > 0 ? "└ " : ""}${p.name}`,
+    ]);
+    (children.get(p.id) ?? []).sort(byName).forEach((c) => walk(c, depth + 1));
+  };
+  roots.sort(byName).forEach((p) => walk(p, 0));
+
+  const nested = [...keep].filter((id) => byId.get(id)?.parent !== undefined).length;
+  emit(matches, () =>
+    rows.length === 0
+      ? "Проектов не найдено."
+      : `${table([["ID", "IDENTIFIER", "ДОСТУП", "НАЗВАНИЕ"], ...rows])}\n\n` +
+        `Всего ${rows.length}${q ? ` (совпадений ${matches.length}, остальные показаны как родители)` : ""}, ` +
+        `из них подпроектов ${nested}. Плоским списком — --flat.`,
+  );
+}
+
+/** Состав проекта одинаково нужен и предпросмотру создания, и предпросмотру правки. */
+function describeAccess(isPublic: boolean): string {
+  return isPublic ? "публичный (виден всем, у кого есть учётная запись)" : "закрытый (только участники проекта)";
+}
+
+async function cmdCreateProject(rm: Resolved, args: Args): Promise<void> {
+  const name = (str(args, "name") ?? args.positional.join(" ")).trim();
+  if (!name) throw new UserError('Нужно название проекта: --name "Название".');
+
+  const explicit = str(args, "identifier")?.trim();
+  const identifier = explicit ?? slugIdentifier(name);
+  const problem = identifierProblem(identifier);
+  if (problem) {
+    throw new UserError(
+      explicit
+        ? `Идентификатор "${identifier}" не подходит: ${problem}.`
+        : `Из названия «${name}» получился идентификатор "${identifier}", и он не подходит: ${problem}.\n` +
+          `  Задайте его сами: --identifier <строка>.`,
+    );
+  }
+  const state = await identifierState(rm, identifier);
+  if (state !== "free") {
+    throw new UserError(
+      state === "taken"
+        ? `Идентификатор "${identifier}" уже занят на инстансе ${rm.name}: ${projectUrl(rm, identifier)}.\n` +
+          `  Выберите другой: --identifier <строка>.`
+        : `Идентификатор "${identifier}" занят проектом, который вам не виден (закрыт или архивирован).\n` +
+          `  Выберите другой: --identifier <строка>.`,
+    );
+  }
+
+  const parentArg = str(args, "parent");
+  const parent = parentArg ? await findProject(rm, parentArg) : undefined;
+
+  const descriptionFile = str(args, "description-file");
+  const description = descriptionFile ? await Bun.file(descriptionFile).text() : str(args, "description");
+
+  // Закрытый проект — безопасное умолчание: публичность включается только явным --public.
+  const isPublic = bool(args, "public") && !bool(args, "private");
+  const inheritMembers = bool(args, "inherit-members");
+
+  const trackerNames = values(args, "tracker");
+  const pickedTrackers = trackerNames.length > 0 ? resolveManyByName(await trackers(rm), trackerNames, "Трекеры") : [];
+  const moduleNames = values(args, "module");
+  const pickedModules = moduleNames.length > 0 ? resolveModules(await instanceModules(rm), moduleNames) : [];
+
+  checkOutgoing({ "название проекта": name, "описание проекта": description }, args);
+
+  const payload: Record<string, unknown> = { name, identifier, is_public: isPublic };
+  if (description?.trim()) payload.description = description;
+  if (parent) payload.parent_id = parent.id;
+  if (parent && inheritMembers) payload.inherit_members = true;
+  if (pickedTrackers.length > 0) payload.tracker_ids = pickedTrackers.map((t) => t.id);
+  if (pickedModules.length > 0) payload.enabled_module_names = pickedModules;
+
+  const rows: string[][] = [
+    ["Название", name],
+    ["Идентификатор", identifier + (explicit ? "" : " (сгенерирован из названия)")],
+    ["Родитель", parent ? `${parent.name} (${parent.identifier}, id=${parent.id}) — создаётся подпроект` : "нет — проект верхнего уровня"],
+    ["Доступ", describeAccess(isPublic)],
+    [
+      "Участники",
+      parent
+        ? inheritMembers
+          ? "наследуются от родителя"
+          : "свои (наследование не включено; --inherit-members включит)"
+        : "назначаются после создания",
+    ],
+    ["Трекеры", pickedTrackers.length > 0 ? pickedTrackers.map((t) => t.name).join(", ") : "набор инстанса по умолчанию"],
+    ["Модули", pickedModules.length > 0 ? pickedModules.join(", ") : "набор инстанса по умолчанию"],
+    ["Адрес", projectUrl(rm, identifier)],
+  ];
+  if (!parent && inheritMembers) rows.push(["Внимание", "--inherit-members без --parent ничего не делает"]);
+
+  const preview =
+    `НОВЫЙ ПРОЕКТ · инстанс ${rm.name}\n${table(rows)}` +
+    (description?.trim()
+      ? `\n\nОПИСАНИЕ (как уйдёт в Redmine):\n${"─".repeat(60)}\n${description.trim()}\n${"─".repeat(60)}`
+      : "\n\nОписание не задано (--description-file <файл>).") +
+    `\n\nСоздание проекта требует прав администратора либо роли с разрешением ` +
+    (parent ? `«Создание подпроектов» в проекте «${parent.name}».` : "«Создание проекта».");
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  const created = await withProjectRights("create", `Проект «${name}» не создан.`, async () =>
+    (await request<{ project: ProjectRef }>(rm, "POST", "projects.json", undefined, { project: payload })).project,
+  );
+  await cacheDrop(rm, "projects");
+  emit(created, () =>
+    `Создан проект «${created.name}» (${created.identifier}, id=${created.id})\n${projectUrl(rm, created.identifier)}\n` +
+      `Родитель: ${parent ? parent.name : "нет"} | Доступ: ${describeAccess(created.is_public ?? isPublic)}` +
+      (pickedTrackers.length > 0 ? ` | Трекеры: ${pickedTrackers.map((t) => t.name).join(", ")}` : "") +
+      (pickedModules.length > 0 ? ` | Модули: ${pickedModules.join(", ")}` : ""),
+  );
+}
+
+async function cmdUpdateProject(rm: Resolved, args: Args): Promise<void> {
+  const target = args.positional[0] ?? str(args, "project");
+  if (!target) throw new UserError('Укажите проект: redmine.ts update-project <identifier|id> --name "…"');
+  const project = await findProject(rm, target);
+
+  const patch: Record<string, unknown> = {};
+  const rows: string[][] = [];
+  const name = str(args, "name");
+  if (name) {
+    patch.name = name;
+    rows.push(["Название", `${project.name} → ${name}`]);
+  }
+  const descriptionFile = str(args, "description-file");
+  const description = descriptionFile ? await Bun.file(descriptionFile).text() : str(args, "description");
+  if (description !== undefined) patch.description = description;
+
+  const parentArg = str(args, "parent");
+  let parent: ProjectRef | undefined;
+  if (parentArg !== undefined) {
+    if (/^(none|нет|—|-)$/i.test(parentArg.trim())) {
+      patch.parent_id = "";
+      rows.push(["Родитель", `${project.parent?.name ?? "нет"} → нет (проект верхнего уровня)`]);
+    } else {
+      parent = await findProject(rm, parentArg);
+      if (parent.id === project.id) throw new UserError("Проект не может быть родителем самому себе.");
+      patch.parent_id = parent.id;
+      rows.push(["Родитель", `${project.parent?.name ?? "нет"} → ${parent.name} (${parent.identifier})`]);
+    }
+  }
+  if (bool(args, "public") || bool(args, "private")) {
+    const isPublic = bool(args, "public") && !bool(args, "private");
+    patch.is_public = isPublic;
+    rows.push(["Доступ", `${describeAccess(project.is_public === true)} → ${describeAccess(isPublic)}`]);
+  }
+  const trackerNames = values(args, "tracker");
+  if (trackerNames.length > 0) {
+    const picked = resolveManyByName(await trackers(rm), trackerNames, "Трекеры");
+    patch.tracker_ids = picked.map((t) => t.id);
+    rows.push([
+      "Трекеры",
+      `${(project.trackers ?? []).map((t) => t.name).join(", ") || "—"} → ${picked.map((t) => t.name).join(", ")}`,
+    ]);
+  }
+  const moduleNames = values(args, "module");
+  if (moduleNames.length > 0) {
+    const picked = resolveModules(await instanceModules(rm), moduleNames);
+    patch.enabled_module_names = picked;
+    rows.push([
+      "Модули",
+      `${(project.enabled_modules ?? []).map((m) => m.name).join(", ") || "—"} → ${picked.join(", ")}`,
+    ]);
+  }
+  if (Object.keys(patch).length === 0) {
+    throw new UserError(
+      "Нечего менять: задайте --name / --description(-file) / --parent / --public|--private / --tracker / --module.",
+    );
+  }
+
+  checkOutgoing({ "название проекта": name, "описание проекта": description }, args);
+
+  const preview =
+    `ПРАВКА ПРОЕКТА «${project.name}» (${project.identifier}) · инстанс ${rm.name}\n` +
+    `${projectUrl(rm, project.identifier)}\n` +
+    (rows.length > 0 ? table(rows) : "(меняется только описание)") +
+    (description !== undefined
+      ? `\n\nНОВОЕ ОПИСАНИЕ (заменит текущее целиком):\n${"─".repeat(60)}\n${description.trim() || "(пусто — описание будет стёрто)"}\n${"─".repeat(60)}` +
+        (project.description?.trim()
+          ? `\n\nТЕКУЩЕЕ ОПИСАНИЕ:\n${"─".repeat(60)}\n${project.description.trim()}\n${"─".repeat(60)}`
+          : "")
+      : "");
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  await withProjectRights("update", `Проект «${project.name}» не изменён.`, () =>
+    request(rm, "PUT", `projects/${project.id}.json`, undefined, { project: patch }),
+  );
+  await cacheDrop(rm, "projects");
+  const after = (await request<{ project: ProjectRef }>(rm, "GET", `projects/${project.id}.json`)).project;
+  emit(after, () =>
+    `Проект «${after.name}» (${after.identifier}) обновлён.\n${projectUrl(rm, after.identifier)}\n` +
+      `Родитель: ${after.parent?.name ?? "нет"} | Доступ: ${describeAccess(after.is_public === true)}`,
+  );
+}
+
+async function cmdArchiveProject(rm: Resolved, args: Args): Promise<void> {
+  const unarchive = args.cmd === "unarchive-project";
+  const target = args.positional[0] ?? str(args, "project");
+  if (!target) {
+    throw new UserError(`Укажите проект: redmine.ts ${args.cmd} <identifier|id> --yes`);
+  }
+
+  const me = await currentUser(rm);
+  // Архивированный проект не виден в списке, поэтому при разархивации имя может не найтись — это нормально.
+  let project: ProjectRef | null = null;
+  try {
+    project = await findProject(rm, target);
+  } catch (error) {
+    if (!unarchive) throw error;
+  }
+  const key = project ? String(project.id) : target.replace(/^#/, "");
+  const title = project ? `«${project.name}» (${project.identifier})` : `"${target}"`;
+
+  const found = project;
+  const nested = found === null ? [] : (await projects(rm)).filter((p) => p.parent?.id === found.id);
+
+  const rows: string[][] = [
+    ["Проект", title],
+    ["Инстанс", rm.name],
+    ["Операция", unarchive ? "разархивировать — проект снова станет рабочим" : "архивировать"],
+  ];
+  if (!unarchive && nested.length > 0) {
+    rows.push(["Подпроекты", `${nested.length} — архивируются вместе с родителем: ${nested.map((p) => p.name).join(", ")}`]);
+  }
+  rows.push([
+    "Права",
+    me.admin === true
+      ? "владелец ключа — администратор Redmine"
+      : "владелец ключа НЕ администратор: Redmine откажет (403), это нормально и не ошибка скилла",
+  ]);
+
+  const consequence = unarchive
+    ? "После разархивации проект снова доступен: задачи видны в поиске и отчётах, время списывается."
+    : "Архив закрывает проект целиком: задачи исчезают из поиска и отчётов, время списать нельзя, правки запрещены. " +
+      "Данные не удаляются — проект можно вернуть командой unarchive-project.";
+
+  const preview =
+    `${unarchive ? "РАЗАРХИВАЦИЯ" : "АРХИВИРОВАНИЕ"} ПРОЕКТА · инстанс ${rm.name}\n${table(rows)}\n\n${consequence}\n` +
+    `Операция доступна только администратору Redmine; через интерфейс — «Администрирование → Проекты».`;
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  await withProjectRights(
+    "archive",
+    `Проект ${title} не тронут.`,
+    () => request(rm, "PUT", `projects/${key}/${unarchive ? "unarchive" : "archive"}.json`),
+    found !== null,
+  );
+  await cacheDrop(rm, "projects");
+  emit({ project: key, archived: !unarchive }, () =>
+    `Проект ${title} ${unarchive ? "разархивирован" : "архивирован"} на инстансе ${rm.name}.`,
   );
 }
 
@@ -2444,7 +3015,8 @@ function cmdHelp(): void {
 Общие флаги: --instance <имя|хост>  --all-instances (для inbox/due)  --json  --no-cache
 
 ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: команды log, batch, comment, create-issue, create-tree,
-update-issue, edit без --yes печатают полный предпросмотр и ничего не отправляют.
+update-issue, edit, create-project, update-project, archive-project без --yes печатают
+полный предпросмотр и ничего не отправляют.
 Любой уходящий текст проверяется на компрометацию (секреты, ПДн, внутренние адреса,
 самооговор). Запрет снимается только флагом --override-guard.
   scan --text "..."|--file f [--audience client|internal]   проверить текст отдельно
@@ -2453,7 +3025,19 @@ update-issue, edit без --yes печатают полный предпросм
   instances                         профили из конфига и их состояние
   whoami                            кто я на этом инстансе
   activities | statuses | trackers  виды деятельности / статусы / трекеры и приоритеты
-  projects [строка]                 проекты (фильтр по имени/identifier)
+  projects [строка] [--flat]        проекты деревом: родитель → подпроекты (--flat — плоским списком)
+
+Проекты и подпроекты
+  create-project --name "..." [--identifier <строка>] [--parent <identifier|id>]
+                 [--description "..."|--description-file f] [--public|--private] [--inherit-members]
+                 [--tracker <имя> ...] [--module <имя> ...] [--yes]
+        идентификатор без --identifier генерируется из названия транслитерацией и проверяется
+        на занятость; без --public проект создаётся закрытым
+  update-project <identifier|id> [--name "..."] [--description "..."|--description-file f]
+                 [--parent <identifier|id>|none] [--public|--private] [--tracker <имя> ...]
+                 [--module <имя> ...] [--yes]
+  archive-project <identifier|id> --yes | unarchive-project <identifier|id> --yes
+        только для администратора Redmine; обычному ключу инстанс ответит отказом
 
 Что нового и сроки
   inbox [--since 2026-09-20|-3|12h] [--mark] [--watched] [--authored] [--include-own]
@@ -2546,6 +3130,10 @@ async function main(): Promise<void> {
     activities: cmdActivities,
     statuses: cmdStatuses,
     projects: cmdProjects,
+    "create-project": cmdCreateProject,
+    "update-project": cmdUpdateProject,
+    "archive-project": cmdArchiveProject,
+    "unarchive-project": cmdArchiveProject,
     issue: cmdIssue,
     issues: cmdIssues,
     search: cmdSearch,
