@@ -1045,7 +1045,10 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   const parent = str(args, "parent");
   if (parent) patch.parent_issue_id = Number(parent.replace("#", ""));
   const estimated = str(args, "estimated");
-  if (estimated) patch.estimated_hours = round2(parseHours(estimated));
+  // «none» и «0» снимают оценку: Redmine очищает поле пустой строкой.
+  if (estimated) {
+    patch.estimated_hours = /^(none|нет|0)$/i.test(estimated.trim()) ? "" : round2(parseHours(estimated));
+  }
   const assignee = str(args, "assignee");
   if (assignee) patch.assigned_to_id = assignee === "me" ? (await currentUser(rm)).id : Number(assignee);
   const due = str(args, "due");
