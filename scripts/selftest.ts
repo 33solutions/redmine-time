@@ -11,6 +11,18 @@ import { categorize, monthsSince } from "./redmine.ts";
 import { translit, slugIdentifier, identifierProblem } from "./redmine.ts";
 import { parseFieldSpec, assignProjectFields, type ProjectField } from "./redmine.ts";
 import { dayTotals, loadWarnings, reconcileHours } from "./redmine.ts";
+import {
+  parseRelationType,
+  invertRelationType,
+  asRelationType,
+  delayApplies,
+  describeRelation,
+  explainRelationRejection,
+  parseIssueRef,
+  findCrossInstanceRefs,
+  formatXref,
+  xrefLabel,
+} from "./redmine.ts";
 
 let passed = 0;
 const failures: string[] = [];
@@ -450,6 +462,226 @@ check("сверка: округление Redmine не считается рас
 check("сверка: пропавшая запись видна", reconcileHours(10, 36, 29.5, 5).ok, false);
 check("сверка: размер расхождения назван", reconcileHours(10, 36, 29.5, 5).diff, -3.5);
 check("сверка: допуск не бесконечный", reconcileHours(0, 29.4, 29.5, 3).ok, false);
+
+
+// ── связи между задачами ──────────────────────────────────────────────
+check("тип связи: канонический", parseRelationType("blocks"), "blocks");
+check("тип связи: регистр не важен", parseRelationType("  BLOCKS "), "blocks");
+check("тип связи: подчёркивание как разделитель", parseRelationType("copied_to"), "copied_to");
+check("тип связи: тот же тип через пробел", parseRelationType("copied from"), "copied_from");
+check("тип связи: русское «связана»", parseRelationType("связана"), "relates");
+check("тип связи: русское «блокирует»", parseRelationType("блокирует"), "blocks");
+check("тип связи: русское «заблокирована»", parseRelationType("Заблокирована"), "blocked");
+check("тип связи: русское «предшествует»", parseRelationType("предшествует"), "precedes");
+check("тип связи: русское «следует»", parseRelationType("следует"), "follows");
+check("тип связи: «следует за» — тот же тип", parseRelationType("следует за"), "follows");
+check("тип связи: русское «дублирует»", parseRelationType("дублирует"), "duplicates");
+check("тип связи: «дублируется» — обратный тип", parseRelationType("дублируется"), "duplicated");
+check("тип связи: «ё» не мешает", parseRelationType("связана"), parseRelationType("связана"));
+checkThrows("тип связи: выдумка", () => parseRelationType("зависит"));
+checkThrows("тип связи: пустая строка", () => parseRelationType("  "));
+
+// Тип хранится от лица первой задачи: со стороны второй он разворачивается.
+check("разворот: blocks", invertRelationType("blocks"), "blocked");
+check("разворот: precedes", invertRelationType("precedes"), "follows");
+check("разворот: duplicates", invertRelationType("duplicates"), "duplicated");
+check("разворот: copied_to", invertRelationType("copied_to"), "copied_from");
+check("разворот: relates симметрична", invertRelationType("relates"), "relates");
+for (const type of ["relates", "duplicates", "duplicated", "blocks", "blocked", "precedes", "follows", "copied_to", "copied_from"] as const) {
+  check(`разворот дважды возвращает исходный тип: ${type}`, invertRelationType(invertRelationType(type)), type);
+}
+
+check("ответ Redmine: известный тип", asRelationType("precedes"), "precedes");
+check("ответ Redmine: незнакомый тип не ломает разбор", asRelationType("teleports"), null);
+
+check("отсрочка: имеет смысл для precedes", delayApplies("precedes"), true);
+check("отсрочка: имеет смысл для follows", delayApplies("follows"), true);
+check("отсрочка: бессмысленна для blocks", delayApplies("blocks"), false);
+check("отсрочка: бессмысленна для relates", delayApplies("relates"), false);
+
+// Предпросмотр объясняет последствие, а не называет код типа.
+check(
+  "смысл связи: блокировка названа словами",
+  describeRelation("blocks", 25185, 25190),
+  "#25185 блокирует #25190: пока #25185 не закрыта, #25190 выполнять нельзя — Redmine не даст перевести её в закрывающий статус.",
+);
+check(
+  "смысл связи: порядок без отсрочки — следующий день",
+  describeRelation("precedes", 1, 2).includes("на следующий день после окончания #1"),
+  true,
+);
+check(
+  "смысл связи: отсрочка попадает в текст",
+  describeRelation("precedes", 1, 2, 3).includes("через 3 дн. после окончания #1"),
+  true,
+);
+check(
+  "смысл связи: отсрочка 0 — это не отсрочка",
+  describeRelation("precedes", 1, 2, 0).includes("на следующий день"),
+  true,
+);
+check(
+  "смысл связи: дубль предупреждает о закрытии второй задачи",
+  describeRelation("duplicates", 1, 2).includes("закроется вместе с ней"),
+  true,
+);
+
+// Отказ 422 разворачивается в объяснение, а не в код ответа.
+check(
+  "отказ: связь с самой собой",
+  explainRelationRejection(["Issue cannot be linked to itself"], { from: 5, to: 5, type: "relates" }).includes(
+    "саму с собой",
+  ),
+  true,
+);
+check(
+  "отказ: цикл",
+  explainRelationRejection(["This relation would create a circular dependency"], {
+    from: 1,
+    to: 2,
+    type: "precedes",
+  }).includes("замкнула бы круг"),
+  true,
+);
+check(
+  "отказ: связь уже есть",
+  explainRelationRejection(["Relation has already been taken"], { from: 1, to: 2, type: "blocks" }).includes(
+    "уже есть",
+  ),
+  true,
+);
+check(
+  "отказ: подзадача",
+  explainRelationRejection(["An issue cannot be linked to one of its subtasks"], {
+    from: 1,
+    to: 2,
+    type: "blocks",
+  }).includes("иерархия"),
+  true,
+);
+check(
+  "отказ: незнакомая причина не теряется",
+  explainRelationRejection(["Something odd"], { from: 1, to: 2, type: "relates" }).includes("Something odd"),
+  true,
+);
+check(
+  "отказ: кода ответа в тексте нет",
+  explainRelationRejection(["Something odd"], { from: 1, to: 2, type: "relates" }).includes("422"),
+  false,
+);
+
+// ── ссылки на задачи и второй инстанс ─────────────────────────────────
+const known = [
+  { name: "company", base: "https://redmine.example.com/" },
+  { name: "ru", base: "https://tracker.example.ru/redmine/" },
+];
+
+check("ссылка: голый номер", parseIssueRef("1234", known), { id: 1234, raw: "1234" });
+check("ссылка: с решёткой", parseIssueRef("#1234", known), { id: 1234, raw: "#1234" });
+check("ссылка: профиль перед номером", parseIssueRef("ru:25185", known), {
+  id: 25185,
+  instance: "ru",
+  raw: "ru:25185",
+});
+check("ссылка: профиль и решётка", parseIssueRef("company:#42", known), {
+  id: 42,
+  instance: "company",
+  raw: "company:#42",
+});
+check("ссылка: профиль по началу имени", parseIssueRef("comp:42", known).instance, "company");
+check("ссылка: адрес известного инстанса", parseIssueRef("https://tracker.example.ru/redmine/issues/25185", known), {
+  id: 25185,
+  instance: "ru",
+  raw: "https://tracker.example.ru/redmine/issues/25185",
+});
+check(
+  "ссылка: адрес с якорем комментария",
+  parseIssueRef("https://redmine.example.com/issues/777#note-3", known).instance,
+  "company",
+);
+check(
+  "ссылка: чужой хост опознан как чужой",
+  parseIssueRef("https://redmine.someone-else.org/issues/1", known).foreignHost,
+  "redmine.someone-else.org",
+);
+check(
+  "ссылка: у чужого адреса нет профиля",
+  parseIssueRef("https://redmine.someone-else.org/issues/1", known).instance,
+  undefined,
+);
+checkThrows("ссылка: неизвестный профиль", () => parseIssueRef("prod:1", known));
+checkThrows("ссылка: адрес без номера задачи", () => parseIssueRef("https://redmine.example.com/projects/core", known));
+checkThrows("ссылка: не ссылка вовсе", () => parseIssueRef("вчерашняя задача", known));
+checkThrows("ссылка: пустая строка", () => parseIssueRef("   ", known));
+
+// Ссылка на второй инстанс не должна потеряться в тексте описания или комментария.
+const others = [{ name: "ru", base: "https://tracker.example.ru/redmine/" }];
+check(
+  "перекрёстные ссылки: находятся в html",
+  findCrossInstanceRefs(
+    '<p>Внедрение: <a href="https://tracker.example.ru/redmine/issues/25185">33 Решения #25185</a></p>',
+    others,
+  ),
+  [{ instance: "ru", id: 25185, url: "https://tracker.example.ru/redmine/issues/25185" }],
+);
+check(
+  "перекрёстные ссылки: повтор считается один раз",
+  findCrossInstanceRefs(
+    "https://tracker.example.ru/redmine/issues/25185 и ещё раз https://tracker.example.ru/redmine/issues/25185#note-2",
+    others,
+  ).length,
+  1,
+);
+check(
+  "перекрёстные ссылки: свой инстанс сюда не попадает",
+  findCrossInstanceRefs("https://redmine.example.com/issues/42", others),
+  [],
+);
+check(
+  "перекрёстные ссылки: адрес проекта — не задача",
+  findCrossInstanceRefs("https://tracker.example.ru/redmine/projects/core", others),
+  [],
+);
+check("перекрёстные ссылки: нечего искать без профилей", findCrossInstanceRefs("https://любой/issues/1", []), []);
+check(
+  "перекрёстные ссылки: точка в конце предложения не ломает разбор",
+  findCrossInstanceRefs("Подробности в https://tracker.example.ru/redmine/issues/7.", others)[0]?.id,
+  7,
+);
+
+// Строка перекрёстной ссылки: номер без адреса на другом инстансе указывает на чужую задачу.
+const xref = {
+  url: "https://tracker.example.ru/redmine/issues/25185",
+  id: 25185,
+  project: "33 Решения",
+  subject: "Панель контроля менеджеров: оперативное ядро платформы",
+};
+check(
+  "xref: подпись с названием проекта",
+  xrefLabel(xref.project, xref.id, xref.subject),
+  "33 Решения #25185 — Панель контроля менеджеров: оперативное ядро платформы",
+);
+check(
+  "xref: html",
+  formatXref(xref),
+  '<a href="https://tracker.example.ru/redmine/issues/25185">33 Решения #25185 — Панель контроля менеджеров: оперативное ядро платформы</a>',
+);
+check(
+  "xref: markdown",
+  formatXref(xref, "markdown"),
+  "[33 Решения #25185 — Панель контроля менеджеров: оперативное ядро платформы](https://tracker.example.ru/redmine/issues/25185)",
+);
+check(
+  "xref: textile",
+  formatXref(xref, "textile"),
+  '"33 Решения #25185 — Панель контроля менеджеров: оперативное ядро платформы":https://tracker.example.ru/redmine/issues/25185',
+);
+check(
+  "xref: разметка темы не ломает ссылку",
+  formatXref({ ...xref, subject: 'Обмен <b>«ЮЛ & ИП»</b>' }),
+  '<a href="https://tracker.example.ru/redmine/issues/25185">33 Решения #25185 — Обмен &lt;b&gt;«ЮЛ &amp; ИП»&lt;/b&gt;</a>',
+);
+check("xref: адрес в строке есть всегда", formatXref(xref).includes(xref.url), true);
 
 // ── итог ──────────────────────────────────────────────────────────────
 console.log(`Проверок пройдено: ${passed}`);

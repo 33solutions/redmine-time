@@ -313,6 +313,8 @@ type Issue = {
   journals?: Journal[];
   /** Переходы, разрешённые рабочим процессом для текущей роли. */
   allowed_statuses?: IdName[];
+  /** Связи с другими задачами — приходят при include=relations. */
+  relations?: IssueRelation[];
 };
 
 type TimeEntry = {
@@ -1698,6 +1700,746 @@ function formatJournalDetail(d: JournalDetail): string {
   return `${d.name}: ${clip(from, 40)} → ${clip(to, 40)}`;
 }
 
+// ──────────────────────── связи между задачами ────────────────────────
+
+/**
+ * Типы связей Redmine. `relation_type` хранится от лица задачи `issue_id`, поэтому при взгляде
+ * со стороны второй задачи тип разворачивается: «#A блокирует #B» читается как «#B заблокирована #A».
+ */
+export type RelationType =
+  | "relates"
+  | "duplicates"
+  | "duplicated"
+  | "blocks"
+  | "blocked"
+  | "precedes"
+  | "follows"
+  | "copied_to"
+  | "copied_from";
+
+type IssueRelation = {
+  id: number;
+  issue_id: number;
+  issue_to_id: number;
+  relation_type: string;
+  delay?: number | null;
+};
+
+const RELATION_OPPOSITE: Record<RelationType, RelationType> = {
+  relates: "relates",
+  duplicates: "duplicated",
+  duplicated: "duplicates",
+  blocks: "blocked",
+  blocked: "blocks",
+  precedes: "follows",
+  follows: "precedes",
+  copied_to: "copied_from",
+  copied_from: "copied_to",
+};
+
+const RELATION_TYPES = Object.keys(RELATION_OPPOSITE) as RelationType[];
+
+/** Тип связи глазами второй задачи. */
+export function invertRelationType(type: RelationType): RelationType {
+  return RELATION_OPPOSITE[type];
+}
+
+/** Строка из ответа Redmine в тип, или null — если инстанс прислал незнакомое. */
+export function asRelationType(raw: string): RelationType | null {
+  const key = raw.trim().toLowerCase();
+  return (RELATION_TYPES as string[]).includes(key) ? (key as RelationType) : null;
+}
+
+const RELATION_LABEL: Record<RelationType, string> = {
+  relates: "связана с",
+  duplicates: "дублирует",
+  duplicated: "продублирована в",
+  blocks: "блокирует",
+  blocked: "заблокирована задачей",
+  precedes: "предшествует",
+  follows: "следует за",
+  copied_to: "скопирована в",
+  copied_from: "скопирована из",
+};
+
+/** Короткое имя связи — для таблиц и заголовков. */
+export function relationLabel(type: RelationType): string {
+  return RELATION_LABEL[type];
+}
+
+/**
+ * Синонимы типов связи. Пользователь говорит «заблокирована», а не `blocked`, и оба варианта
+ * должны попадать в одно значение API. Ключи — в нормализованном виде: нижний регистр,
+ * «ё» → «е», подчёркивания и дефисы → пробел.
+ */
+const RELATION_SYNONYMS: Record<string, RelationType> = {
+  relates: "relates",
+  relate: "relates",
+  related: "relates",
+  relation: "relates",
+  "related to": "relates",
+  связана: "relates",
+  связан: "relates",
+  связано: "relates",
+  связь: "relates",
+  "связана с": "relates",
+  смежная: "relates",
+  смежные: "relates",
+
+  duplicates: "duplicates",
+  duplicate: "duplicates",
+  дублирует: "duplicates",
+  дубль: "duplicates",
+  дубликат: "duplicates",
+
+  duplicated: "duplicated",
+  "duplicated by": "duplicated",
+  дублируется: "duplicated",
+  продублирована: "duplicated",
+  продублировано: "duplicated",
+  "продублирована в": "duplicated",
+
+  blocks: "blocks",
+  block: "blocks",
+  блокирует: "blocks",
+  блокер: "blocks",
+
+  blocked: "blocked",
+  "blocked by": "blocked",
+  заблокирована: "blocked",
+  заблокирован: "blocked",
+  заблокировано: "blocked",
+  блокируется: "blocked",
+
+  precedes: "precedes",
+  precede: "precedes",
+  предшествует: "precedes",
+  перед: "precedes",
+  раньше: "precedes",
+
+  follows: "follows",
+  follow: "follows",
+  следует: "follows",
+  "следует за": "follows",
+  после: "follows",
+  позже: "follows",
+
+  "copied to": "copied_to",
+  copiedto: "copied_to",
+  "скопирована в": "copied_to",
+  "копия в": "copied_to",
+
+  "copied from": "copied_from",
+  copiedfrom: "copied_from",
+  "скопирована из": "copied_from",
+  "копия из": "copied_from",
+};
+
+export function parseRelationType(raw: string): RelationType {
+  const key = raw.trim().toLowerCase().replace(/ё/g, "е").replace(/[\s_-]+/g, " ").trim();
+  const hit = RELATION_SYNONYMS[key];
+  if (hit) return hit;
+  throw new UserError(
+    `Тип связи "${raw}" не распознан. Типы Redmine: relates (связана), duplicates (дублирует), ` +
+      `duplicated (продублирована), blocks (блокирует), blocked (заблокирована), precedes (предшествует), ` +
+      `follows (следует), copied_to (скопирована в), copied_from (скопирована из).`,
+  );
+}
+
+/** Отсрочка имеет смысл только там, где Redmine двигает даты: в порядке выполнения. */
+export function delayApplies(type: RelationType): boolean {
+  return type === "precedes" || type === "follows";
+}
+
+/**
+ * Что связь означает словами. Читателю предпросмотра нужен не код типа, а последствие:
+ * что нельзя будет сделать и какие даты сдвинутся.
+ */
+export function describeRelation(
+  type: RelationType,
+  from: number | string,
+  to: number | string,
+  delay?: number | null,
+): string {
+  const a = `#${from}`;
+  const b = `#${to}`;
+  const gap = (after: string): string =>
+    delay != null && delay > 0
+      ? `через ${delay} дн. после окончания ${after}`
+      : `на следующий день после окончания ${after}`;
+
+  switch (type) {
+    case "relates":
+      return `${a} связана с ${b}: задачи об одном, но ни порядок, ни сроки, ни закрытие друг от друга не зависят.`;
+    case "duplicates":
+      return `${a} дублирует ${b}: это одна и та же работа; когда закроют ${b}, задача ${a} закроется вместе с ней.`;
+    case "duplicated":
+      return `${a} продублирована в ${b}: это одна и та же работа; когда закроют ${a}, задача ${b} закроется вместе с ней.`;
+    case "blocks":
+      return `${a} блокирует ${b}: пока ${a} не закрыта, ${b} выполнять нельзя — Redmine не даст перевести её в закрывающий статус.`;
+    case "blocked":
+      return `${a} заблокирована задачей ${b}: пока ${b} не закрыта, ${a} выполнять нельзя — Redmine не даст перевести её в закрывающий статус.`;
+    case "precedes":
+      return `${a} предшествует ${b}: ${b} начинается ${gap(a)}; при переносе сроков ${a} Redmine сдвинет даты ${b} сам.`;
+    case "follows":
+      return `${a} следует за ${b}: ${a} начинается ${gap(b)}; при переносе сроков ${b} Redmine сдвинет даты ${a} сам.`;
+    case "copied_to":
+      return `${a} скопирована в ${b}: ${b} заведена копированием ${a}, дальше задачи живут независимо.`;
+    case "copied_from":
+      return `${a} скопирована из ${b}: ${a} заведена копированием ${b}, дальше задачи живут независимо.`;
+  }
+}
+
+/**
+ * Отказ `422` по связи — это почти всегда одна из четырёх понятных ситуаций.
+ * Показывать пользователю код ответа бессмысленно: ему нужно знать, что именно не сходится.
+ */
+export function explainRelationRejection(
+  details: string[],
+  ctx: { from: number; to: number; type: RelationType },
+): string {
+  const flat = details.join("; ").toLowerCase();
+  const head = `Redmine отказался создать связь: ${describeRelation(ctx.type, ctx.from, ctx.to)}`;
+
+  if (ctx.from === ctx.to || /itself|сама с собой|самой с собой/.test(flat)) {
+    return (
+      `${head}\n` +
+      `  Задачу нельзя связать саму с собой: связь описывает отношение двух разных задач.\n` +
+      `  Проверьте номера — скорее всего, вторая задача указана неверно.`
+    );
+  }
+  if (/circular|цикл/.test(flat)) {
+    return (
+      `${head}\n` +
+      `  Такая связь замкнула бы круг: #${ctx.to} уже прямо или через цепочку зависит от #${ctx.from}.\n` +
+      `  Порядок выполнения должен быть линейным. Посмотрите цепочку — redmine.ts relations ${ctx.to} — ` +
+      `и снимите лишнее звено (unrelate), либо свяжите задачи типом relates: он ничего не упорядочивает.`
+    );
+  }
+  if (/descendant|subtask|подзадач|потомк|дочерн/.test(flat)) {
+    return (
+      `${head}\n` +
+      `  Одна из задач — подзадача другой. Внутри дерева порядок задаёт иерархия, и Redmine ` +
+      `запрещает дублировать её связями.\n` +
+      `  Если порядок нужен между соседними подзадачами — связывайте их между собой, а не с родителем: ` +
+      `redmine.ts tree ${ctx.from}`
+    );
+  }
+  if (/taken|already|exists|существует|занят/.test(flat)) {
+    return (
+      `${head}\n` +
+      `  Такая связь между этими задачами уже есть. Посмотреть: redmine.ts relations ${ctx.from}.\n` +
+      `  Чтобы заменить её другой — сначала удалите прежнюю: redmine.ts unrelate <номер связи> --yes`
+    );
+  }
+  return (
+    `${head}\n` +
+    `  Redmine ответил: ${details.join("; ") || "без пояснения"}.\n` +
+    `  Обычные причины: задача в закрытом проекте, у владельца ключа нет права «Управление связями задач», ` +
+    `либо тип связи запрещён рабочим процессом. Проверьте доступ: redmine.ts issue ${ctx.to}`
+  );
+}
+
+/** Отказы по связям разворачиваются в объяснение — так же, как отказы по проектам. */
+async function withRelationErrors<T>(
+  ctx: { from: number; to: number; type: RelationType },
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    if (error.status === 422) throw new UserError(explainRelationRejection(error.details, ctx));
+    if (error.status === 403) {
+      throw new UserError(
+        `Связь не создана: у владельца ключа нет права «Управление связями задач» в одном из проектов.\n` +
+          `  Право выдаёт администратор в «Администрирование → Роли и права». Обходного пути нет.`,
+      );
+    }
+    if (error.status === 404) {
+      throw new UserError(
+        `Одна из задач недоступна: #${ctx.from} или #${ctx.to} нет на инстансе либо она закрыта от владельца ключа.\n` +
+          `  Если номер точно верный — проверьте второй инстанс: связи работают только внутри одного Redmine.`,
+      );
+    }
+    throw error;
+  }
+}
+
+// ──────────────── ссылки на задачи и второй инстанс ───────────────────
+
+export type InstanceRef = { name: string; base: string };
+
+export type IssueRef = {
+  id: number;
+  /** Профиль, явно названный в ссылке; не задан — значит, текущий инстанс. */
+  instance?: string;
+  /** Хост, не принадлежащий ни одному профилю из конфига. */
+  foreignHost?: string;
+  raw: string;
+};
+
+/** Имя профиля по названию, однозначному началу имени или подстроке адреса. */
+function matchInstanceName(known: InstanceRef[], wanted: string): string | null {
+  const needle = wanted.toLowerCase();
+  const exact = known.find((k) => k.name.toLowerCase() === needle);
+  if (exact) return exact.name;
+  const byPrefix = known.filter((k) => k.name.toLowerCase().startsWith(needle));
+  if (byPrefix.length === 1) return byPrefix[0]!.name;
+  const byUrl = known.filter((k) => k.base.toLowerCase().includes(needle));
+  return byUrl.length === 1 ? byUrl[0]!.name : null;
+}
+
+/**
+ * Ссылка на задачу в любом виде, в каком её называет человек: `1234`, `#1234`, `ru:25185`
+ * или полный адрес. Адрес сверяется с профилями конфига — так становится видно,
+ * что задача лежит на другом инстансе, где связи Redmine уже не работают.
+ */
+export function parseIssueRef(raw: string, known: InstanceRef[] = []): IssueRef {
+  const value = raw.trim();
+  if (!value) throw new UserError("Пустая ссылка на задачу.");
+
+  if (/^https?:\/\//i.test(value)) {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new UserError(`Адрес «${value}» не разбирается как ссылка.`);
+    }
+    const found = url.pathname.match(/\/issues\/(\d+)/);
+    if (!found) throw new UserError(`В адресе «${value}» нет номера задачи: ожидается …/issues/NNNN.`);
+    const id = Number(found[1]);
+    const low = value.toLowerCase();
+    const hit = known.find((k) => low.startsWith(k.base.toLowerCase()));
+    return hit ? { id, instance: hit.name, raw: value } : { id, foreignHost: url.host, raw: value };
+  }
+
+  const prefixed = value.match(/^([A-Za-z0-9_.-]+)\s*:\s*#?(\d+)$/);
+  if (prefixed) {
+    const name = matchInstanceName(known, prefixed[1]!);
+    if (!name) {
+      throw new UserError(
+        `Инстанс "${prefixed[1]}" не найден. Профили: ${known.map((k) => k.name).join(", ") || "нет"} ` +
+          `(список — redmine.ts instances).`,
+      );
+    }
+    return { id: Number(prefixed[2]), instance: name, raw: value };
+  }
+
+  const bare = value.match(/^#?(\d+)$/);
+  if (bare) return { id: Number(bare[1]), raw: value };
+
+  throw new UserError(
+    `Ссылка на задачу "${raw}" не разобрана. Форматы: 1234, #1234, ru:25185, https://…/issues/25185.`,
+  );
+}
+
+export type CrossRef = { instance: string; id: number; url: string };
+
+/**
+ * Ссылки на задачи другого инстанса, спрятанные в описании или комментарии.
+ * Связей Redmine между инстансами не бывает, поэтому такая ссылка — единственный вид связи,
+ * и теряться в тексте она не должна.
+ */
+export function findCrossInstanceRefs(text: string, others: InstanceRef[]): CrossRef[] {
+  if (!text || others.length === 0) return [];
+  const out: CrossRef[] = [];
+  const seen = new Set<string>();
+  for (const raw of text.match(/https?:\/\/[^\s"'<>)\]]+/gi) ?? []) {
+    const low = raw.toLowerCase();
+    const hit = others.find((o) => low.startsWith(o.base.toLowerCase()));
+    if (!hit) continue;
+    const found = raw.match(/\/issues\/(\d+)/);
+    if (!found) continue;
+    const id = Number(found[1]);
+    const key = `${hit.name}#${id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ instance: hit.name, id, url: `${hit.base}issues/${id}` });
+  }
+  return out;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Подпись перекрёстной ссылки: проект отвечает на вопрос «чья это задача». */
+export function xrefLabel(project: string, id: number, subject: string): string {
+  return `${project} #${id} — ${subject}`;
+}
+
+/**
+ * Готовая строка для вставки в текст на другом инстансе. Номером `#NNNN` её писать нельзя:
+ * там этот номер указывает на чужую задачу, и читатель уходит не туда.
+ */
+export function formatXref(
+  ref: { url: string; id: number; project: string; subject: string },
+  markup: "html" | "textile" | "markdown" = "html",
+): string {
+  const label = xrefLabel(ref.project, ref.id, ref.subject);
+  if (markup === "markdown") return `[${label}](${ref.url})`;
+  if (markup === "textile") return `"${label}":${ref.url}`;
+  return `<a href="${ref.url}">${escapeHtml(label)}</a>`;
+}
+
+/** Профили конфига как «имя + адрес»: ключи здесь не нужны, поэтому берутся и профили без них. */
+async function instanceRefs(): Promise<InstanceRef[]> {
+  const cfg = await readConfigFile();
+  const out: InstanceRef[] = [];
+  for (const [name, inst] of Object.entries(cfg?.instances ?? {})) {
+    if (!inst.url) continue;
+    try {
+      out.push({ name, base: normalizeBase(inst.url) });
+    } catch {
+      // Кривой url в конфиге не должен ронять чтение задачи.
+    }
+  }
+  return out;
+}
+
+/** Задача, которой может не быть или которая закрыта от владельца ключа. */
+async function tryIssue(rm: Resolved, id: number): Promise<Issue | null> {
+  try {
+    return (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`)).issue;
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 404 || error.status === 403)) return null;
+    throw error;
+  }
+}
+
+type RelationView = { relation: IssueRelation; type: RelationType; otherId: number };
+
+/** Связи задачи, развёрнутые от её лица. */
+function viewRelations(relations: IssueRelation[], id: number): RelationView[] {
+  const out: RelationView[] = [];
+  for (const relation of relations) {
+    const stored = asRelationType(relation.relation_type);
+    if (!stored) continue;
+    const mine = relation.issue_id === id ? stored : invertRelationType(stored);
+    const otherId = relation.issue_id === id ? relation.issue_to_id : relation.issue_id;
+    out.push({ relation, type: mine, otherId });
+  }
+  return out;
+}
+
+/** Блок связей для карточки задачи: тип, вторая задача, её статус и номер самой связи. */
+function relationLines(views: RelationView[], others: Map<number, Issue | null>): string[] {
+  return views.map(({ relation, type, otherId }) => {
+    const other = others.get(otherId) ?? null;
+    const delay = delayApplies(type) && relation.delay ? `, отсрочка ${relation.delay} дн.` : "";
+    return (
+      `  ${relationLabel(type)} #${otherId}` +
+      (other ? ` — ${clip(other.subject, 60)} (${other.status.name})` : " — нет доступа или задача удалена") +
+      ` · связь ${relation.id}${delay}`
+    );
+  });
+}
+
+/** Подтягивает вторые задачи связей одним заходом: без них список связей нечитаем. */
+async function loadRelatedIssues(rm: Resolved, views: RelationView[]): Promise<Map<number, Issue | null>> {
+  const ids = [...new Set(views.map((v) => v.otherId))];
+  const loaded = await mapLimit(ids, 4, (id) => tryIssue(rm, id));
+  return new Map(ids.map((id, index) => [id, loaded[index] ?? null]));
+}
+
+/** Текст задачи целиком — описание и все комментарии: перекрёстные ссылки ищутся по нему. */
+function issueFullText(issue: Issue): string {
+  return [issue.description ?? "", ...(issue.journals ?? []).map((j) => j.notes ?? "")].join("\n");
+}
+
+function crossRefLines(refs: CrossRef[]): string[] {
+  return refs.map(
+    (r) => `  ${r.instance} #${r.id} — ${r.url}  (подробнее: redmine.ts issue ${r.id} --instance ${r.instance})`,
+  );
+}
+
+async function cmdRelations(rm: Resolved, args: Args): Promise<void> {
+  const raw = args.positional[0] ?? str(args, "issue");
+  if (!raw) throw new UserError("Укажите номер задачи: redmine.ts relations 25185");
+  const id = Number(raw.replace("#", ""));
+  if (!Number.isInteger(id)) throw new UserError("Укажите номер задачи: redmine.ts relations 25185");
+
+  const issue = (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`, { include: "relations,journals" }))
+    .issue;
+  const views = viewRelations(issue.relations ?? [], id);
+  const others = await loadRelatedIssues(rm, views);
+  const cross = findCrossInstanceRefs(
+    issueFullText(issue),
+    (await instanceRefs()).filter((x) => x.name !== rm.name),
+  );
+
+  emit(
+    {
+      instance: rm.name,
+      issue: { id, subject: issue.subject },
+      relations: views.map((v) => ({ id: v.relation.id, type: v.type, issue: v.otherId, delay: v.relation.delay })),
+      crossInstanceRefs: cross,
+    },
+    () => {
+      const lines = [`СВЯЗИ #${id} — ${issue.subject}`, issueUrl(rm, id), ""];
+      if (views.length === 0) lines.push("Связей в Redmine нет.");
+      else {
+        lines.push(...relationLines(views, others), "");
+        lines.push("Что это значит:");
+        for (const v of views) lines.push(`  ${describeRelation(v.type, id, v.otherId, v.relation.delay)}`);
+        lines.push("", `Удалить связь: redmine.ts unrelate <номер связи> --instance ${rm.name} --yes`);
+      }
+      if (cross.length > 0) {
+        lines.push(
+          "",
+          "Связано на другом инстансе (ссылкой в тексте — связей Redmine между инстансами не бывает):",
+          ...crossRefLines(cross),
+        );
+      }
+      return lines.join("\n");
+    },
+  );
+}
+
+/** Ровно та ситуация, ради которой команда отказывается работать: задача на другом Redmine. */
+async function reportCrossInstance(rm: Resolved, ref: IssueRef, fromId: number): Promise<void> {
+  if (ref.foreignHost) {
+    throw new UserError(
+      `Адрес ${ref.raw} не принадлежит ни одному профилю из конфига (хост ${ref.foreignHost}).\n` +
+        `  Связи Redmine существуют только внутри одного инстанса. Если это наш второй Redmine — ` +
+        `добавьте его профиль в конфиг (redmine.ts instances), иначе вставьте ссылку в текст руками.`,
+    );
+  }
+
+  const target = await resolveInstance(ref.instance);
+  const issue = await tryIssue(target, ref.id);
+  const url = issueUrl(target, ref.id);
+  const markup = target.markup ?? "html";
+  const line = issue
+    ? formatXref({ url, id: ref.id, project: issue.project.name, subject: issue.subject }, markup)
+    : null;
+
+  emit(
+    {
+      crossInstance: true,
+      created: false,
+      from: { instance: rm.name, issue: fromId },
+      to: { instance: target.name, issue: ref.id, url },
+      xref: line,
+    },
+    () =>
+      [
+        `СВЯЗЬ НЕ СОЗДАНА: #${fromId} лежит на инстансе ${rm.name}, а #${ref.id} — на ${target.name}.`,
+        "",
+        "Связи Redmine живут внутри одного инстанса: у второго Redmine своя нумерация задач, и объекта,",
+        "который связал бы две базы, в API не существует. Обходного пути нет — и придумывать его не надо.",
+        "",
+        `Связывают такие задачи перекрёстной ссылкой в тексте обеих. Готовая строка для #${fromId}:`,
+        "─".repeat(60),
+        line ?? `${url}  (тему задачи прочитать не удалось: нет доступа к #${ref.id} на ${target.name})`,
+        "─".repeat(60),
+        "",
+        `Вставьте её в описание или комментарий #${fromId} (redmine.ts comment ${fromId} --text-file …),`,
+        `а в #${ref.id} на ${target.name} — встречную: redmine.ts xref ${fromId} --instance ${rm.name}.`,
+        "Связь нужна с обеих сторон, иначе её найдёт только тот, кто и так знает, где искать.",
+      ].join("\n"),
+  );
+}
+
+async function cmdRelate(rm: Resolved, args: Args): Promise<void> {
+  const rawFrom = args.positional[0] ?? str(args, "from") ?? str(args, "issue");
+  if (!rawFrom) throw new UserError("Укажите задачу: redmine.ts relate 25185 --to 25190 --type blocks");
+  const fromId = Number(rawFrom.replace("#", ""));
+  if (!Number.isInteger(fromId)) throw new UserError("Первый аргумент — номер задачи: redmine.ts relate 25185 --to …");
+
+  const rawTo = str(args, "to") ?? args.positional[1];
+  if (!rawTo) throw new UserError("Укажите вторую задачу: --to 25190 (либо --to ru:25185, либо полный адрес).");
+
+  const known = await instanceRefs();
+  const ref = parseIssueRef(rawTo, known);
+  if (ref.foreignHost || (ref.instance && ref.instance !== rm.name)) {
+    await reportCrossInstance(rm, ref, fromId);
+    return;
+  }
+
+  const type = parseRelationType(required(args, "type"));
+  const delay = num(args, "delay");
+  if (delay !== undefined && !delayApplies(type)) {
+    throw new UserError(
+      `Отсрочка --delay имеет смысл только у precedes и follows: там Redmine двигает даты второй задачи. ` +
+        `Для связи «${relationLabel(type)}» она ничего не значит — уберите флаг.`,
+    );
+  }
+  if (fromId === ref.id) {
+    throw new UserError(
+      `#${fromId} нельзя связать саму с собой: связь описывает отношение двух разных задач. Проверьте --to.`,
+    );
+  }
+
+  const [from, to] = await Promise.all([tryIssue(rm, fromId), tryIssue(rm, ref.id)]);
+  const missing = [from ? null : fromId, to ? null : ref.id].filter((x): x is number => x !== null);
+  if (missing.length > 0) {
+    throw new UserError(
+      `На инстансе ${rm.name} недоступны: ${missing.map((id) => `#${id}`).join(", ")} — задачи нет либо она закрыта от ключа.\n` +
+        `  Если номер верный, проверьте второй инстанс: redmine.ts issue ${missing[0]} --instance <профиль>.\n` +
+        `  Связать задачи с разных инстансов нельзя — там нужна перекрёстная ссылка: ` +
+        `redmine.ts xref ${missing[0]} --instance <профиль>.`,
+    );
+  }
+
+  const existing = viewRelations(
+    (await request<{ relations: IssueRelation[] }>(rm, "GET", `issues/${fromId}/relations.json`)).relations ?? [],
+    fromId,
+  ).filter((v) => v.otherId === ref.id);
+  if (existing.length > 0) {
+    const shown = existing.map((v) => `  ${relationLabel(v.type)} #${v.otherId} · связь ${v.relation.id}`).join("\n");
+    throw new UserError(
+      `#${fromId} и #${ref.id} уже связаны:\n${shown}\n` +
+        `  Redmine держит одну связь на пару задач. Чтобы заменить тип — сначала удалите прежнюю: ` +
+        `redmine.ts unrelate ${existing[0]!.relation.id} --instance ${rm.name} --yes`,
+    );
+  }
+
+  const preview =
+    `СВЯЗЬ ЗАДАЧ · инстанс ${rm.name} · тип ${relationLabel(type)} (${type})` +
+    (delay !== undefined ? ` · отсрочка ${delay} дн.` : "") +
+    `\n` +
+    `  #${from!.id} — ${from!.subject}\n` +
+    `    ${from!.project.name} · ${from!.status.name} · срок ${from!.due_date ?? "—"} · ${issueUrl(rm, from!.id)}\n` +
+    `  #${to!.id} — ${to!.subject}\n` +
+    `    ${to!.project.name} · ${to!.status.name} · срок ${to!.due_date ?? "—"} · ${issueUrl(rm, to!.id)}\n` +
+    `${"─".repeat(60)}\n` +
+    `${describeRelation(type, from!.id, to!.id, delay)}\n` +
+    `${"─".repeat(60)}\n` +
+    (delayApplies(type) ? "Redmine пересчитает даты второй задачи по сроку первой — проверьте, что это ожидаемо.\n" : "") +
+    (type === "duplicates" || type === "duplicated"
+      ? "Закрытие одной из задач закроет вторую автоматически.\n"
+      : "") +
+    "Участники обеих задач получат уведомление.";
+
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  const body: Record<string, unknown> = { issue_to_id: ref.id, relation_type: type };
+  if (delay !== undefined) body.delay = delay;
+  const created = await withRelationErrors({ from: fromId, to: ref.id, type }, () =>
+    request<{ relation: IssueRelation }>(rm, "POST", `issues/${fromId}/relations.json`, undefined, { relation: body }),
+  );
+
+  emit(
+    { created: created.relation },
+    () =>
+      `Связь ${created.relation.id} создана: ${describeRelation(type, fromId, ref.id, delay)}\n${issueUrl(rm, fromId)}`,
+  );
+}
+
+async function cmdUnrelate(rm: Resolved, args: Args): Promise<void> {
+  const raw = args.positional[0] ?? str(args, "relation") ?? str(args, "id");
+  if (!raw) throw new UserError("Укажите номер связи: redmine.ts unrelate 812 --yes (номера видно в relations).");
+  const relationId = Number(raw.replace("#", ""));
+  if (!Number.isInteger(relationId)) {
+    throw new UserError("Номер связи — число: redmine.ts unrelate 812 --yes (номера видно в relations).");
+  }
+
+  let relation: IssueRelation;
+  try {
+    relation = (await request<{ relation: IssueRelation }>(rm, "GET", `relations/${relationId}.json`)).relation;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      throw new UserError(
+        `Связи ${relationId} на инстансе ${rm.name} нет: её уже удалили либо номер с другого инстанса.\n` +
+          `  Номера связей видно в карточке задачи: redmine.ts relations <номер задачи>`,
+      );
+    }
+    throw error;
+  }
+
+  const stored = asRelationType(relation.relation_type) ?? "relates";
+  const [from, to] = await Promise.all([tryIssue(rm, relation.issue_id), tryIssue(rm, relation.issue_to_id)]);
+  const name = (id: number, issue: Issue | null): string =>
+    `#${id}${issue ? ` — ${issue.subject} (${issue.status.name})` : ""}`;
+
+  const preview =
+    `УДАЛЕНИЕ СВЯЗИ ${relationId} · инстанс ${rm.name}\n` +
+    `  ${name(relation.issue_id, from)}\n` +
+    `  ${name(relation.issue_to_id, to)}\n` +
+    `${"─".repeat(60)}\n` +
+    `Сейчас: ${describeRelation(stored, relation.issue_id, relation.issue_to_id, relation.delay)}\n` +
+    `После удаления задачи останутся сами по себе; тексты и часы не затрагиваются.\n` +
+    `${"─".repeat(60)}`;
+
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  await request(rm, "DELETE", `relations/${relationId}.json`);
+  emit(
+    { deleted: relationId },
+    () => `Связь ${relationId} удалена: #${relation.issue_id} и #${relation.issue_to_id} больше не связаны.`,
+  );
+}
+
+async function cmdXref(rm: Resolved, args: Args): Promise<void> {
+  const raw = args.positional[0] ?? str(args, "issue");
+  if (!raw) throw new UserError("Укажите задачу: redmine.ts xref 25185 --instance ru");
+  const known = await instanceRefs();
+  const ref = parseIssueRef(raw, known);
+  if (ref.foreignHost) {
+    throw new UserError(
+      `Адрес ${ref.raw} не принадлежит ни одному профилю из конфига (хост ${ref.foreignHost}). ` +
+        `Перекрёстную ссылку скилл строит только по известным инстансам.`,
+    );
+  }
+
+  const source = ref.instance && ref.instance !== rm.name ? await resolveInstance(ref.instance) : rm;
+  const issue = await tryIssue(source, ref.id);
+  if (!issue) {
+    throw new UserError(
+      `#${ref.id} на инстансе ${source.name} недоступна: задачи нет либо она закрыта от владельца ключа.\n` +
+        `  Проверьте номер и профиль: redmine.ts instances`,
+    );
+  }
+
+  const url = issueUrl(source, ref.id);
+  // Строка вставляется в текст на другом инстансе — значит, и разметка нужна его.
+  const elsewhere = known.filter((k) => k.name !== source.name);
+  const cfg = await readConfigFile();
+  const guessed = elsewhere.length === 1 ? cfg?.instances[elsewhere[0]!.name]?.markup : undefined;
+  const requested = str(args, "markup");
+  const markup: "html" | "textile" | "markdown" =
+    requested === "textile" || requested === "markdown" || requested === "html"
+      ? requested
+      : (guessed ?? source.markup ?? "html");
+
+  const line = formatXref({ url, id: ref.id, project: issue.project.name, subject: issue.subject }, markup);
+  const label = xrefLabel(issue.project.name, ref.id, issue.subject);
+
+  emit(
+    {
+      instance: source.name,
+      issue: { id: ref.id, project: issue.project.name, subject: issue.subject },
+      url,
+      markup,
+      label,
+      xref: line,
+    },
+    () =>
+      [
+        `ПЕРЕКРЁСТНАЯ ССЫЛКА на #${ref.id} · инстанс ${source.name}`,
+        label,
+        url,
+        "",
+        `Вставить в текст на другом инстансе (разметка ${markup}${requested ? "" : ", задаётся флагом --markup"}):`,
+        "─".repeat(60),
+        line,
+        "─".repeat(60),
+        "",
+        `Без разметки: ${label} (${url})`,
+        "",
+        `На инстансе ${source.name} эта задача пишется просто #${ref.id}. На другом так писать нельзя:`,
+        `там #${ref.id} — чужая задача, и читатель уйдёт не туда. Правило — references/editorial.md,`,
+        "раздел «Ссылки между задачами».",
+      ].join("\n"),
+  );
+}
+
 async function cmdIssue(rm: Resolved, args: Args): Promise<void> {
   const raw = args.positional[0] ?? str(args, "issue");
   if (!raw) throw new UserError("Укажите номер задачи: redmine.ts issue 1234");
@@ -1707,7 +2449,15 @@ async function cmdIssue(rm: Resolved, args: Args): Promise<void> {
   const journals = (i.journals ?? []).filter((j) => j.notes?.trim() || j.details.length > 0);
   const tail = journals.slice(-(num(args, "comments") ?? 5));
 
-  emit(i, () => {
+  // Связь, которой не видно в карточке, связью не работает: показываем обе разновидности.
+  const views = viewRelations(i.relations ?? [], i.id);
+  const related = await loadRelatedIssues(rm, views);
+  const cross = findCrossInstanceRefs(
+    issueFullText(i),
+    (await instanceRefs()).filter((x) => x.name !== rm.name),
+  );
+
+  emit({ ...i, crossInstanceRefs: cross }, () => {
     const lines = [
       `#${i.id} — ${i.subject}`,
       issueUrl(rm, i.id),
@@ -1724,6 +2474,8 @@ async function cmdIssue(rm: Resolved, args: Args): Promise<void> {
       } | Обновлена: ${i.updated_on}`,
     ];
     if (i.description?.trim()) lines.push("", "Описание:", clipBlock(i.description, 2000));
+    if (views.length) lines.push("", "Связи:", ...relationLines(views, related));
+    if (cross.length) lines.push("", "Связано на другом инстансе:", ...crossRefLines(cross));
     if (tail.length) {
       lines.push("", `Последние события (${tail.length} из ${journals.length}):`);
       for (const j of tail) {
@@ -3609,6 +4361,16 @@ update-issue, edit, create-project, update-project, archive-project без --yes
   create-tree --file plan.json [--project X] [--yes]
                родитель + подзадачи одной операцией; тексты описаний — из descriptionFile
   tree <id>                         дерево задачи с агрегатами оценок, списаний и готовности
+
+Связи между задачами (только внутри одного инстанса)
+  relations <id>                    связи задачи: тип, номер, тема и статус второй задачи
+  relate <id> --to <id|профиль:id|адрес> --type <тип> [--delay N] [--yes]
+        типы: relates duplicates duplicated blocks blocked precedes follows copied_to copied_from;
+        русские синонимы: связана, дублирует, блокирует, заблокирована, предшествует, следует
+        --delay только для precedes/follows; задача другого инстанса — не связь, а перекрёстная ссылка
+  unrelate <id связи> [--yes]       удалить связь; номера связей видно в relations
+  xref <id> [--instance <профиль>] [--markup html|textile|markdown]
+        готовая строка со ссылкой на задачу — для вставки в текст на другом инстансе
   detect-markup [--project X]       какая разметка принята на инстансе (textile/markdown/html)
   comment <id> --text "..."|--text-file f [--private] [--dry-run]
   update-issue <id> [--status имя] [--done N] [--note текст] [--assignee me] [--due дата] [--dry-run]
@@ -3691,6 +4453,10 @@ async function main(): Promise<void> {
     "create-issue": cmdCreateIssue,
     "create-tree": cmdCreateTree,
     tree: cmdTree,
+    relations: cmdRelations,
+    relate: cmdRelate,
+    unrelate: cmdUnrelate,
+    xref: cmdXref,
     "detect-markup": cmdDetectMarkup,
     comment: cmdComment,
     log: cmdLog,
