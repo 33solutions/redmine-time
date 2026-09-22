@@ -121,21 +121,55 @@ for (const file of files) {
 
 // ── 3. История коммитов ───────────────────────────────────────────────
 if (process.argv.includes("--history")) {
-  // Фикстуры исключаем и из истории: их синтетические «секреты» добавлялись коммитами.
-  const excludes = [...FIXTURE_FILES].map((f) => `:(exclude)${f}`);
-  const diff = await sh(["git", "log", "-p", "--no-color", "--unified=0", "--", ".", ...excludes]);
-  const added = diff
+  // Проверяем не диффы, а каждую когда-либо существовавшую версию файла: строка,
+  // добавленная в первом коммите и не тронутая во втором, в дифф второго не попадает,
+  // а в публичной истории видна целиком.
+  const objects = (await sh(["git", "rev-list", "--objects", "--all"]))
     .split("\n")
-    .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
-    .map((l) => l.slice(1))
-    .join("\n");
-  // История — это в основном диффы кода и документации, поэтому только правила «по форме секрета».
-  const findings = scanText(added, { audience: "internal" })
-    .filter((f) => f.severity === "block")
-    .filter((f) => STRONG_RULES.has(f.rule));
-  for (const f of findings) {
-    problems.push({ file: "история git", line: null, title: f.title, detail: f.excerpt });
+    .map((line) => {
+      const space = line.indexOf(" ");
+      return space === -1 ? null : { sha: line.slice(0, space), path: line.slice(space + 1).trim() };
+    })
+    .filter((o): o is { sha: string; path: string } => o !== null && o.path.length > 0);
+
+  const blobs = new Map<string, string>(); // sha → путь (для адреса находки)
+  for (const o of objects) {
+    if (!isTextFile(o.path) || FIXTURE_FILES.has(o.path)) continue;
+    if (!blobs.has(o.sha)) blobs.set(o.sha, o.path);
   }
+
+  const MAX_BLOBS = 5000;
+  const list = [...blobs.entries()].slice(0, MAX_BLOBS);
+  if (blobs.size > MAX_BLOBS) notes.push(`история: проверено ${MAX_BLOBS} версий файлов из ${blobs.size}`);
+
+  let checked = 0;
+  for (const [sha, path] of list) {
+    let text: string;
+    try {
+      text = await sh(["git", "cat-file", "-p", sha]);
+    } catch {
+      continue; // не блоб (дерево или тег)
+    }
+    checked++;
+    const where = `${path}@${sha.slice(0, 8)}`;
+
+    for (const f of scanText(text, { audience: "internal" })) {
+      if (f.severity !== "block" || !STRONG_RULES.has(f.rule)) continue;
+      problems.push({ file: `история ${where}`, line: f.line, title: f.title, detail: f.excerpt });
+    }
+    // Внутренние адреса в истории — ровно та утечка, ради которой история и проверяется.
+    for (const { pattern, title } of INTERNAL_PATTERNS) {
+      const re = new RegExp(pattern.source, pattern.flags);
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) {
+        const around = text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 20);
+        if (INTERNAL_ALLOW.test(around)) continue;
+        const line = text.slice(0, m.index).split("\n").length;
+        problems.push({ file: `история ${where}`, line, title, detail: m[0] });
+      }
+    }
+  }
+  notes.push(`история: проверено ${checked} версий файлов во всех ветках и тегах`);
   const everAdded = (await sh(["git", "log", "--all", "--diff-filter=A", "--name-only", "--pretty=format:"]))
     .split("\n")
     .map((f) => f.trim())
