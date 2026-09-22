@@ -7,8 +7,9 @@
  * Вывод: человекочитаемый текст, либо --json для машинного разбора.
  */
 
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { guard, scanText, formatFindings, type Audience, type Finding } from "./guard.ts";
+import { harvestRepo, isGitRepo, repoName, draftDescription, type RepoBinding } from "./harvest.ts";
 
 // ─────────────────────────────── конфиг ───────────────────────────────
 
@@ -26,6 +27,8 @@ type Instance = {
 type ConfigFile = {
   default?: string;
   instances: Record<string, Instance>;
+  /** Привязка репозиториев к инстансу и проекту: ключ — путь или owner/repo. */
+  repos?: Record<string, RepoBinding>;
 };
 
 type Resolved = Instance & { name: string; base: string };
@@ -83,7 +86,34 @@ async function readConfigFile(): Promise<ConfigFile | null> {
         value.markup === "textile" || value.markup === "markdown" || value.markup === "html" ? value.markup : undefined,
     };
   }
-  return { default: typeof raw.default === "string" ? raw.default : undefined, instances: parsed };
+  const repos: Record<string, RepoBinding> = {};
+  if (isRecord(raw.repos)) {
+    for (const [key, value] of Object.entries(raw.repos)) {
+      if (!isRecord(value)) continue;
+      repos[key] = {
+        instance: typeof value.instance === "string" ? value.instance : undefined,
+        project: typeof value.project === "string" ? value.project : undefined,
+        client: typeof value.client === "string" ? value.client : undefined,
+        activity: typeof value.activity === "string" ? value.activity : undefined,
+        tracker: typeof value.tracker === "string" ? value.tracker : undefined,
+      };
+    }
+  }
+
+  return {
+    default: typeof raw.default === "string" ? raw.default : undefined,
+    instances: parsed,
+    repos: Object.keys(repos).length > 0 ? repos : undefined,
+  };
+}
+
+/** Ключи привязки сравниваем без учёта регистра и вида слэшей. */
+function normalizeRepoKey(key: string): string {
+  return key.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+async function writeConfigFile(cfg: ConfigFile): Promise<void> {
+  await Bun.write(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
 function normalizeBase(url: string): string {
@@ -444,7 +474,7 @@ function shiftDays(d: Date, days: number): Date {
   return c;
 }
 
-function parseDate(input: string): string {
+export function parseDate(input: string): string {
   const s = input.trim().toLowerCase();
   const today = new Date();
   if (s === "today" || s === "сегодня") return fmtDate(today);
@@ -472,7 +502,7 @@ function startOfWeek(d: Date): Date {
 }
 
 /** Период → [from, to] в формате YYYY-MM-DD. */
-function parsePeriod(input: string): [string, string] {
+export function parsePeriod(input: string): [string, string] {
   const s = input.trim().toLowerCase();
   const today = new Date();
   if (s === "today" || s === "сегодня") return [fmtDate(today), fmtDate(today)];
@@ -503,7 +533,7 @@ function parsePeriod(input: string): [string, string] {
   return [single, single];
 }
 
-function parseHours(input: string): number {
+export function parseHours(input: string): number {
   const s = input.trim().toLowerCase().replace(",", ".");
   const colon = s.match(/^(\d+):([0-5]\d)$/);
   if (colon) return Number(colon[1]) + Number(colon[2]) / 60;
@@ -668,7 +698,7 @@ const HTML_ENTITIES: Record<string, string> = {
 };
 
 /** Redmine отдаёт описания и комментарии как HTML или textile — приводим к читаемому тексту. */
-function plain(text: string): string {
+export function plain(text: string): string {
   return text
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/(p|div|li|h[1-6]|tr)>/gi, "\n")
@@ -1244,6 +1274,207 @@ async function cmdCreateTree(rm: Resolved, args: Args): Promise<void> {
     return lines.join("\n");
   });
   if (failed.length) process.exitCode = 1;
+}
+
+// ─────────────── репозитории и сбор сделанного по истории ─────────────
+
+/** Находит привязку репозитория: по пути или по owner/repo из origin. */
+async function findBinding(path: string): Promise<{ key: string; binding: RepoBinding } | null> {
+  const cfg = await readConfigFile();
+  if (!cfg?.repos) return null;
+  const candidates = [normalizeRepoKey(path), normalizeRepoKey(await repoName(path))];
+  for (const [key, binding] of Object.entries(cfg.repos)) {
+    if (candidates.includes(normalizeRepoKey(key))) return { key, binding };
+  }
+  return null;
+}
+
+async function cmdRepos(args: Args): Promise<void> {
+  const action = args.positional[0] ?? "list";
+  const cfg = (await readConfigFile()) ?? { instances: {} };
+
+  if (action === "list") {
+    const rows = Object.entries(cfg.repos ?? {});
+    emit({ repos: cfg.repos ?? {} }, () =>
+      rows.length === 0
+        ? `Репозитории не привязаны. Привязать текущий:\n  redmine.ts repos add --instance <профиль> --project <проект> --client "<организация>"`
+        : table([
+            ["РЕПОЗИТОРИЙ", "ИНСТАНС", "ПРОЕКТ", "ОРГАНИЗАЦИЯ", "ВИД ДЕЯТЕЛЬНОСТИ"],
+            ...rows.map(([key, b]) => [key, b.instance ?? "—", b.project ?? "—", b.client ?? "—", b.activity ?? "—"]),
+          ]),
+    );
+    return;
+  }
+
+  const path = resolve(str(args, "path") ?? args.positional[1] ?? ".");
+  if (!(await isGitRepo(path))) throw new UserError(`${path} — не репозиторий git.`);
+  const key = str(args, "key") ?? (await repoName(path));
+
+  if (action === "remove" || action === "rm") {
+    if (!cfg.repos?.[key]) throw new UserError(`Привязка "${key}" не найдена. Список: redmine.ts repos list`);
+    delete cfg.repos[key];
+    await writeConfigFile(cfg);
+    emit({ removed: key }, () => `Привязка "${key}" удалена.`);
+    return;
+  }
+
+  if (action !== "add" && action !== "set") {
+    throw new UserError('Доступно: repos list | repos add [--path .] | repos remove --key <ключ>');
+  }
+
+  const binding: RepoBinding = {
+    instance: str(args, "instance") ?? (await readConfigFile())?.default,
+    project: str(args, "project"),
+    client: str(args, "client"),
+    activity: str(args, "activity"),
+    tracker: str(args, "tracker"),
+  };
+  if (!binding.instance) throw new UserError("Укажите --instance <профиль>.");
+  if (!binding.project) throw new UserError("Укажите --project <identifier проекта Redmine>.");
+
+  cfg.repos = { ...(cfg.repos ?? {}), [key]: binding };
+  await writeConfigFile(cfg);
+  emit({ key, binding }, () =>
+    `Репозиторий "${key}" привязан: ${binding.instance} / ${binding.project}` +
+      (binding.client ? ` (${binding.client})` : "") +
+      `\nСобрать сделанное: redmine.ts harvest --repo "${path}" --period week`,
+  );
+}
+
+async function cmdHarvest(args: Args): Promise<void> {
+  const path = resolve(str(args, "repo") ?? args.positional[0] ?? ".");
+  if (!(await isGitRepo(path))) {
+    throw new UserError(`${path} — не репозиторий git. Укажите путь: harvest --repo <путь>`);
+  }
+
+  const found = await findBinding(path);
+  const binding: RepoBinding = {
+    ...(found?.binding ?? {}),
+    instance: str(args, "instance") ?? found?.binding.instance,
+    project: str(args, "project") ?? found?.binding.project,
+  };
+  const rm = await resolveInstance(binding.instance);
+
+  const [from, to] = parsePeriod(str(args, "period") ?? "week");
+  const authorFlag = str(args, "author") ?? "me";
+  const author = authorFlag === "all" ? null : authorFlag === "me" ? (await currentUser(rm)).mail ?? null : authorFlag;
+
+  const result = await harvestRepo(path, binding, {
+    from,
+    to,
+    author,
+    gap: num(args, "gap") ?? 90,
+    warmup: num(args, "warmup") ?? 30,
+    min: num(args, "min") ?? 0.5,
+  });
+
+  if (result.commits.length === 0) {
+    emit(result, () => `За ${from}..${to} коммитов${author ? ` автора ${author}` : ""} в ${result.repo} нет.`);
+    return;
+  }
+
+  // Проверяем, существуют ли задачи, на которые ссылаются коммиты.
+  const referenced = [...new Set(result.groups.map((g) => g.issue).filter((n): n is number => n !== null))];
+  const known = new Map<number, Issue | null>();
+  await mapLimit(referenced, 4, async (id) => {
+    try {
+      known.set(id, (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`)).issue);
+    } catch {
+      known.set(id, null);
+    }
+  });
+
+  const markup = rm.markup ?? "textile";
+  const linked = result.groups.filter((g) => g.issue !== null && known.get(g.issue) !== null);
+  const orphanRefs = result.groups.filter((g) => g.issue !== null && known.get(g.issue) === null);
+  const fresh = result.groups.filter((g) => g.issue === null);
+
+  const entries = linked.map((g) => ({
+    issue: g.issue,
+    hours: String(g.hours),
+    comment: `${g.commits.length} коммитов: ${[...new Set(g.commits.map((c) => c.subject))].slice(0, 3).join("; ")}`,
+    activity: binding.activity ?? rm.defaultActivity,
+  }));
+
+  const newIssues = fresh.map((g) => ({
+    subject: g.title,
+    description: draftDescription(g, markup === "markdown" ? "markdown" : markup === "html" ? "html" : "textile"),
+    estimated: String(g.hours),
+    hours: String(g.hours),
+    commits: g.commits.map((c) => c.short),
+  }));
+
+  const outDir = str(args, "out");
+  const written: string[] = [];
+  if (outDir) {
+    await Bun.write(join(outDir, "entries.json"), JSON.stringify(entries, null, 2));
+    written.push(join(outDir, "entries.json"));
+    for (const [i, issue] of newIssues.entries()) {
+      const file = join(outDir, `issue-${i + 1}.html`);
+      await Bun.write(file, issue.description);
+      written.push(file);
+    }
+    await Bun.write(
+      join(outDir, "plan.json"),
+      JSON.stringify({ instance: rm.name, project: binding.project, entries, newIssues }, null, 2),
+    );
+    written.push(join(outDir, "plan.json"));
+  }
+
+  emit(
+    { ...result, instance: rm.name, project: binding.project ?? null, entries, newIssues, written },
+    () => {
+      const lines = [
+        `РЕПОЗИТОРИЙ ${result.repo} → ${rm.name}${binding.project ? ` / ${binding.project}` : " / проект не задан"}` +
+          (binding.client ? ` · ${binding.client}` : ""),
+        `Период ${from}..${to}${author ? `, автор ${author}` : ", все авторы"}`,
+        `Коммитов ${result.commits.length}, сессий ${result.sessions.length}, черновая оценка ${h(result.totalHours)}`,
+        "",
+      ];
+
+      if (linked.length) {
+        lines.push("СПИСАТЬ В СУЩЕСТВУЮЩИЕ ЗАДАЧИ");
+        lines.push(
+          table([
+            ["ЗАДАЧА", "ЧАСЫ", "КОММИТОВ", "ТЕМА ЗАДАЧИ"],
+            ...linked.map((g) => [
+              `#${g.issue}`,
+              h(g.hours),
+              String(g.commits.length),
+              clip(known.get(g.issue!)?.subject ?? "", 50),
+            ]),
+          ]),
+        );
+        lines.push("");
+      }
+
+      if (fresh.length) {
+        lines.push("ПРЕДЛОЖЕНИЕ: ЗАВЕСТИ ЗАДАЧИ");
+        for (const [i, g] of fresh.entries()) {
+          lines.push(
+            `${i + 1}. ${g.title}\n   ${h(g.hours)} · ${g.commits.length} коммитов · +${g.insertions}/−${g.deletions} · ` +
+              `${[...new Set(g.files.map((f) => f.split("/")[0]))].slice(0, 4).join(", ")}`,
+          );
+        }
+        lines.push("");
+      }
+
+      if (orphanRefs.length) {
+        lines.push(
+          `Ссылки на задачи, которых нет в ${rm.name}: ${orphanRefs.map((g) => `#${g.issue}`).join(", ")} — ` +
+            `возможно, это другой инстанс.`,
+          "",
+        );
+      }
+
+      if (written.length) lines.push(`Черновики записаны: ${written.join(", ")}`, "");
+      lines.push(
+        "Оценка часов — ЧЕРНОВИК по времени коммитов, а не факт. Проверьте цифры и тексты, прежде чем отправлять.",
+      );
+      if (!outDir) lines.push("Сохранить черновики для правки: добавьте --out <каталог>");
+      return lines.join("\n");
+    },
+  );
 }
 
 // ───────────────────── проверка текста и разметка ─────────────────────
@@ -1926,6 +2157,12 @@ update-issue, edit без --yes печатают полный предпросм
   due [--days 14] [--all] [--project X] [--anyone]
         задачи на мне со сроками: просроченные, сегодня, ближайшие
 
+Сделанное по истории git
+  repos list | repos add [--path .] --instance <профиль> --project <проект> [--client "<организация>"]
+              [--activity <вид>] [--tracker <трекер>] | repos remove --key <ключ>
+  harvest [--repo <путь>] [--period week] [--author me|all|<почта>] [--gap 90] [--min 0.5] [--out <каталог>]
+        коммиты за период → куда списать часы и какие задачи завести (черновик, требует правки)
+
 Задачи
   issue <id> [--comments N]         карточка задачи с последними событиями
   issues [--subject текст] [--project X] [--status open|closed|имя] [--mine|--assignee me|id]
@@ -1982,6 +2219,14 @@ async function main(): Promise<void> {
     await cmdScan(null, args);
     return;
   }
+  if (args.cmd === "repos") {
+    await cmdRepos(args);
+    return;
+  }
+  if (args.cmd === "harvest") {
+    await cmdHarvest(args);
+    return;
+  }
 
   const rm = await resolveInstance(str(args, "instance"));
   const handlers: Record<string, (rm: Resolved, a: Args) => Promise<void>> = {
@@ -2012,11 +2257,16 @@ async function main(): Promise<void> {
   await handler(rm, args);
 }
 
-try {
-  await main();
-} catch (error) {
-  if (error instanceof UserError) console.error(`Ошибка: ${error.message}`);
-  else if (error instanceof ApiError) console.error(`Redmine API: ${error.message}`);
-  else console.error(`Сбой: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
+async function run(): Promise<void> {
+  try {
+    await main();
+  } catch (error) {
+    if (error instanceof UserError) console.error(`Ошибка: ${error.message}`);
+    else if (error instanceof ApiError) console.error(`Redmine API: ${error.message}`);
+    else console.error(`Сбой: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
 }
+
+// Импорт модуля (тесты) не должен запускать CLI.
+if (import.meta.main) await run();

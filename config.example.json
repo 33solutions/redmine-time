@@ -6,6 +6,7 @@
       "apiKey": "",
       "defaultActivity": "Разработка",
       "dailyTargetHours": 8,
+      "markup": "textile",
       "projectAliases": {
         "ядро": "core-platform"
       }
@@ -14,6 +15,15 @@
       "url": "https://redmine.another.example/",
       "apiKey": "",
       "dailyTargetHours": 8
+    }
+  },
+  "repos": {
+    "acme/core-platform": {
+      "instance": "work",
+      "project": "core-platform",
+      "client": "ООО «Пример»",
+      "activity": "Программирование",
+      "tracker": "Разработка"
     }
   }
 }
