@@ -1,0 +1,19 @@
+{
+  "default": "work",
+  "instances": {
+    "work": {
+      "url": "https://redmine.example.com/",
+      "apiKey": "",
+      "defaultActivity": "Разработка",
+      "dailyTargetHours": 8,
+      "projectAliases": {
+        "ядро": "core-platform"
+      }
+    },
+    "second": {
+      "url": "https://redmine.another.example/",
+      "apiKey": "",
+      "dailyTargetHours": 8
+    }
+  }
+}
