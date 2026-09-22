@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Redmine из чата — инструкция</title>
+<style>
+  @page { size: A4; margin: 16mm 15mm 14mm; }
+
+  :root {
+    --ink: #1a1d21;
+    --muted: #5d656e;
+    --line: #d8dde3;
+    --accent: #1f5f8b;
+    --soft: #f2f5f8;
+    --warn: #8a5a00;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 10.2pt;
+    line-height: 1.5;
+    color: var(--ink);
+  }
+
+  code, pre, .mono { font-family: Consolas, "Cascadia Mono", monospace; }
+
+  /* ── титул ── */
+  .cover { border-bottom: 2px solid var(--accent); padding-bottom: 10mm; margin-bottom: 8mm; }
+  .eyebrow { font-size: 8.5pt; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); font-weight: 600; }
+  h1 { font-size: 25pt; line-height: 1.12; margin: 4mm 0 3mm; font-weight: 650; letter-spacing: -.02em; }
+  .lead { font-size: 11.5pt; color: var(--muted); max-width: 150mm; margin: 0; }
+  .meta { margin-top: 6mm; font-size: 8.8pt; color: var(--muted); display: flex; gap: 6mm; flex-wrap: wrap; }
+  .meta b { color: var(--ink); font-weight: 600; }
+
+  h2 {
+    font-size: 13pt; margin: 8mm 0 3mm; padding-bottom: 1.6mm;
+    border-bottom: 1px solid var(--line); font-weight: 640; letter-spacing: -.01em;
+    break-after: avoid;
+  }
+  h2 .num { color: var(--accent); margin-right: 2.5mm; font-variant-numeric: tabular-nums; }
+  h3 { font-size: 10.6pt; margin: 5mm 0 2mm; font-weight: 640; break-after: avoid; }
+  p { margin: 0 0 3mm; }
+  ul, ol { margin: 0 0 3mm; padding-left: 5.5mm; }
+  li { margin-bottom: 1.4mm; }
+
+  pre {
+    background: var(--soft); border: 1px solid var(--line); border-radius: 3px;
+    padding: 3mm 3.5mm; font-size: 8.8pt; line-height: 1.45; overflow-wrap: anywhere;
+    white-space: pre-wrap; margin: 0 0 3mm; break-inside: avoid;
+  }
+  p code, li code, td code { background: var(--soft); padding: .3mm 1.2mm; border-radius: 2px; font-size: 9pt; }
+
+  table { width: 100%; border-collapse: collapse; margin: 0 0 4mm; font-size: 9.4pt; break-inside: avoid; }
+  th { text-align: left; font-weight: 640; font-size: 8.4pt; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--muted); border-bottom: 1px solid var(--line); padding: 1.6mm 2.5mm 1.6mm 0; }
+  td { padding: 1.8mm 2.5mm 1.8mm 0; border-bottom: 1px solid #eef1f4; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.k { white-space: nowrap; font-family: Consolas, monospace; font-size: 8.8pt; color: var(--accent); }
+
+  .dialog { border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 3px;
+            padding: 3.5mm 4mm; margin: 0 0 4mm; background: #fbfcfd; break-inside: avoid; }
+  .dialog .turn { display: flex; gap: 3mm; margin-bottom: 2mm; }
+  .dialog .turn:last-child { margin-bottom: 0; }
+  .who { flex: 0 0 17mm; font-size: 8.4pt; font-weight: 640; color: var(--muted);
+         text-transform: uppercase; letter-spacing: .05em; padding-top: .4mm; }
+  .said { flex: 1; }
+  .said .sys { color: var(--muted); font-size: 9.2pt; font-family: Consolas, monospace; }
+
+  .note { background: #fff8ec; border: 1px solid #f0dcb4; border-radius: 3px;
+          padding: 3mm 3.5mm; font-size: 9.4pt; margin: 0 0 4mm; break-inside: avoid; }
+  .note b { color: var(--warn); }
+
+  .cols { display: flex; gap: 6mm; }
+  .cols > * { flex: 1; }
+
+  footer { margin-top: 9mm; padding-top: 3mm; border-top: 1px solid var(--line);
+           font-size: 8.6pt; color: var(--muted); display: flex; justify-content: space-between; }
+
+  .page-break { break-before: page; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <div class="eyebrow">redmine-time · инструкция для команды</div>
+  <h1>Redmine прямо из чата</h1>
+  <p class="lead">Скилл <span class="mono">redmine-time</span> для Claude Code: списывайте трудозатраты, узнавайте о новых задачах и комментариях и держите сроки под контролем — обычными фразами, не открывая браузер.</p>
+  <div class="meta">
+    <span><b>Версия</b> 1.0</span>
+    <span><b>Обновлено</b> 22.09.2026</span>
+    <span><b>Репозиторий</b> github.com/33solutions/redmine-time</span>
+    <span><b>Время установки</b> ≈ 10 минут</span>
+  </div>
+</div>
+
+<h2><span class="num">1</span>Зачем это нужно</h2>
+<p>Учёт времени отнимает время. Чтобы списать два часа, нужно открыть Redmine, найти задачу, выбрать вид деятельности, заполнить форму — и так по каждой задаче в конце дня. Скилл убирает этот путь: вы пишете в чат Claude Code одну фразу, подтверждаете предпросмотр — запись уходит в Redmine.</p>
+<p>Так же работает и обратное направление: вместо того чтобы просматривать почту и списки задач, вы спрашиваете «что у меня нового» и получаете сводку — новые задачи на вас, чужие комментарии, изменения статусов и горящие сроки. Сразу по всем подключённым инстансам.</p>
+
+<div class="dialog">
+  <div class="turn"><div class="who">Вы</div><div class="said">потратил 2 часа на #25127, писал протокол обмена</div></div>
+  <div class="turn"><div class="who">Claude</div><div class="said"><span class="sys">Записать в Redmine (work)?<br>2026-09-22 · #25127 · 2.00ч · Программирование<br>«Реализация протокола обмена»</span></div></div>
+  <div class="turn"><div class="who">Вы</div><div class="said">да</div></div>
+  <div class="turn"><div class="who">Claude</div><div class="said"><span class="sys">Записано. Итого сегодня 6.5ч из 8.</span></div></div>
+</div>
+
+<h2><span class="num">2</span>Что нужно установить</h2>
+<table>
+  <tr><th style="width:38mm">Компонент</th><th>Как поставить</th></tr>
+  <tr><td class="k">Claude Code</td><td>Десктоп-приложение или CLI — <span class="mono">claude.com/claude-code</span></td></tr>
+  <tr><td class="k">Bun ≥ 1.2</td><td>Windows: <span class="mono">powershell -c "irm bun.sh/install.ps1 | iex"</span><br>macOS/Linux: <span class="mono">curl -fsSL https://bun.sh/install | bash</span></td></tr>
+  <tr><td class="k">Доступ в Redmine</td><td>Обычная учётная запись — прав больше, чем у вас есть, скилл не получает</td></tr>
+</table>
+
+<h3>Установка скилла</h3>
+<pre>git clone https://github.com/33solutions/redmine-time.git ~/.claude/skills/redmine-time</pre>
+<p>Claude Code подхватит скилл при следующем запуске. Обновление — <span class="mono">git pull</span> в этой же папке.</p>
+
+<h2><span class="num">3</span>Настройка за три шага</h2>
+
+<h3>Шаг 1. Получите ключ доступа к API</h3>
+<p>Откройте Redmine → <b>Моя учётная запись</b> → справа блок <b>Ключ доступа к API</b> → <b>Показать</b>. Ключ — это ваш личный пароль к API: он даёт ровно те права, что есть у вашей учётной записи, и никому его передавать не нужно.</p>
+<p>Например: <span class="mono">redmine.example.com/my/account</span> и <span class="mono">redmine.another.example/my/account</span>.</p>
+
+<h3>Шаг 2. Создайте файл конфигурации</h3>
+<pre>mkdir -p ~/.redmine
+cp ~/.claude/skills/redmine-time/config.example.json ~/.redmine/config.json</pre>
+<p>Откройте <span class="mono">~/.redmine/config.json</span> и впишите ключи:</p>
+<pre>{
+  "default": "work",
+  "instances": {
+    "work": {
+      "url": "https://redmine.example.com/",
+      "apiKey": "ваш ключ",
+      "defaultActivity": "Разработка",
+      "dailyTargetHours": 8
+    },
+    "second": {
+      "url": "https://redmine.another.example/",
+      "apiKey": "ваш ключ",
+      "dailyTargetHours": 8
+    }
+  }
+}</pre>
+<table>
+  <tr><th style="width:42mm">Параметр</th><th>Что задаёт</th></tr>
+  <tr><td class="k">default</td><td>инстанс по умолчанию, когда вы не уточняете, где задача</td></tr>
+  <tr><td class="k">defaultActivity</td><td>вид деятельности, если не назвали его явно</td></tr>
+  <tr><td class="k">dailyTargetHours</td><td>дневная норма для отчёта о недоборе часов</td></tr>
+  <tr><td class="k">projectAliases</td><td>короткие имена проектов на свой вкус: <span class="mono">"ядро" → "core-platform"</span></td></tr>
+</table>
+
+<h3>Шаг 3. Проверьте связь</h3>
+<pre>bun ~/.claude/skills/redmine-time/scripts/redmine.ts whoami --instance ru</pre>
+<p>Ответ вида «Пользователь: Иван Иванов (i.ivanov, id=42)» означает, что всё готово.</p>
+
+<div class="note"><b>Ключ не попадёт в чужие руки:</b> он хранится только на вашем компьютере в <span class="mono">~/.redmine/config.json</span>, не печатается в выводе и исключён из репозитория через <span class="mono">.gitignore</span>.</div>
+
+<div class="page-break"></div>
+
+<h2><span class="num">4</span>Как пользоваться — фразы для чата</h2>
+<p>Отдельных команд запоминать не нужно: пишите обычным языком, номер задачи — с решёткой.</p>
+
+<table>
+  <tr><th style="width:78mm">Что написать</th><th>Что произойдёт</th></tr>
+  <tr><td>спиши 3 часа на #25127, рефакторинг ядра</td><td>предпросмотр записи, после вашего «да» — списание</td></tr>
+  <tr><td>отрази вчерашний день: 4 часа на #25127 и 2 на #25140</td><td>две записи за вчера одной операцией</td></tr>
+  <tr><td>сколько я списал на этой неделе?</td><td>отчёт по задачам и дням с итогом</td></tr>
+  <tr><td>где у меня недобор часов за сентябрь?</td><td>дни ниже нормы и суммарная недостача</td></tr>
+  <tr><td>что у меня нового?</td><td>новые задачи, назначения, чужие комментарии по обоим Redmine</td></tr>
+  <tr><td>какие сроки горят?</td><td>просроченное, сегодняшнее и ближайшие две недели</td></tr>
+  <tr><td>покажи #25127 с последними комментариями</td><td>карточка задачи с историей</td></tr>
+  <tr><td>поставь #25127 в работу, 60% готовности</td><td>смена статуса и процента с записью в историю</td></tr>
+  <tr><td>заведи задачу в проекте «Ядро»: …</td><td>создание задачи с описанием, сроком и оценкой</td></tr>
+</table>
+
+<h3>Форматы, которые понимает скилл</h3>
+<table>
+  <tr><th style="width:26mm">Часы</th><td><span class="mono">2</span> · <span class="mono">2.5</span> · <span class="mono">1h30</span> · <span class="mono">1:30</span> · <span class="mono">90m</span> · <span class="mono">1 ч 30 мин</span></td></tr>
+  <tr><th>Даты</th><td><span class="mono">сегодня</span> · <span class="mono">вчера</span> · <span class="mono">22.09</span> · <span class="mono">2026-09-22</span> · <span class="mono">-3</span> (три дня назад)</td></tr>
+  <tr><th>Периоды</th><td><span class="mono">неделя</span> · <span class="mono">прошлая неделя</span> · <span class="mono">месяц</span> · <span class="mono">2026-09</span> · <span class="mono">01.09..15.09</span></td></tr>
+</table>
+
+<div class="note"><b>Перед каждой записью — предпросмотр.</b> Скилл обязан показать, что именно уйдёт в Redmine: дату, задачу, часы, вид деятельности, комментарий и инстанс. Пока вы не подтвердили — в Redmine ничего не меняется. Удаление требует отдельного подтверждения.</div>
+
+<h2><span class="num">5</span>Командная строка</h2>
+<p>Скилл можно использовать и как обычную утилиту — например, в скриптах или по привычке. Полный список: <span class="mono">bun scripts/redmine.ts help</span>.</p>
+<pre>R=~/.claude/skills/redmine-time/scripts/redmine.ts
+
+bun $R log --issue 25127 --hours 2.5 --comment "Рефакторинг ядра"
+bun $R log --issue 25127 --hours 1h30 --date yesterday --dry-run
+bun $R batch --file entries.json
+
+bun $R entries --period week --group issue
+bun $R gaps --period month --target 8
+
+bun $R inbox --all-instances --since -3
+bun $R due --all-instances --days 14
+
+bun $R issue 25127 --comments 5
+bun $R comment 25127 --text "Готово, жду проверки"
+bun $R update-issue 25127 --status "В работе" --done 60</pre>
+<p>Полезные флаги: <span class="mono">--dry-run</span> — предпросмотр без записи, <span class="mono">--instance work|second</span> — выбор инстанса, <span class="mono">--all-instances</span> — сводка по всем, <span class="mono">--json</span> — машиночитаемый вывод.</p>
+
+<h2><span class="num">6</span>Если что-то не работает</h2>
+<table>
+  <tr><th style="width:26mm">Сообщение</th><th>Причина и что делать</th></tr>
+  <tr><td class="k">401</td><td>Ключ неверный или отозван — перевыпустите его в «Моей учётной записи» и обновите конфиг</td></tr>
+  <tr><td class="k">403</td><td>Не хватает прав именно вашей учётной записи: закрытый проект или списание за другого сотрудника</td></tr>
+  <tr><td class="k">404 везде</td><td>В инстансе выключен REST API — нужен администратор Redmine</td></tr>
+  <tr><td class="k">422</td><td>Не прошла проверка: чаще всего не указан вид деятельности или дата вне допустимого периода</td></tr>
+  <tr><td class="k">bun не найден</td><td>Bun не установлен или не добавлен в PATH — переоткройте терминал после установки</td></tr>
+  <tr><td class="k">старые данные</td><td>Справочники кэшируются на сутки; добавьте <span class="mono">--no-cache</span> после изменений в Redmine</td></tr>
+</table>
+
+<h2><span class="num">7</span>Что скилл не делает</h2>
+<ul>
+  <li>Не списывает часы за других сотрудников — только за владельца ключа.</li>
+  <li>Не считает время автоматически: часы называете вы, скилл лишь корректно их оформляет.</li>
+  <li>Не знает о том, что вы прочитали задачу в браузере: отметку «просмотрено» для сводки новых событий ставит команда с флагом <span class="mono">--mark</span>.</li>
+  <li>Не требует плагинов Redmine — работает на штатном REST API версий 5.x и 6.x.</li>
+</ul>
+
+<footer>
+  <span>redmine-time 1.0 · MIT</span>
+  <span>github.com/33solutions/redmine-time</span>
+</footer>
+
+</body>
+</html>

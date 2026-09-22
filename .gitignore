@@ -3,3 +3,4 @@ bun.lockb
 *.log
 .env
 config.json
+docs/*.internal.*
