@@ -4212,50 +4212,7 @@ async function cmdBackfillCheck(rm: Resolved, args: Args): Promise<void> {
           )
         : "") +
       (warnings.length > 0 ? `\n\nПОДОЗРИТЕЛЬНАЯ НАГРУЗКА:\n${warnings.map((w) => `  ${w}`).join("\n")}` : "") +
-      `\n\nЧем заполнять: готовые отчёты, история git (redmine.ts harvest), журналы рабочих сессий ` +
-      `(redmine.ts hours-prompt — готовый текст для машины, где шла работа).`,
-  );
-}
-
-/** Путь к файлу навыка рядом со скриптом: скилл ставится в произвольный каталог. */
-function skillFile(relative: string): string {
-  return join(import.meta.dir, "..", relative);
-}
-
-/**
- * Готовый текст для сбора часов по журналам рабочих сессий. Запускается не здесь, а на машине,
- * где шла работа, поэтому команда ничего не отправляет — только печатает промпт с методикой.
- */
-async function cmdHoursPrompt(rm: Resolved, args: Args): Promise<void> {
-  const period = str(args, "period") ?? "последние три месяца";
-  const [from, to] = /\d{4}/.test(period) ? parsePeriod(period) : ["", ""];
-  const threshold = num(args, "threshold") ?? 30;
-  const projectArg = str(args, "project");
-  const project = projectArg ? await findProject(rm, projectArg) : undefined;
-
-  const methodology = await Bun.file(skillFile("references/hours-methodology.md"))
-    .text()
-    .catch(() => "");
-  if (!methodology.trim()) {
-    throw new UserError(
-      "Не найден файл методики references/hours-methodology.md рядом со скриптом — переустановите скилл.",
-    );
-  }
-
-  const window = from && to ? `${from} .. ${to}` : period;
-  const prompt =
-    `Восстанови трудозатраты за период ${window} по журналам рабочих сессий и истории git на этой машине.\n` +
-    (project ? `Работа относится к проекту «${project.name}» (${project.identifier}).\n` : "") +
-    `Порог склейки блока: ${threshold} минут — назови его в каждом отчёте.\n\n` +
-    `Работай строго по методике ниже. Где данных нет — так и пиши «данных нет»; ` +
-    `не подставляй правдоподобные числа вместо измеренных.\n\n` +
-    `${"─".repeat(72)}\n${methodology.trim()}\n${"─".repeat(72)}\n`;
-
-  emit({ period: window, threshold, project: project?.identifier ?? null, prompt }, () =>
-    `ПРОМПТ ДЛЯ СБОРА ЧАСОВ · запускать на машине, где шла работа\n` +
-      `${"═".repeat(72)}\n${prompt}${"═".repeat(72)}\n` +
-      `Что делать дальше: отдать этот текст агенту на той машине, забрать отчёты, ` +
-      `свериться с redmine.ts backfill-check --project <проект> и списать часы пачкой: redmine.ts batch --file entries.json.`,
+      `\n\nЧем заполнять: готовые отчёты и история git (redmine.ts harvest).`,
   );
 }
 
@@ -4386,9 +4343,6 @@ update-issue, edit, create-project, update-project, archive-project без --yes
 Ретроспектива: заполнить прошлое
   backfill-check --project X [--period 2026-07..2026-09|--from --to]
         пробелы: задачи без списаний, месяцы без часов, дни с нечеловеческой нагрузкой
-  hours-prompt [--period 2026-07..2026-09] [--project X] [--threshold 30|90]
-        готовый промпт для машины, где шла работа: восстановить часы по журналам сессий и git
-        (методика — references/hours-methodology.md; batch разносит результат по дням)
   edit <entryId> [--hours|--date|--comment|--activity|--issue] [--dry-run]
   delete <entryId> --yes
 
@@ -4465,7 +4419,6 @@ async function main(): Promise<void> {
     report: cmdEntries,
     gaps: cmdGaps,
     "backfill-check": cmdBackfillCheck,
-    "hours-prompt": cmdHoursPrompt,
     edit: cmdEdit,
     delete: cmdDelete,
     "update-issue": cmdUpdateIssue,
