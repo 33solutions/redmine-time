@@ -275,6 +275,7 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
 // ─────────────────────────────── модели ───────────────────────────────
 
 type IdName = { id: number; name: string };
+type StatusRef = IdName & { is_closed?: boolean };
 
 type JournalDetail = { property: string; name: string; old_value: string | null; new_value: string | null };
 
@@ -310,6 +311,8 @@ type Issue = {
   created_on: string;
   updated_on: string;
   journals?: Journal[];
+  /** Переходы, разрешённые рабочим процессом для текущей роли. */
+  allowed_statuses?: IdName[];
 };
 
 type TimeEntry = {
@@ -386,9 +389,9 @@ async function activities(rm: Resolved): Promise<IdName[]> {
   });
 }
 
-async function statuses(rm: Resolved): Promise<IdName[]> {
+async function statuses(rm: Resolved): Promise<StatusRef[]> {
   return cached(rm, "statuses", async () => {
-    const r = await request<{ issue_statuses: IdName[] }>(rm, "GET", "issue_statuses.json");
+    const r = await request<{ issue_statuses: StatusRef[] }>(rm, "GET", "issue_statuses.json");
     return r.issue_statuses;
   });
 }
@@ -1222,7 +1225,9 @@ async function cmdClose(rm: Resolved, args: Args): Promise<void> {
   const status = await closingStatus(rm, str(args, "status"));
   const loaded = await mapLimit(ids, 4, async (id) => {
     try {
-      return (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`)).issue;
+      return (
+        await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`, { include: "allowed_statuses" })
+      ).issue;
     } catch {
       return null;
     }
@@ -1263,10 +1268,40 @@ async function cmdClose(rm: Resolved, args: Args): Promise<void> {
   const cleared: { id: number; fields: string[] }[] = [];
   const failed: { id: number; error: string }[] = [];
 
+  /**
+   * Redmine молча игнорирует переход, запрещённый рабочим процессом: отвечает 200,
+   * сохраняет комментарий и оставляет прежний статус. Поэтому сверяем результат по факту,
+   * а до записи смотрим список разрешённых переходов.
+   */
+  const currentStatus = async (id: number): Promise<string> =>
+    (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`)).issue.status.name;
+
   for (const issue of closable) {
+    const allowed = issue.allowed_statuses;
+    if (allowed && allowed.length > 0 && !allowed.some((s) => s.id === status.id)) {
+      const closers = (await statuses(rm)).filter((s) => s.is_closed).map((s) => s.name);
+      const possible = allowed.filter((s) => closers.includes(s.name)).map((s) => s.name);
+      failed.push({
+        id: issue.id,
+        error:
+          `рабочий процесс не разрешает переход «${issue.status.name}» → «${status.name}» для вашей роли.\n` +
+          `      закрывающие статусы, доступные этой задаче: ${possible.join(", ") || "нет ни одного"}` +
+          (possible.length > 0 ? ` — укажите явно: --status "${possible[0]}"` : " — потребуется администратор Redmine"),
+      });
+      continue;
+    }
+
     const payload: Record<string, unknown> = { status_id: status.id, notes: note };
     try {
       await request(rm, "PUT", `issues/${issue.id}.json`, undefined, { issue: payload });
+      const now = await currentStatus(issue.id);
+      if (now.toLowerCase() !== status.name.toLowerCase()) {
+        failed.push({
+          id: issue.id,
+          error: `Redmine принял запрос, но статус остался «${now}»: переход запрещён рабочим процессом (комментарий сохранён).`,
+        });
+        continue;
+      }
       closed.push(issue.id);
       continue;
     } catch (e) {
@@ -1286,6 +1321,11 @@ async function cmdClose(rm: Resolved, args: Args): Promise<void> {
       for (const f of broken) payload[f.field] = "";
       try {
         await request(rm, "PUT", `issues/${issue.id}.json`, undefined, { issue: payload });
+        const now = await currentStatus(issue.id);
+        if (now.toLowerCase() !== status.name.toLowerCase()) {
+          failed.push({ id: issue.id, error: `статус остался «${now}»: переход запрещён рабочим процессом.` });
+          continue;
+        }
         closed.push(issue.id);
         cleared.push({ id: issue.id, fields: broken.map((b) => b.label) });
       } catch (retry) {
