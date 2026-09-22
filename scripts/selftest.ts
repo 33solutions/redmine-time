@@ -7,6 +7,7 @@
 import { parseHours, parseDate, parsePeriod, plain } from "./redmine.ts";
 import { scanText, guard } from "./guard.ts";
 import { buildSessions, buildGroups, plural, draftDescription, type Commit } from "./harvest.ts";
+import { categorize, monthsSince } from "./redmine.ts";
 
 let passed = 0;
 const failures: string[] = [];
@@ -192,6 +193,20 @@ if (withoutIssue) {
 } else {
   failures.push("черновик: не нашлась группа без задачи");
 }
+
+// ── разбор зависших задач ─────────────────────────────────────────────
+const NOW = new Date("2026-09-22T00:00:00Z");
+const issue = (status: string, updated: string) => ({ status: { name: status }, updated_on: updated });
+
+check("категория: выполнена, но не закрыта", categorize(issue("Выполнена", "2021-09-30"), NOW, 6), "done-not-closed");
+check("категория: принята", categorize(issue("Принята", "2026-09-01"), NOW, 6), "done-not-closed");
+check("категория: Resolved", categorize(issue("Resolved", "2024-12-15"), NOW, 6), "done-not-closed");
+check("категория: отложена", categorize(issue("Отложена", "2022-06-24"), NOW, 6), "on-hold");
+check("категория: новая и забытая", categorize(issue("Новая", "2024-11-27"), NOW, 6), "no-movement");
+check("категория: новая и свежая", categorize(issue("Новая", "2026-09-01"), NOW, 6), "active");
+check("категория: в работе на границе", categorize(issue("В работе", "2026-03-20"), NOW, 6), "no-movement");
+check("категория: порог сдвигается", categorize(issue("В работе", "2026-03-20"), NOW, 12), "active");
+check("возраст в месяцах", monthsSince("2026-03-22", NOW), 6);
 
 // ── итог ──────────────────────────────────────────────────────────────
 console.log(`Проверок пройдено: ${passed}`);

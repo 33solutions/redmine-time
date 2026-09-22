@@ -397,6 +397,15 @@ async function projects(rm: Resolved): Promise<ProjectRef[]> {
   return cached(rm, "projects", async () => fetchAll<ProjectRef>(rm, "projects.json", "projects", {}, 1000));
 }
 
+/**
+ * Redmine отдаёт в projects.json только действующие проекты, поэтому всё, чего там нет,
+ * закрыто или архивировано. Задачи таких проектов доступны только для чтения: закрыть
+ * или прокомментировать их нельзя, пока проект не откроют заново.
+ */
+async function activeProjectIds(rm: Resolved): Promise<Set<number>> {
+  return new Set((await projects(rm)).map((p) => p.id));
+}
+
 async function trackers(rm: Resolved): Promise<IdName[]> {
   return cached(rm, "trackers", async () => {
     const r = await request<{ trackers: IdName[] }>(rm, "GET", "trackers.json");
@@ -865,13 +874,17 @@ async function cmdIssues(rm: Resolved, args: Args): Promise<void> {
   if (due) query.due_date = `<=${parseDate(due)}`;
 
   const r = await request<{ issues: Issue[]; total_count: number }>(rm, "GET", "issues.json", query);
-  emit({ instance: rm.name, total_count: r.total_count, issues: r.issues }, () =>
-    r.issues.length === 0
-      ? "Задач не найдено."
-      : `Найдено ${r.total_count}, показано ${r.issues.length}:\n` +
+
+  // Задачи закрытых проектов только зашумляют выдачу: изменить их всё равно нельзя.
+  const { visible, hidden } = await splitByProjectState(rm, r.issues, bool(args, "include-closed-projects"));
+
+  emit({ instance: rm.name, total_count: r.total_count, hiddenInClosedProjects: hidden, issues: visible }, () =>
+    visible.length === 0
+      ? `Задач не найдено.${hidden > 0 ? ` Скрыто ${hidden} в закрытых проектах (--include-closed-projects).` : ""}`
+      : `Найдено ${r.total_count}, показано ${visible.length}:\n` +
         table([
           ["ID", "СТАТУС", "ГОТОВ", "СРОК", "ПРОЕКТ", "ТЕМА"],
-          ...r.issues.map((i) => [
+          ...visible.map((i) => [
             `#${i.id}`,
             clip(i.status.name, 14),
             `${i.done_ratio}%`,
@@ -879,8 +892,21 @@ async function cmdIssues(rm: Resolved, args: Args): Promise<void> {
             clip(i.project.name, 20),
             clip(i.subject, 60),
           ]),
-        ]),
+        ]) +
+        (hidden > 0 ? `\n\nСкрыто ${hidden} задач в закрытых проектах — показать: --include-closed-projects` : ""),
   );
+}
+
+/** Делит задачи на доступные для изменения и те, что лежат в закрытых проектах. */
+async function splitByProjectState(
+  rm: Resolved,
+  issues: Issue[],
+  includeClosed: boolean,
+): Promise<{ visible: Issue[]; hidden: number }> {
+  if (includeClosed) return { visible: issues, hidden: 0 };
+  const active = await activeProjectIds(rm);
+  const visible = issues.filter((i) => active.has(i.project.id));
+  return { visible, hidden: issues.length - visible.length };
 }
 
 async function cmdSearch(rm: Resolved, args: Args): Promise<void> {
@@ -1043,6 +1069,206 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   const r = await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`);
   const i = r.issue;
   emit(i, () => `#${i.id} обновлена: статус ${i.status.name}, готовность ${i.done_ratio}%\n${issueUrl(rm, i.id)}`);
+}
+
+// ─────────────────── разбор зависших задач и закрытие ─────────────────
+
+export type StaleCategory = "done-not-closed" | "on-hold" | "no-movement" | "active";
+
+/** Статусы, означающие «работа сделана», но задача ещё не закрыта. */
+const DONE_LIKE = ["выполнена", "принята", "resolved", "сдача работ", "решена", "готова"];
+/** Статусы сознательной паузы. */
+const HOLD_LIKE = ["отложена", "on hold", "приостановлена", "заморожена"];
+
+export function monthsSince(date: string, now: Date): number {
+  return Math.round((now.getTime() - new Date(date).getTime()) / 2_592_000_000);
+}
+
+/**
+ * Категория зависшей задачи. Различать важно: «выполнена, но не закрыта» — это уборка,
+ * а «новая без движения» — отказ от работы, и решать его должен человек.
+ */
+export function categorize(
+  issue: { status: { name: string }; updated_on: string },
+  now: Date,
+  staleMonths: number,
+): StaleCategory {
+  const status = issue.status.name.toLowerCase();
+  if (DONE_LIKE.some((s) => status.includes(s))) return "done-not-closed";
+  if (HOLD_LIKE.some((s) => status.includes(s))) return "on-hold";
+  return monthsSince(issue.updated_on, now) >= staleMonths ? "no-movement" : "active";
+}
+
+const CATEGORY_TITLES: Record<StaleCategory, string> = {
+  "done-not-closed": "завершены, но не закрыты",
+  "on-hold": "отложены",
+  "no-movement": "без движения",
+  active: "в работе",
+};
+
+async function loadStale(rm: Resolved, args: Args): Promise<{ issues: Issue[]; hidden: number }> {
+  const query: Query = {
+    status_id: await resolveStatusFilter(rm, str(args, "status") ?? "open"),
+    sort: "updated_on:asc",
+    limit: num(args, "limit") ?? 300,
+  };
+  if (bool(args, "mine") || !str(args, "assignee")) query.assigned_to_id = "me";
+  const assignee = str(args, "assignee");
+  if (assignee && assignee !== "me") query.assigned_to_id = assignee;
+  if (assignee === "all") delete query.assigned_to_id;
+  const project = str(args, "project");
+  if (project) query.project_id = await resolveProjectKey(rm, project);
+
+  const issues = await fetchAll<Issue>(rm, "issues.json", "issues", query, num(args, "limit") ?? 300);
+  return splitByProjectState(rm, issues, bool(args, "include-closed-projects")).then((r) => ({
+    issues: r.visible,
+    hidden: r.hidden,
+  }));
+}
+
+async function cmdStale(rm: Resolved, args: Args): Promise<void> {
+  const now = new Date(str(args, "now") ?? new Date().toISOString());
+  const staleMonths = num(args, "months") ?? 6;
+  const size = num(args, "size") ?? 10;
+  const page = num(args, "page") ?? 1;
+  const wanted = str(args, "category");
+
+  const { issues, hidden } = await loadStale(rm, args);
+  const enriched = issues
+    .map((i) => ({ issue: i, category: categorize(i, now, staleMonths), age: monthsSince(i.updated_on, now) }))
+    .filter((x) => x.category !== "active")
+    .filter((x) => !wanted || wanted === "all" || x.category.startsWith(wanted));
+
+  if (bool(args, "summary")) {
+    const byCategory = new Map<StaleCategory, number>();
+    const byProject = new Map<string, number>();
+    for (const x of enriched) {
+      byCategory.set(x.category, (byCategory.get(x.category) ?? 0) + 1);
+      byProject.set(x.issue.project.name, (byProject.get(x.issue.project.name) ?? 0) + 1);
+    }
+    emit({ instance: rm.name, total: enriched.length, hidden, byCategory: [...byCategory], byProject: [...byProject] }, () =>
+      `ЗАВИСШИЕ ЗАДАЧИ · инстанс ${rm.name} · всего ${enriched.length}` +
+        (hidden ? `, скрыто в закрытых проектах ${hidden}` : "") +
+        "\n\n" +
+        table([
+          ["КАТЕГОРИЯ", "ЗАДАЧ"],
+          ...[...byCategory].map(([c, n]) => [CATEGORY_TITLES[c], String(n)]),
+        ]) +
+        "\n\nПО ПРОЕКТАМ\n" +
+        table([
+          ["ПРОЕКТ", "ЗАДАЧ"],
+          ...[...byProject].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([p, n]) => [clip(p, 30), String(n)]),
+        ]),
+    );
+    return;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(enriched.length / size));
+  const slice = enriched.slice((page - 1) * size, page * size);
+
+  emit(
+    { instance: rm.name, page, totalPages, total: enriched.length, hidden, issues: slice },
+    () =>
+      `ПАЧКА ${page} из ${totalPages} · к разбору ${enriched.length} задач` +
+      (hidden ? ` · в закрытых проектах пропущено ${hidden}` : "") +
+      "\n\n" +
+      slice
+        .map(({ issue: i, category, age }, index) => {
+          const number = (page - 1) * size + index + 1;
+          const description = clip(i.description ?? "", 200);
+          return (
+            `${String(number).padStart(3)}. #${i.id} — ${i.subject}\n` +
+            `     ${i.project.name} · ${i.status.name} · готовность ${i.done_ratio}% · ` +
+            `списано ${Math.round(i.spent_hours ?? 0)}ч` +
+            (i.estimated_hours ? ` из ${Math.round(i.estimated_hours)}ч` : "") +
+            `\n     ${CATEGORY_TITLES[category]} · без движения ${age} мес. · ${issueUrl(rm, i.id)}` +
+            (description ? `\n     ${description}` : "\n     (описания нет)")
+          );
+        })
+        .join("\n\n") +
+      (page < totalPages ? `\n\nСледующая пачка: --page ${page + 1}` : "\n\nЭто последняя пачка."),
+  );
+}
+
+/** Статус, которым закрывают задачи на этом инстансе. */
+async function closingStatus(rm: Resolved, preferred: string | undefined): Promise<IdName> {
+  const list = await statuses(rm);
+  if (preferred) return matchByName(list, preferred, "Статус");
+  const byName = list.find((s) => ["закрыта", "closed", "закрыт"].includes(s.name.toLowerCase()));
+  if (byName) return byName;
+  throw new UserError(
+    `Не удалось определить статус закрытия. Укажите его явно: --status "<имя>". Доступны: ${list
+      .map((s) => s.name)
+      .join(", ")}`,
+  );
+}
+
+async function cmdClose(rm: Resolved, args: Args): Promise<void> {
+  const ids = args.positional
+    .flatMap((token) => token.split(","))
+    .map((token) => Number(token.replace("#", "").trim()))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  if (ids.length === 0) throw new UserError("Укажите номера задач: close 123 456 --note-file note.html --yes");
+
+  const noteFile = str(args, "note-file");
+  const note = noteFile ? await Bun.file(noteFile).text() : str(args, "note");
+  if (!note?.trim()) {
+    throw new UserError(
+      "Нужен комментарий: закрытие без объяснения оставляет читателя в недоумении. --note-file <файл> или --note \"…\"",
+    );
+  }
+  checkOutgoing({ комментарий: note }, args);
+
+  const status = await closingStatus(rm, str(args, "status"));
+  const loaded = await mapLimit(ids, 4, async (id) => {
+    try {
+      return (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`)).issue;
+    } catch {
+      return null;
+    }
+  });
+  const found = loaded.filter((i): i is Issue => i !== null);
+  const missing = ids.filter((id) => !found.some((i) => i.id === id));
+
+  const active = await activeProjectIds(rm);
+  const closable = found.filter((i) => active.has(i.project.id));
+  const locked = found.filter((i) => !active.has(i.project.id));
+
+  const preview =
+    `ЗАКРЫТИЕ ЗАДАЧ · инстанс ${rm.name} · статус «${status.name}»\n` +
+    table([
+      ["ЗАДАЧА", "ПРОЕКТ", "СТАТУС СЕЙЧАС", "ТЕМА"],
+      ...closable.map((i) => [`#${i.id}`, clip(i.project.name, 20), clip(i.status.name, 14), clip(i.subject, 50)]),
+    ]) +
+    (locked.length
+      ? `\n\nНЕ БУДУТ ЗАКРЫТЫ — проект закрыт, задачи доступны только для чтения:\n` +
+        locked.map((i) => `  #${i.id} — ${clip(i.project.name, 24)} — ${clip(i.subject, 50)}`).join("\n")
+      : "") +
+    (missing.length ? `\n\nНЕ НАЙДЕНЫ: ${missing.map((id) => `#${id}`).join(", ")}` : "") +
+    `\n\nКОММЕНТАРИЙ (уйдёт в каждую задачу, участники получат уведомление):\n${"─".repeat(60)}\n${note.trim()}\n${"─".repeat(60)}`;
+
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  const closed: number[] = [];
+  const failed: { id: number; error: string }[] = [];
+  for (const issue of closable) {
+    try {
+      await request(rm, "PUT", `issues/${issue.id}.json`, undefined, {
+        issue: { status_id: status.id, notes: note },
+      });
+      closed.push(issue.id);
+    } catch (e) {
+      failed.push({ id: issue.id, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  emit({ closed, failed, locked: locked.map((i) => i.id), missing }, () =>
+    `Закрыто: ${closed.length} из ${ids.length} (${closed.map((id) => `#${id}`).join(", ") || "—"})` +
+      (locked.length ? `\nПропущено в закрытых проектах: ${locked.map((i) => `#${i.id}`).join(", ")}` : "") +
+      (missing.length ? `\nНе найдены: ${missing.map((id) => `#${id}`).join(", ")}` : "") +
+      (failed.length ? `\nОшибки:\n${failed.map((f) => `  #${f.id}: ${f.error}`).join("\n")}` : ""),
+  );
+  if (failed.length) process.exitCode = 1;
 }
 
 // ───────────────────────── дерево задач ───────────────────────────────
@@ -2167,6 +2393,14 @@ update-issue, edit без --yes печатают полный предпросм
   issue <id> [--comments N]         карточка задачи с последними событиями
   issues [--subject текст] [--project X] [--status open|closed|имя] [--mine|--assignee me|id]
          [--watched] [--due-before дата] [--limit N] [--sort updated_on:desc]
+         задачи закрытых проектов скрыты: они доступны только для чтения (--include-closed-projects)
+
+Разбор зависших задач
+  stale [--summary] [--page 1] [--size 10] [--months 6] [--category done|on-hold|no-movement]
+        [--mine|--assignee all] [--project X]
+        зависшие задачи пачками: категория, готовность, списанное время, срок молчания, описание
+  close <id> [<id> …] (--note-file f | --note "…") [--status "Закрыта"] [--yes]
+        закрыть пачкой с общим комментарием; задачи закрытых проектов пропускаются с пояснением
   search "фраза" [--project X]      полнотекстовый поиск
   create-issue --project X --subject "..." [--description "..."|--description-file f]
                [--tracker имя] [--priority имя] [--assignee me] [--start дата] [--due дата]
@@ -2238,6 +2472,9 @@ async function main(): Promise<void> {
     issues: cmdIssues,
     search: cmdSearch,
     trackers: cmdTrackers,
+    stale: cmdStale,
+    cleanup: cmdStale,
+    close: cmdClose,
     "create-issue": cmdCreateIssue,
     "create-tree": cmdCreateTree,
     tree: cmdTree,
