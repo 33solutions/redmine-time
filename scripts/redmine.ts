@@ -496,6 +496,56 @@ function matchByName<T extends IdName>(items: T[], needle: string, kind: string)
   throw new UserError(`${kind} "${needle}" не найден. Доступно: ${items.map((i) => i.name).join(", ")}.`);
 }
 
+const membersMemo = new Map<string, IdName[]>();
+
+/**
+ * Участники проекта — единственный доступный нам справочник людей: `/users.json`
+ * закрыт правами администратора, а назначить задачу всё равно можно только участнику.
+ */
+async function projectMembers(rm: Resolved, project: string | number): Promise<IdName[]> {
+  const key = `${rm.name}:${project}`;
+  const hit = membersMemo.get(key);
+  if (hit) return hit;
+  const r = await request<{ memberships: { user?: IdName; group?: IdName }[] }>(
+    rm,
+    "GET",
+    `projects/${project}/memberships.json`,
+    { limit: 100 },
+  );
+  const list = (r.memberships ?? []).flatMap((m) => (m.user ? [m.user] : []));
+  membersMemo.set(key, list);
+  return list;
+}
+
+/**
+ * Исполнитель по «me», номеру или имени.
+ *
+ * Имя разрешается по участникам проекта. Без этого `Number("Соловьёв")` давал NaN,
+ * уходил в JSON как null, Redmine молча оставлял поле как было, а команда отвечала
+ * «обновлена» — назначение терялось незаметно.
+ */
+async function resolveAssignee(
+  rm: Resolved,
+  value: string,
+  project: string | number | undefined,
+): Promise<number> {
+  const raw = value.trim();
+  if (raw === "me") return (await currentUser(rm)).id;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  if (project === undefined) {
+    throw new UserError(
+      `Исполнитель "${raw}": не по чему искать — проект не определён. Укажите номер: --assignee <id>.`,
+    );
+  }
+  const members = await projectMembers(rm, project);
+  if (members.length === 0) {
+    throw new UserError(
+      `Исполнитель "${raw}": список участников проекта пуст или закрыт правами. Укажите номер: --assignee <id>.`,
+    );
+  }
+  return matchByName(members, raw, "Исполнитель").id;
+}
+
 async function resolveActivityId(rm: Resolved, value: string | undefined): Promise<number | undefined> {
   const wanted = value ?? rm.defaultActivity;
   if (!wanted) return undefined;
@@ -2641,7 +2691,9 @@ async function cmdCreateIssue(rm: Resolved, args: Args): Promise<void> {
   const status = str(args, "status");
   if (status) payload.status_id = matchByName(await statuses(rm), status, "Статус").id;
   const assignee = str(args, "assignee");
-  if (assignee) payload.assigned_to_id = assignee === "me" ? (await currentUser(rm)).id : Number(assignee);
+  if (assignee) {
+    payload.assigned_to_id = await resolveAssignee(rm, assignee, payload.project_id as string | number);
+  }
   const due = str(args, "due");
   if (due) payload.due_date = parseDate(due);
   const start = str(args, "start");
@@ -2692,7 +2744,13 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
     patch.estimated_hours = /^(none|нет|0)$/i.test(estimated.trim()) ? "" : round2(parseHours(estimated));
   }
   const assignee = str(args, "assignee");
-  if (assignee) patch.assigned_to_id = assignee === "me" ? (await currentUser(rm)).id : Number(assignee);
+  if (assignee) {
+    // Проект задачи нужен, чтобы разрешить имя исполнителя по участникам.
+    const project = /^(me|\d+)$/.test(assignee.trim())
+      ? undefined
+      : (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`)).issue.project.id;
+    patch.assigned_to_id = await resolveAssignee(rm, assignee, project);
+  }
   const due = str(args, "due");
   if (due) patch.due_date = parseDate(due);
   if (Object.keys(patch).length === 0) {
@@ -3153,7 +3211,7 @@ async function cmdCreateTree(rm: Resolved, args: Args): Promise<void> {
     if (node.priority) payload.priority_id = matchByName(await priorities(rm), node.priority, "Приоритет").id;
     const assignee = "assignee" in node ? node.assignee : undefined;
     const who = assignee ?? plan.assignee;
-    if (who) payload.assigned_to_id = who === "me" ? me.id : Number(who);
+    if (who) payload.assigned_to_id = who === "me" ? me.id : await resolveAssignee(rm, who, projectKey);
     if (node.start) payload.start_date = parseDate(node.start);
     if (node.due) payload.due_date = parseDate(node.due);
     if (node.estimated !== undefined) payload.estimated_hours = round2(parseHours(String(node.estimated)));
@@ -4313,7 +4371,7 @@ update-issue, edit, create-project, update-project, archive-project без --yes
         закрыть пачкой с общим комментарием; задачи закрытых проектов пропускаются с пояснением
   search "фраза" [--project X]      полнотекстовый поиск
   create-issue --project X --subject "..." [--description "..."|--description-file f]
-               [--tracker имя] [--priority имя] [--assignee me] [--start дата] [--due дата]
+               [--tracker имя] [--priority имя] [--assignee me|id|имя] [--start дата] [--due дата]
                [--estimated 8] [--parent N] [--yes]
   create-tree --file plan.json [--project X] [--yes]
                родитель + подзадачи одной операцией; тексты описаний — из descriptionFile
@@ -4330,7 +4388,7 @@ update-issue, edit, create-project, update-project, archive-project без --yes
         готовая строка со ссылкой на задачу — для вставки в текст на другом инстансе
   detect-markup [--project X]       какая разметка принята на инстансе (textile/markdown/html)
   comment <id> --text "..."|--text-file f [--private] [--dry-run]
-  update-issue <id> [--status имя] [--done N] [--note текст] [--assignee me] [--due дата] [--dry-run]
+  update-issue <id> [--status имя] [--done N] [--note текст] [--assignee me|id|имя] [--due дата] [--dry-run]
 
 Трудозатраты
   log --issue N --hours 2.5 [--date today|YYYY-MM-DD|-1] [--comment "..."] [--activity имя] [--dry-run]
