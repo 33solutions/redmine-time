@@ -7,7 +7,7 @@
  * Вывод: человекочитаемый текст, либо --json для машинного разбора.
  */
 
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { guard, scanText, formatFindings, type Audience, type Finding } from "./guard.ts";
 import { harvestRepo, isGitRepo, repoName, draftDescription, type RepoBinding } from "./harvest.ts";
 
@@ -369,6 +369,35 @@ type CurrentUser = {
   admin?: boolean;
 };
 
+/** Роль в членстве. `inherited` — роль пришла от группы или родительского проекта: здесь её не снять. */
+export type MemberRole = IdName & { inherited?: boolean };
+
+/** Членство в проекте: участник — пользователь либо группа, у каждого свой набор ролей. */
+export type Membership = {
+  id: number;
+  project: IdName;
+  user?: IdName;
+  group?: IdName;
+  roles: MemberRole[];
+};
+
+/**
+ * Роль из справочника. Права приходят только из `roles/:id.json` — в общем списке их нет,
+ * а без них предпросмотр не скажет, что роль даёт человеку.
+ */
+export type RoleInfo = {
+  id: number;
+  name: string;
+  /** Можно ли назначать задачи на обладателя роли. */
+  assignable?: boolean;
+  /** all — все задачи, default — все, кроме приватных, own — только свои. */
+  issues_visibility?: string;
+  /** all — все списания проекта, own — только свои. */
+  time_entries_visibility?: string;
+  /** null — права прочитать не удалось; [] — у роли их действительно нет. */
+  permissions: string[] | null;
+};
+
 // ─────────────────────────── кэш и состояние ──────────────────────────
 
 type CacheEntry = { at: number; data: unknown };
@@ -469,6 +498,38 @@ async function priorities(rm: Resolved): Promise<IdName[]> {
   });
 }
 
+/** Разбор роли из ответа Redmine: поля старых версий бывают пустыми, типам ответа не доверяем. */
+function asRole(raw: unknown, fallback: IdName): RoleInfo {
+  if (!isRecord(raw)) return { id: fallback.id, name: fallback.name, permissions: null };
+  const text = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+  return {
+    id: fallback.id,
+    name: fallback.name,
+    assignable: typeof raw.assignable === "boolean" ? raw.assignable : undefined,
+    issues_visibility: text(raw.issues_visibility),
+    time_entries_visibility: text(raw.time_entries_visibility),
+    permissions: Array.isArray(raw.permissions)
+      ? raw.permissions.filter((p): p is string => typeof p === "string")
+      : null,
+  };
+}
+
+async function roles(rm: Resolved): Promise<RoleInfo[]> {
+  return cached(rm, "roles", async () => {
+    const r = await request<{ roles: IdName[] }>(rm, "GET", "roles.json");
+    return mapLimit(r.roles ?? [], 4, async (role) => {
+      try {
+        const full = await request<{ role: unknown }>(rm, "GET", `roles/${role.id}.json`);
+        return asRole(full.role, role);
+      } catch (error) {
+        // Карточка роли есть не во всех версиях Redmine: без прав роль всё равно назначается по имени.
+        if (error instanceof ApiError && (error.status === 403 || error.status === 404)) return asRole(null, role);
+        throw error;
+      }
+    });
+  });
+}
+
 const userMemo = new Map<string, CurrentUser>();
 
 async function currentUser(rm: Resolved): Promise<CurrentUser> {
@@ -506,15 +567,17 @@ async function projectMembers(rm: Resolved, project: string | number): Promise<I
   const key = `${rm.name}:${project}`;
   const hit = membersMemo.get(key);
   if (hit) return hit;
-  const r = await request<{ memberships: { user?: IdName; group?: IdName }[] }>(
-    rm,
-    "GET",
-    `projects/${project}/memberships.json`,
-    { limit: 100 },
-  );
-  const list = (r.memberships ?? []).flatMap((m) => (m.user ? [m.user] : []));
+  const list = (await loadMemberships(rm, project)).flatMap((m) => (m.user ? [m.user] : []));
   membersMemo.set(key, list);
   return list;
+}
+
+/**
+ * Все членства проекта — постранично и без кэша: у крупного проекта участников больше сотни,
+ * а сверка после записи обязана видеть состояние Redmine, а не память скрипта.
+ */
+async function loadMemberships(rm: Resolved, project: string | number): Promise<Membership[]> {
+  return fetchAll<Membership>(rm, `projects/${project}/memberships.json`, "memberships", {}, 2000);
 }
 
 /**
@@ -1087,16 +1150,27 @@ export function parsePeriod(input: string): [string, string] {
     const end = new Date(today.getFullYear(), today.getMonth(), 0);
     return [fmtDate(start), fmtDate(end)];
   }
-  const ym = s.match(/^(\d{4})-(\d{2})$/);
-  if (ym) {
-    const year = Number(ym[1]);
-    const month = Number(ym[2]);
-    return [fmtDate(new Date(year, month - 1, 1)), fmtDate(new Date(year, month, 0))];
-  }
+  const month = monthBounds(s);
+  if (month) return month;
+  // Концы диапазона — дата или месяц: «2026-07..2026-09» — с первого июля по последний день сентября.
   const range = s.match(/^(.+?)\.\.(.+)$/);
-  if (range) return [parseDate(range[1]!), parseDate(range[2]!)];
+  if (range) {
+    const from = monthBounds(range[1]!)?.[0] ?? parseDate(range[1]!);
+    const to = monthBounds(range[2]!)?.[1] ?? parseDate(range[2]!);
+    return [from, to];
+  }
   const single = parseDate(s);
   return [single, single];
+}
+
+/** YYYY-MM → первый и последний день месяца; не месяц — null. */
+function monthBounds(input: string): [string, string] | null {
+  const ym = input.trim().match(/^(\d{4})-(\d{2})$/);
+  if (!ym) return null;
+  const year = Number(ym[1]);
+  const month = Number(ym[2]);
+  if (month < 1 || month > 12) throw new UserError(`Не понимаю месяц "${input.trim()}": номер месяца — от 01 до 12.`);
+  return [fmtDate(new Date(year, month - 1, 1)), fmtDate(new Date(year, month, 0))];
 }
 
 export function parseHours(input: string): number {
@@ -1137,7 +1211,7 @@ type Args = {
   repeated: Map<string, string[]>;
 };
 
-function parseArgs(argv: string[]): Args {
+export function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
   const flags = new Map<string, string | true>();
   const repeated = new Map<string, string[]>();
@@ -1522,6 +1596,9 @@ async function cmdCreateProject(rm: Resolved, args: Args): Promise<void> {
   if (pickedModules.length > 0) payload.enabled_module_names = pickedModules;
   if (fields.length > 0) payload.custom_fields = fields.map((f) => ({ id: f.id, value: f.value }));
 
+  // Redmine сам делает создателя-не-администратора участником нового проекта
+  // (роль — из настройки инстанса «роль создателя проекта»), в том числе через REST.
+  const me = await currentUser(rm);
   const rows: string[][] = [
     ["Название", name],
     ["Идентификатор", identifier + (explicit ? "" : " (сгенерирован из названия)")],
@@ -1529,11 +1606,15 @@ async function cmdCreateProject(rm: Resolved, args: Args): Promise<void> {
     ["Доступ", describeAccess(isPublic)],
     [
       "Участники",
-      parent
+      (parent
         ? inheritMembers
           ? "наследуются от родителя"
           : "свои (наследование не включено; --inherit-members включит)"
-        : "назначаются после создания",
+        : "добавляются после создания (add-member)") +
+        (me.admin === true
+          ? ""
+          : "; владелец ключа не администратор — Redmine сразу сделает его участником с ролью, " +
+            "которую инстанс назначает создателю проекта"),
     ],
     ["Трекеры", pickedTrackers.length > 0 ? pickedTrackers.map((t) => t.name).join(", ") : "набор инстанса по умолчанию"],
     ["Модули", pickedModules.length > 0 ? pickedModules.join(", ") : "набор инстанса по умолчанию"],
@@ -1730,6 +1811,1046 @@ async function cmdArchiveProject(rm: Resolved, args: Args): Promise<void> {
   emit({ project: key, archived: !unarchive }, () =>
     `Проект ${title} ${unarchive ? "разархивирован" : "архивирован"} на инстансе ${rm.name}.`,
   );
+}
+
+// ─────────────────────────── участники проекта ─────────────────────────
+
+/** Проект так, как его называют в предпросмотре: название, идентификатор и номер разом. */
+export function projectTitle(p: { id: number; name: string; identifier: string }): string {
+  return `«${p.name}» (${p.identifier}, id=${p.id})`;
+}
+
+/** Всё о проекте, что нужно предпросмотру участника. `isPublic: null` — проект не виден в списке. */
+export type MemberProject = { id: number; name: string; identifier: string; url: string; isPublic: boolean | null };
+
+/**
+ * Кого добавляют или меняют: пользователь или группа. Номер принимается как есть, даже если имя
+ * узнать не удалось, — но предпросмотр говорит об этом прямо, а не печатает голый номер.
+ */
+export type Principal = {
+  id: number;
+  name: string | null;
+  kind: "user" | "group" | "unknown";
+  /** Видимые проекты, где он уже состоит: по ним различают однофамильцев. */
+  projects: string[];
+  /** Это владелец ключа: удалить себя или снять с себя управление — значит потерять доступ. */
+  self: boolean;
+  /** Почему имя неизвестно — для предпросмотра. */
+  note?: string;
+};
+
+/**
+ * Кандидат при поиске по имени. `seen` — когда учётная запись заведена и когда в неё входили:
+ * у однофамильцев часто один и тот же набор проектов, и живую запись отличает только это.
+ */
+export type PersonCandidate = { id: number; name: string; kind: "user" | "group"; projects: string[]; seen?: string };
+
+export type MemberAction = "list" | "add" | "update" | "remove";
+
+const RULE = "─".repeat(60);
+
+// ── роли словами ──
+
+const ISSUE_VISIBILITY: Record<string, string> = {
+  all: "видит все",
+  default: "видит все, кроме приватных",
+  own: "видит только созданные им или назначенные на него",
+};
+
+const TIME_VISIBILITY: Record<string, string> = {
+  all: "видит все списания",
+  own: "видит только свои списания",
+};
+
+/** Права управления проектом: их называем отдельно — они дают власть над другими людьми и настройками. */
+const PROJECT_POWERS: [string, string][] = [
+  ["manage_members", "управляет участниками"],
+  ["edit_project", "меняет настройки проекта"],
+  ["add_subprojects", "создаёт подпроекты"],
+  ["manage_versions", "ведёт версии"],
+];
+
+const MODULE_ACCESS: [string, string][] = [
+  ["view_wiki_pages", "вики"],
+  ["view_documents", "документы"],
+  ["view_files", "файлы"],
+  ["browse_repository", "репозиторий"],
+];
+
+/**
+ * Что роль даёт — в общих чертах и словами. Полный список прав Redmine длинный и технический;
+ * человеку, который соглашается на добавление участника, нужна суть: что он увидит, что сможет
+ * менять и получит ли власть над проектом.
+ */
+export function describeRole(role: RoleInfo): string {
+  const perms = role.permissions;
+  if (perms === null) return "права роли не прочитаны — они видны в «Администрирование → Роли и права»";
+  const has = (permission: string): boolean => perms.includes(permission);
+  const parts: string[] = [];
+
+  if (has("view_issues")) {
+    const actions = [
+      has("add_issues") ? "создаёт" : "",
+      has("edit_issues") ? "редактирует" : has("edit_own_issues") ? "редактирует свои" : "",
+      has("add_issue_notes") ? "комментирует" : "",
+      has("delete_issues") ? "удаляет" : "",
+    ].filter(Boolean);
+    parts.push(
+      `задачи: ${ISSUE_VISIBILITY[role.issues_visibility ?? ""] ?? "видит"}` +
+        (actions.length > 0 ? `; ${actions.join(", ")}` : "; только читает"),
+    );
+  } else {
+    parts.push("задач не видит");
+  }
+
+  const time = [
+    has("view_time_entries") ? (TIME_VISIBILITY[role.time_entries_visibility ?? ""] ?? "видит списания") : "",
+    has("log_time") ? "списывает своё время" : "",
+    has("edit_time_entries") ? "правит чужие списания" : "",
+    has("log_time_for_other_users") ? "списывает за других" : "",
+  ].filter(Boolean);
+  parts.push(time.length > 0 ? `трудозатраты: ${time.join(", ")}` : "трудозатрат не видит");
+
+  const powers = PROJECT_POWERS.filter(([p]) => has(p)).map(([, words]) => words);
+  if (powers.length > 0) parts.push(powers.join(", "));
+  const modules = MODULE_ACCESS.filter(([p]) => has(p)).map(([, words]) => words);
+  if (modules.length > 0) parts.push(`также: ${modules.join(", ")}`);
+  if (role.assignable === true) parts.push("может быть исполнителем задач");
+  if (role.assignable === false) parts.push("исполнителем задач быть не может");
+  return parts.join(" · ");
+}
+
+/** Роли по имени или номеру; неизвестная останавливает команду и перечисляет доступные. */
+export function resolveRoles(all: RoleInfo[], wanted: string[]): RoleInfo[] {
+  if (wanted.length === 0) {
+    throw new UserError(`Укажите хотя бы одну роль: --role <имя|id>. Доступно: ${all.map((r) => r.name).join(", ")}.`);
+  }
+  try {
+    return resolveManyByName(all, wanted, "Роли");
+  } catch (error) {
+    if (error instanceof UserError) {
+      throw new UserError(`${error.message}\n  Что даёт каждая роль — redmine.ts roles.`);
+    }
+    throw error;
+  }
+}
+
+// ── поиск человека по имени ──
+
+/** Слова имени для сравнения: регистр, «ё», знаки препинания и порядок слов не важны. */
+function nameWords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .split(/[\s.,]+/)
+    .filter((w) => w.length > 0);
+}
+
+export type PersonMatch =
+  | { kind: "one"; person: PersonCandidate }
+  | { kind: "many"; candidates: PersonCandidate[] }
+  | { kind: "none"; similar: PersonCandidate[] };
+
+/**
+ * Сопоставление имени без учёта порядка слов: инстанс показывает людей то «Имя Фамилия»,
+ * то «Фамилия Имя» — как настроено, а человек пишет так, как помнит.
+ * Полное совпадение важнее частичного: «Иван Петров» не должен становиться неоднозначным
+ * из-за «Ивана Петровича Сидорова».
+ */
+export function matchPeople(candidates: PersonCandidate[], needle: string): PersonMatch {
+  const want = nameWords(needle);
+  if (want.length === 0) return { kind: "none", similar: [] };
+  const verdict = (list: PersonCandidate[]): PersonMatch | null =>
+    list.length === 1 ? { kind: "one", person: list[0]! } : list.length > 1 ? { kind: "many", candidates: list } : null;
+
+  const full = candidates.filter((c) => {
+    const own = nameWords(c.name);
+    return own.length === want.length && want.every((w) => own.includes(w));
+  });
+  const byFull = verdict(full);
+  if (byFull) return byFull;
+
+  const partial = candidates.filter((c) => {
+    const own = nameWords(c.name);
+    return want.every((w) => own.some((o) => o.startsWith(w)));
+  });
+  const byPartial = verdict(partial);
+  if (byPartial) return byPartial;
+
+  // Похожие — только подсказка для ошибки, выбирать из них скилл не вправе.
+  const similar = candidates.filter((c) => {
+    const own = nameWords(c.name);
+    return want.some((w) => w.length >= 3 && own.some((o) => o.startsWith(w.slice(0, 3))));
+  });
+  return { kind: "none", similar: similar.slice(0, 10) };
+}
+
+function shortList(items: string[], max: number): string {
+  if (items.length <= max) return items.join(", ");
+  return `${items.slice(0, max).join(", ")} и ещё ${items.length - max}`;
+}
+
+function candidateLine(p: PersonCandidate): string {
+  const where = p.projects.length > 0 ? `проекты: ${shortList(p.projects, 4)}` : "в видимых проектах не встречается";
+  return `    ${p.name} (id=${p.id}) — ${p.kind === "group" ? "группа" : "пользователь"}; ${where}${p.seen ? `; ${p.seen}` : ""}`;
+}
+
+/**
+ * Выбор одного человека — или остановка до отправки со списком кандидатов.
+ * `serverHits` — ответ справочника пользователей: он ищет ещё по логину и почте,
+ * и такие совпадения по имени не видны.
+ */
+export function pickPerson(
+  pool: PersonCandidate[],
+  needle: string,
+  ctx: { projects: number; directory: "admin" | "closed"; serverHits: PersonCandidate[] },
+): PersonCandidate {
+  let match = matchPeople(pool, needle);
+  if (match.kind === "none" && ctx.serverHits.length > 0) {
+    match =
+      ctx.serverHits.length === 1
+        ? { kind: "one", person: ctx.serverHits[0]! }
+        : { kind: "many", candidates: ctx.serverHits };
+  }
+  if (match.kind === "one") return match.person;
+  if (match.kind === "many") {
+    throw new UserError(
+      `"${needle}" подходит нескольким — уточните имя или укажите номер: --user <id>.\n` +
+        `  Кандидаты:\n${match.candidates.map(candidateLine).join("\n")}`,
+    );
+  }
+  const where =
+    `среди участников ${ctx.projects} видимых проектов` + (ctx.directory === "admin" ? " и в справочнике пользователей" : "");
+  throw new UserError(
+    `"${needle}" не найден ${where}.\n` +
+      (match.similar.length > 0
+        ? `  Похожие:\n${match.similar.map(candidateLine).join("\n")}\n`
+        : "  Похожих имён нет.\n") +
+      (ctx.directory === "admin"
+        ? "  Проверьте написание или укажите номер: --user <id>."
+        : "  Человека, который ещё ни в одном видимом вам проекте не состоит, по имени не найти: справочник\n" +
+          "  пользователей (/users.json) отдаётся только администратору Redmine. Укажите номер: --user <id> —\n" +
+          "  он виден в адресе профиля (…/users/<id>), либо его назовёт администратор."),
+  );
+}
+
+/**
+ * Справочник людей из участников всех видимых проектов — только в памяти, на один запуск.
+ * На диск не пишется: это персональные данные, а состав участников меняется этими же
+ * командами — вчерашний кэш назвал бы не того человека.
+ */
+const peopleMemo = new Map<string, { people: PersonCandidate[]; projects: number }>();
+
+async function peopleIndex(rm: Resolved): Promise<{ people: PersonCandidate[]; projects: number }> {
+  const hit = peopleMemo.get(rm.name);
+  if (hit) return hit;
+  const list = await projects(rm);
+  const loaded = await mapLimit(list, 6, async (project) => {
+    try {
+      return { project, memberships: await loadMemberships(rm, project.id) };
+    } catch (error) {
+      // Участники части проектов бывают закрыты от ключа — поиск по остальным от этого не ломается.
+      if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
+        return { project, memberships: [] as Membership[] };
+      }
+      throw error;
+    }
+  });
+  const byId = new Map<number, PersonCandidate>();
+  for (const { project, memberships } of loaded) {
+    for (const m of memberships) {
+      const principal = m.user ?? m.group;
+      if (!principal) continue;
+      const kind: PersonCandidate["kind"] = m.user ? "user" : "group";
+      const slot = byId.get(principal.id) ?? { id: principal.id, name: principal.name, kind, projects: [] };
+      if (!slot.projects.includes(project.name)) slot.projects.push(project.name);
+      byId.set(principal.id, slot);
+    }
+  }
+  const result = { people: [...byId.values()], projects: list.length };
+  peopleMemo.set(rm.name, result);
+  return result;
+}
+
+type DirectoryUser = {
+  id: number;
+  firstname?: string;
+  lastname?: string;
+  login?: string;
+  created_on?: string;
+  last_login_on?: string | null;
+};
+
+function directoryName(u: DirectoryUser): string {
+  return [u.firstname, u.lastname].filter(Boolean).join(" ") || u.login || `#${u.id}`;
+}
+
+/** Даты учётной записи для различения однофамильцев. Почту не берём: это лишние персональные данные. */
+export function accountSeen(u: { created_on?: string; last_login_on?: string | null }): string | undefined {
+  // null — Redmine прямо говорит «не входил»; отсутствие поля — только то, что дату нам не показали.
+  const parts = [
+    u.created_on ? `заведён ${u.created_on.slice(0, 10)}` : "",
+    typeof u.last_login_on === "string"
+      ? `последний вход ${u.last_login_on.slice(0, 10)}`
+      : u.last_login_on === null
+        ? "не входил ни разу"
+        : "",
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+/** Однофамильцев дополняем датами из карточек: по одинаковым спискам проектов их не различить. */
+async function annotateNamesakes(rm: Resolved, candidates: PersonCandidate[]): Promise<void> {
+  const users = candidates.filter((c) => c.kind === "user" && c.seen === undefined).slice(0, 10);
+  await mapLimit(users, 4, async (c) => {
+    try {
+      const r = await request<{ user?: DirectoryUser }>(rm, "GET", `users/${c.id}.json`);
+      if (r.user) c.seen = accountSeen(r.user);
+    } catch (error) {
+      if (!(error instanceof ApiError)) throw error;
+    }
+  });
+}
+
+/** Справочник пользователей — только у администратора; null значит «закрыт», а не «пусто». */
+async function searchUserDirectory(rm: Resolved, name: string): Promise<PersonCandidate[] | null> {
+  try {
+    const r = await request<{ users?: DirectoryUser[] }>(rm, "GET", "users.json", { name, limit: 25 });
+    return (r.users ?? []).map((u) => ({ id: u.id, name: directoryName(u), kind: "user" as const, projects: [] }));
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 403 || error.status === 404)) return null;
+    throw error;
+  }
+}
+
+/** Имя по номеру: карточка пользователя видна не только администратору, если человек ему «виден». */
+async function directoryUserName(rm: Resolved, id: number): Promise<string | null> {
+  try {
+    const r = await request<{ user?: DirectoryUser }>(rm, "GET", `users/${id}.json`);
+    return r.user ? directoryName(r.user) : null;
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 403 || error.status === 404)) return null;
+    throw error;
+  }
+}
+
+async function resolvePrincipal(rm: Resolved, raw: string): Promise<Principal> {
+  const value = raw.trim();
+  const me = await currentUser(rm);
+  if (/^(me|я)$/i.test(value)) {
+    return { id: me.id, name: `${me.firstname} ${me.lastname}`.trim(), kind: "user", projects: [], self: true };
+  }
+
+  if (/^#?\d+$/.test(value)) {
+    const id = Number(value.replace("#", ""));
+    const self = id === me.id;
+    const direct = await directoryUserName(rm, id);
+    if (direct) return { id, name: direct, kind: "user", projects: [], self };
+    const index = await peopleIndex(rm);
+    const known = index.people.find((p) => p.id === id);
+    if (known) return { ...known, self };
+    return {
+      id,
+      name: null,
+      kind: "unknown",
+      projects: [],
+      self,
+      note:
+        `имя узнать не удалось: в ${index.projects} видимых проектах такого участника нет, а карточка ` +
+        `пользователя закрыта от ключа. Номер уйдёт как есть — сверьте его с профилем (…/users/${id})`,
+    };
+  }
+
+  const index = await peopleIndex(rm);
+  const directory = await searchUserDirectory(rm, value);
+  const pool = new Map(index.people.map((p) => [p.id, p]));
+  for (const u of directory ?? []) if (!pool.has(u.id)) pool.set(u.id, u);
+  const hits = (directory ?? []).map((u) => pool.get(u.id) ?? u);
+  const probe = matchPeople([...pool.values()], value);
+  if (probe.kind === "many") await annotateNamesakes(rm, probe.candidates);
+  const person = pickPerson([...pool.values()], value, {
+    projects: index.projects,
+    directory: directory === null ? "closed" : "admin",
+    serverHits: hits,
+  });
+  return { ...person, self: person.id === me.id };
+}
+
+// ── членства ──
+
+/** Членство, в котором состоит пользователь или группа: у одного участника в проекте оно одно. */
+export function findMembership(list: Membership[], principalId: number): Membership | undefined {
+  return list.find((m) => (m.user?.id ?? m.group?.id) === principalId);
+}
+
+/** Собственные роли: их задают и снимают здесь. */
+export function ownRoles(m: Membership): MemberRole[] {
+  return m.roles.filter((r) => r.inherited !== true);
+}
+
+/** Унаследованные роли — от группы или родительского проекта; меняются там, откуда пришли. */
+export function inheritedRoles(m: Membership): MemberRole[] {
+  return m.roles.filter((r) => r.inherited === true);
+}
+
+/**
+ * Роли участника одной строкой: сначала собственные, затем унаследованные. Унаследованная роль
+ * приходит от каждой группы отдельно, и без схлопывания «Исполнитель» повторялся бы по разу на группу.
+ */
+export function describeMemberRoles(roles: MemberRole[]): string {
+  const unique = (list: MemberRole[]): string[] => [...new Set(list.map((r) => r.name))];
+  const own = unique(roles.filter((r) => r.inherited !== true));
+  const inherited = unique(roles.filter((r) => r.inherited === true));
+  if (own.length === 0 && inherited.length === 0) return "—";
+  return [own.join(", "), inherited.length > 0 ? `унасл.: ${inherited.join(", ")}` : ""].filter(Boolean).join(" + ");
+}
+
+function principalOf(m: Membership, meId: number): Principal {
+  if (m.user) return { id: m.user.id, name: m.user.name, kind: "user", projects: [], self: m.user.id === meId };
+  if (m.group) return { id: m.group.id, name: m.group.name, kind: "group", projects: [], self: false };
+  throw new UserError(`Членство ${m.id} не называет ни пользователя, ни группу — такой ответ Redmine разобрать нельзя.`);
+}
+
+/** Как называть участника в тексте: имя и номер, либо честное «имя неизвестно». */
+export function principalName(p: Principal): string {
+  if (p.kind === "group") return `группа «${p.name ?? `#${p.id}`}» (id=${p.id})`;
+  return p.name ? `${p.name} (id=${p.id})` : `пользователь id=${p.id}`;
+}
+
+function principalRow(p: Principal): string[] {
+  const title = p.kind === "group" ? "Группа" : "Пользователь";
+  const extra = [
+    p.self ? "это вы — владелец ключа" : "",
+    p.projects.length > 0 ? `уже состоит в: ${shortList(p.projects, 4)}` : "",
+    p.note ?? "",
+  ].filter(Boolean);
+  return [title, `${p.kind === "group" ? `«${p.name ?? `#${p.id}`}» (id=${p.id})` : principalName(p)}${extra.length > 0 ? ` — ${extra.join("; ")}` : ""}`];
+}
+
+function projectRows(project: MemberProject): string[][] {
+  const access =
+    project.isPublic === null ? "" : project.isPublic ? " — публичный" : " — закрытый, виден только участникам";
+  return [
+    ["Проект", `${projectTitle(project)}${access}`],
+    ["Адрес", project.url],
+  ];
+}
+
+function roleLines(list: RoleInfo[]): string {
+  return list.map((r) => `  ${r.name} (id=${r.id}): ${describeRole(r)}`).join("\n");
+}
+
+/** Главное предупреждение: членство — это видимость и почта, а не пометка в списке. */
+export const CLIENT_NOTICE =
+  "Участник клиентского проекта видит задачи проекта в объёме своей роли и получает уведомления по ним\n" +
+  "(сколько писем — зависит от его настроек почты в Redmine). Проверьте, что роль открывает ровно то,\n" +
+  "что этому человеку положено видеть.";
+
+const MANAGE_NOTE = "Операция требует у владельца ключа права «Управление участниками» в этом проекте.";
+
+const GROUP_NOTE =
+  "Это группа: роли получат все её участники — и нынешние, и те, кого добавят в группу позже.";
+
+export const SEPARATE_CONFIRMATION =
+  "Удаление участника — отдельное подтверждение. Согласие на другие операции его не покрывает:\n" +
+  "нужно явное «да» именно на это удаление, и только после него — повтор с --yes.";
+
+export function addMemberPreview(ctx: {
+  instance: string;
+  project: MemberProject;
+  principal: Principal;
+  roles: RoleInfo[];
+  memberCount: number;
+}): string {
+  const rows = [
+    ...projectRows(ctx.project),
+    principalRow(ctx.principal),
+    ["Роли", ctx.roles.map((r) => r.name).join(", ")],
+    ["Участников", `сейчас ${ctx.memberCount}, станет ${ctx.memberCount + 1}`],
+  ];
+  const notes = [
+    ctx.principal.kind === "group" ? GROUP_NOTE : "",
+    ctx.project.isPublic === true
+      ? "Проект публичный: задачи и так видны всем с учётной записью, членство добавляет права роли и уведомления."
+      : "",
+    CLIENT_NOTICE,
+    MANAGE_NOTE,
+  ].filter(Boolean);
+  return (
+    `НОВЫЙ УЧАСТНИК ПРОЕКТА · инстанс ${ctx.instance}\n${table(rows)}\n${RULE}\n` +
+    `Что дают роли:\n${roleLines(ctx.roles)}\n${RULE}\n${notes.join("\n")}`
+  );
+}
+
+export function updateMemberPreview(ctx: {
+  instance: string;
+  project: MemberProject;
+  principal: Principal;
+  membership: Membership;
+  roles: RoleInfo[];
+  /** Владелец ключа снимает с себя последнюю роль с правом управлять участниками. */
+  selfLosesManage: boolean;
+}): string {
+  const own = ownRoles(ctx.membership);
+  const inherited = inheritedRoles(ctx.membership);
+  const wanted = new Set(ctx.roles.map((r) => r.id));
+  const had = new Set(own.map((r) => r.id));
+  const added = ctx.roles.filter((r) => !had.has(r.id));
+  const removed = own.filter((r) => !wanted.has(r.id));
+
+  const rows = [
+    ...projectRows(ctx.project),
+    principalRow(ctx.principal),
+    ["Роли сейчас", describeMemberRoles(ctx.membership.roles)],
+    [
+      "Станут",
+      ctx.roles.map((r) => r.name).join(", ") +
+        (inherited.length > 0 ? ` + унаследованные: ${inherited.map((r) => r.name).join(", ")}` : ""),
+    ],
+    ["Добавляются", added.length > 0 ? added.map((r) => r.name).join(", ") : "—"],
+    ["Снимаются", removed.length > 0 ? removed.map((r) => r.name).join(", ") : "—"],
+  ];
+  const notes = [
+    inherited.length > 0
+      ? `Унаследованные роли (${inherited.map((r) => r.name).join(", ")}) пришли от группы или родительского ` +
+        "проекта — этой командой они не снимаются."
+      : "",
+    ctx.principal.kind === "group" ? "Это членство группы: изменение коснётся всех её участников в проекте." : "",
+    removed.length > 0
+      ? "Снятая роль перестаёт действовать сразу: пропадают её права, а с ними — доступ к задачам и уведомления, которые она давала."
+      : "",
+    ctx.selfLosesManage
+      ? "ВНИМАНИЕ: вы снимаете с себя последнюю роль с правом «Управление участниками» — вернуть её себе сами не сможете."
+      : "",
+    added.length > 0 ? CLIENT_NOTICE : "",
+    MANAGE_NOTE,
+  ].filter(Boolean);
+  return (
+    `ИЗМЕНЕНИЕ РОЛЕЙ УЧАСТНИКА · инстанс ${ctx.instance} · членство ${ctx.membership.id}\n${table(rows)}\n${RULE}\n` +
+    `Что дают роли после изменения:\n${roleLines(ctx.roles)}\n${RULE}\n${notes.join("\n")}`
+  );
+}
+
+export function removeMemberPreview(ctx: {
+  instance: string;
+  project: MemberProject;
+  principal: Principal;
+  membership: Membership;
+  /** Открытые задачи участника в проекте; null — посчитать не удалось или это группа. */
+  openIssues: number | null;
+}): string {
+  const rows = [...projectRows(ctx.project), principalRow(ctx.principal), ["Роли", describeMemberRoles(ctx.membership.roles)]];
+  if (ctx.openIssues !== null) {
+    rows.push([
+      "Открытые задачи на нём",
+      ctx.openIssues > 0
+        ? `${ctx.openIssues} — останутся назначенными на человека вне проекта: переназначьте их`
+        : "нет",
+    ]);
+  }
+  const notes = [
+    "После удаления права ролей в проекте пропадают сразу, а с ними — уведомления, которые давало членство;\n" +
+      "задачи закрытого проекта станут ему не видны. Списанные часы, комментарии и авторство задач остаются.",
+    ctx.principal.kind === "group"
+      ? "Это членство группы: её участники, которые состоят в проекте только через группу, потеряют доступ вместе с ней."
+      : "",
+    ctx.principal.self
+      ? "ВНИМАНИЕ: это ваше собственное членство. После удаления владелец ключа потеряет роль в проекте и вернуть\n" +
+        "себя сам не сможет — только администратор или менеджер проекта."
+      : "",
+    MANAGE_NOTE,
+  ].filter(Boolean);
+  return (
+    `УДАЛЕНИЕ УЧАСТНИКА ИЗ ПРОЕКТА · инстанс ${ctx.instance} · членство ${ctx.membership.id}\n${table(rows)}\n` +
+    `${RULE}\n${notes.join("\n")}\n${RULE}\n${SEPARATE_CONFIRMATION}`
+  );
+}
+
+// ── запросы ──
+
+export type MembershipRequest = {
+  method: "POST" | "PUT" | "DELETE";
+  path: string;
+  body?: { membership: { user_id?: number; role_ids: number[] } };
+};
+
+function roleIdList(ids: number[]): number[] {
+  const unique = [...new Set(ids)];
+  if (unique.length === 0) throw new UserError("Нужна хотя бы одна роль: без роли Redmine членство не принимает.");
+  const bad = unique.filter((id) => !Number.isInteger(id) || id <= 0);
+  if (bad.length > 0) throw new UserError(`Номер роли должен быть положительным целым, получено: ${bad.join(", ")}.`);
+  return unique;
+}
+
+function positiveId(value: number, what: string): number {
+  if (!Number.isInteger(value) || value <= 0) throw new UserError(`${what} должен быть положительным целым, получено ${value}.`);
+  return value;
+}
+
+/** `user_id` принимает и пользователя, и группу — у Redmine это один «участник». */
+export function addMemberRequest(projectId: number, principalId: number, roleIds: number[]): MembershipRequest {
+  return {
+    method: "POST",
+    path: `projects/${positiveId(projectId, "Номер проекта")}/memberships.json`,
+    body: { membership: { user_id: positiveId(principalId, "Номер пользователя"), role_ids: roleIdList(roleIds) } },
+  };
+}
+
+/** PUT заменяет собственные роли целиком; унаследованные Redmine оставляет сам. */
+export function updateMemberRequest(membershipId: number, roleIds: number[]): MembershipRequest {
+  return {
+    method: "PUT",
+    path: `memberships/${positiveId(membershipId, "Номер членства")}.json`,
+    body: { membership: { role_ids: roleIdList(roleIds) } },
+  };
+}
+
+export function removeMemberRequest(membershipId: number): MembershipRequest {
+  return { method: "DELETE", path: `memberships/${positiveId(membershipId, "Номер членства")}.json` };
+}
+
+async function sendMembership(rm: Resolved, req: MembershipRequest): Promise<void> {
+  await request(rm, req.method, req.path, undefined, req.body);
+}
+
+// ── отказы и сверка ──
+
+/** 403 — про права владельца ключа, а не про запрос: называем разрешение и того, кто его выдаёт. */
+export function explainMemberForbidden(action: MemberAction, project: string): string {
+  if (action === "list") {
+    return (
+      `Список участников проекта ${project} закрыт от владельца ключа: нужна роль с правом «Просмотр участников»\n` +
+      "  или «Управление участниками». Роль в проекте назначает администратор Redmine или менеджер проекта."
+    );
+  }
+  const head =
+    action === "add" ? "Участник не добавлен" : action === "update" ? "Роли не изменены" : "Участник не удалён";
+  return (
+    `${head}: у владельца ключа нет права «Управление участниками» в проекте ${project}.\n` +
+    "  Право входит в роль проекта. Какие роли его дают — «Администрирование → Роли и права»; назначает\n" +
+    "  такую роль администратор Redmine или менеджер этого проекта, у которого право уже есть.\n" +
+    "  Что делать: попросить их выдать право либо внести изменение самим. Обходного пути нет."
+  );
+}
+
+/**
+ * Отказ 422 по членству — почти всегда одна из немногих понятных ситуаций. Пользователю нужна
+ * причина словами, а не код ответа. DELETE при унаследованной роли Redmine отклоняет без текста.
+ */
+export function explainMembershipRejection(
+  details: string[],
+  ctx: { action: "add" | "update" | "remove"; project: string; who: string },
+): string {
+  const flat = details.join("; ").toLowerCase();
+  const head =
+    ctx.action === "add"
+      ? `Redmine не добавил ${ctx.who} в проект ${ctx.project}.`
+      : ctx.action === "update"
+        ? `Redmine не изменил роли ${ctx.who} в проекте ${ctx.project}.`
+        : `Redmine не удалил ${ctx.who} из проекта ${ctx.project}.`;
+
+  if (/taken|already|уже существует|уже использ|уже есть/.test(flat)) {
+    return (
+      `${head}\n  Он уже участник проекта: Redmine держит одно членство на человека в проекте.\n` +
+      "  Роли меняются командой update-member — номер членства видно в redmine.ts members <проект>."
+    );
+  }
+  if (/role|рол/.test(flat) && /blank|empty|пуст|не может/.test(flat)) {
+    return (
+      `${head}\n  Ни одна из ролей не легла. Обычно так бывает, когда владельцу ключа разрешено назначать не все роли:\n` +
+      "  у права «Управление участниками» есть ограничение «только эти роли», и остальные Redmine отбрасывает молча.\n" +
+      "  Назначить такую роль может администратор или менеджер проекта без этого ограничения."
+    );
+  }
+  if (/user|principal|пользовател|имя/.test(flat) && /blank|empty|invalid|пуст|неверн|не найден/.test(flat)) {
+    return (
+      `${head}\n  Пользователя с таким номером на инстансе нет или он заблокирован.\n` +
+      "  Проверьте номер по профилю (…/users/<id>) или найдите человека по имени: --user \"Имя Фамилия\"."
+    );
+  }
+  if (ctx.action === "remove" && details.length === 0) {
+    return (
+      `${head}\n  Это членство нельзя удалить: у него есть роли, унаследованные от группы или родительского проекта.\n` +
+      "  Удалять нужно там, откуда роль пришла, — членство группы или наследование участников в настройках проекта.\n" +
+      "  Собственные роли можно сократить командой update-member."
+    );
+  }
+  return (
+    `${head}\n  Redmine ответил: ${details.join("; ") || "без пояснения"}.\n` +
+    "  Проверьте состав и роли: redmine.ts members <проект>, redmine.ts roles."
+  );
+}
+
+async function withMemberErrors<T>(
+  ctx: { action: MemberAction; project: string; who: string },
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    if (error.status === 403) throw new UserError(explainMemberForbidden(ctx.action, ctx.project));
+    if (error.status === 422 && ctx.action !== "list") {
+      throw new UserError(explainMembershipRejection(error.details, { action: ctx.action, project: ctx.project, who: ctx.who }));
+    }
+    if (error.status === 404) {
+      throw new UserError(
+        ctx.action === "list" || ctx.action === "add"
+          ? `Проект ${ctx.project} не найден на инстансе либо закрыт от владельца ключа. Список: redmine.ts projects`
+          : "Такого членства нет: его уже удалили либо номер с другого инстанса. Номера — redmine.ts members <проект>.",
+      );
+    }
+    throw error;
+  }
+}
+
+export type RoleCheck = { ok: boolean; absent: boolean; missing: IdName[]; extra: IdName[] };
+
+/**
+ * Сверка после записи. Redmine молча отбрасывает роли, которые владельцу ключа не разрешено
+ * назначать или снимать, и всё равно отвечает успехом — верить ответу нельзя, только перечитанному.
+ */
+export function checkMemberRoles(after: Membership | undefined, expected: IdName[]): RoleCheck {
+  if (!after) return { ok: false, absent: true, missing: expected, extra: [] };
+  const own = ownRoles(after);
+  const ownIds = new Set(own.map((r) => r.id));
+  const wantIds = new Set(expected.map((r) => r.id));
+  const missing = expected.filter((r) => !ownIds.has(r.id)).map(({ id, name }) => ({ id, name }));
+  const extra = own.filter((r) => !wantIds.has(r.id)).map(({ id, name }) => ({ id, name }));
+  return { ok: missing.length === 0 && extra.length === 0, absent: false, missing, extra };
+}
+
+export function roleCheckText(check: RoleCheck, who: string): string {
+  if (check.ok) return `Сверка: собственные роли ${who} в проекте совпадают с запрошенными.`;
+  if (check.absent) {
+    return `РАСХОЖДЕНИЕ: Redmine ответил успехом, но ${who} среди участников проекта нет. Проверьте: redmine.ts members <проект>.`;
+  }
+  const parts = [
+    check.missing.length > 0 ? `не легли роли ${check.missing.map((r) => r.name).join(", ")}` : "",
+    check.extra.length > 0 ? `остались роли ${check.extra.map((r) => r.name).join(", ")}` : "",
+  ].filter(Boolean);
+  return (
+    `РАСХОЖДЕНИЕ: ${parts.join("; ")}.\n` +
+    "  Redmine молча пропускает роли, которые владельцу ключа не разрешено назначать или снимать (ограничение\n" +
+    "  «только эти роли» у права «Управление участниками»). Их меняет администратор или менеджер проекта без ограничения."
+  );
+}
+
+// ── разбор аргументов ──
+
+function noExtraWords(args: Args, used: number, example: string): void {
+  const extra = args.positional.slice(used);
+  if (extra.length > 0) {
+    throw new UserError(
+      `Лишние слова в команде: ${extra.map((x) => `"${x}"`).join(" ")}. Имя из нескольких слов берите в кавычки: ${example}.`,
+    );
+  }
+}
+
+export function readAddMember(args: Args): { project: string; user: string; roles: string[] } {
+  const fromPositional = args.positional[0];
+  const project = (fromPositional ?? str(args, "project"))?.trim();
+  if (!project) {
+    throw new UserError('Укажите проект: redmine.ts add-member <проект> --user <id|имя|me> --role <роль>.');
+  }
+  noExtraWords(args, fromPositional === undefined ? 0 : 1, '--user "Имя Фамилия"');
+  const user = str(args, "user")?.trim();
+  if (!user) throw new UserError('Укажите, кого добавить: --user <id|"Имя Фамилия"|me>.');
+  const roleNames = values(args, "role");
+  if (roleNames.length === 0) {
+    throw new UserError('Укажите хотя бы одну роль: --role "<роль>" (флаг повторяется; справочник — redmine.ts roles).');
+  }
+  return { project, user, roles: roleNames };
+}
+
+function readMembershipId(args: Args, cmd: string): number {
+  const raw = args.positional[0] ?? str(args, "membership") ?? str(args, "id");
+  if (!raw) {
+    throw new UserError(`Укажите номер членства: redmine.ts ${cmd} <членство> (номера — в redmine.ts members <проект>).`);
+  }
+  const id = Number(raw.trim().replace(/^#/, ""));
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new UserError(
+      `Номер членства — целое число, получено "${raw}". Это не номер пользователя и не проект: ` +
+        "его видно в первой колонке redmine.ts members <проект>.",
+    );
+  }
+  return id;
+}
+
+export function readUpdateMember(args: Args): { membershipId: number; roles: string[] } {
+  const membershipId = readMembershipId(args, "update-member");
+  noExtraWords(args, args.positional.length > 0 ? 1 : 0, '--role "Имя роли"');
+  const roleNames = values(args, "role");
+  if (roleNames.length === 0) {
+    throw new UserError(
+      "Укажите новый набор ролей целиком: --role <роль> [--role …]. Роли, которых в списке нет, будут сняты.",
+    );
+  }
+  return { membershipId, roles: roleNames };
+}
+
+export function readRemoveMember(args: Args): { membershipId: number } {
+  const membershipId = readMembershipId(args, "remove-member");
+  noExtraWords(args, args.positional.length > 0 ? 1 : 0, "remove-member <членство>");
+  return { membershipId };
+}
+
+// ── команды ──
+
+async function memberProjectOf(rm: Resolved, ref: IdName): Promise<MemberProject> {
+  const known = (await projects(rm)).find((p) => p.id === ref.id);
+  if (known) {
+    return {
+      id: known.id,
+      name: known.name,
+      identifier: known.identifier,
+      url: projectUrl(rm, known.identifier),
+      isPublic: known.is_public === true,
+    };
+  }
+  return { id: ref.id, name: ref.name, identifier: String(ref.id), url: projectUrl(rm, String(ref.id)), isPublic: null };
+}
+
+function toMemberProject(rm: Resolved, p: ProjectRef): MemberProject {
+  return { id: p.id, name: p.name, identifier: p.identifier, url: projectUrl(rm, p.identifier), isPublic: p.is_public === true };
+}
+
+/** После записи всё, что скрипт помнит об участниках, устарело. */
+function forgetMembers(rm: Resolved): void {
+  for (const key of [...membersMemo.keys()]) if (key.startsWith(`${rm.name}:`)) membersMemo.delete(key);
+  peopleMemo.delete(rm.name);
+}
+
+async function loadMembership(rm: Resolved, id: number, action: "update" | "remove"): Promise<Membership> {
+  return withMemberErrors({ action, project: "(ещё не определён)", who: `членство ${id}` }, async () => {
+    try {
+      return (await request<{ membership: Membership }>(rm, "GET", `memberships/${id}.json`)).membership;
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 403) {
+        throw new UserError(
+          `Членство ${id} закрыто от владельца ключа: нужна роль с правом «Просмотр участников» или «Управление участниками» ` +
+            "в его проекте.",
+        );
+      }
+      throw error;
+    }
+  });
+}
+
+/** Открытые задачи на участнике: после удаления они повиснут на человеке вне проекта. */
+async function openAssignedCount(rm: Resolved, projectId: number, userId: number): Promise<number | null> {
+  try {
+    const r = await request<{ total_count?: number }>(rm, "GET", "issues.json", {
+      project_id: projectId,
+      subproject_id: "!*",
+      assigned_to_id: userId,
+      status_id: "open",
+      limit: 1,
+    });
+    return typeof r.total_count === "number" ? r.total_count : null;
+  } catch (error) {
+    if (error instanceof ApiError) return null;
+    throw error;
+  }
+}
+
+async function cmdMembers(rm: Resolved, args: Args): Promise<void> {
+  const target = args.positional[0] ?? str(args, "project") ?? rm.defaultProject;
+  if (!target) throw new UserError("Укажите проект: redmine.ts members <identifier|id|часть названия>");
+  const project = await findProject(rm, target);
+  const title = projectTitle(project);
+  const list = await withMemberErrors({ action: "list", project: title, who: "" }, () =>
+    loadMemberships(rm, project.id),
+  );
+  // Группы сверху: их роли расходятся на всех участников группы, это первое, что стоит увидеть.
+  const sorted = [...list].sort(
+    (a, b) =>
+      Number(Boolean(b.group)) - Number(Boolean(a.group)) ||
+      ((a.user ?? a.group)?.name ?? "").localeCompare((b.user ?? b.group)?.name ?? "", "ru"),
+  );
+  const users = list.filter((m) => m.user).length;
+  const groups = list.filter((m) => m.group).length;
+  const anyInherited = list.some((m) => m.roles.some((r) => r.inherited === true));
+
+  emit(
+    {
+      instance: rm.name,
+      project: { id: project.id, identifier: project.identifier, name: project.name },
+      memberships: sorted,
+    },
+    () =>
+      `УЧАСТНИКИ ПРОЕКТА ${title} · инстанс ${rm.name}\n${projectUrl(rm, project.identifier)}\n` +
+      (sorted.length === 0
+        ? "Участников нет."
+        : table([
+            ["ЧЛЕНСТВО", "ВИД", "КТО", "РОЛИ"],
+            ...sorted.map((m) => [
+              String(m.id),
+              m.group ? "группа" : "пользователь",
+              `${(m.user ?? m.group)?.name ?? "—"} (id=${(m.user ?? m.group)?.id ?? "?"})`,
+              describeMemberRoles(m.roles),
+            ]),
+          ]) + `\n\nВсего ${list.length}: пользователей ${users}, групп ${groups}.`) +
+      (anyInherited
+        ? "\n«унасл.» — роли, пришедшие от группы или родительского проекта: снимаются там, откуда пришли."
+        : "") +
+      `\nРоли: redmine.ts update-member <членство> --role <роль> · удалить: redmine.ts remove-member <членство>` +
+      ` · справочник ролей: redmine.ts roles`,
+  );
+}
+
+async function cmdRoles(rm: Resolved, _args: Args): Promise<void> {
+  const list = await roles(rm);
+  emit(
+    list.map((r) => ({ ...r, summary: describeRole(r) })),
+    () =>
+      `РОЛИ · инстанс ${rm.name}\n` +
+      table([["ID", "РОЛЬ", "ЧТО ДАЁТ"], ...list.map((r) => [String(r.id), r.name, describeRole(r)])]) +
+      `\n\nНазначить: redmine.ts add-member <проект> --user <id|имя|me> --role <имя|id>.` +
+      `\nПолный перечень прав роли — «Администрирование → Роли и права».`,
+  );
+}
+
+async function cmdAddMember(rm: Resolved, args: Args): Promise<void> {
+  const input = readAddMember(args);
+  const project = await findProject(rm, input.project);
+  const title = projectTitle(project);
+  const picked = resolveRoles(await roles(rm), input.roles);
+  const principal = await resolvePrincipal(rm, input.user);
+  const who = principalName(principal);
+
+  const current = await withMemberErrors({ action: "list", project: title, who }, () =>
+    loadMemberships(rm, project.id),
+  );
+  const existing = findMembership(current, principal.id);
+  if (existing) {
+    const allInherited = ownRoles(existing).length === 0;
+    throw new UserError(
+      `${who} уже участник проекта ${title}: роли ${describeMemberRoles(existing.roles)}, членство ${existing.id}.\n` +
+        "  Добавить второй раз нельзя — Redmine держит одно членство на человека в проекте.\n" +
+        (allInherited
+          ? "  Все его роли сейчас унаследованы (от группы или родительского проекта); собственные роли поверх них задаёт update-member.\n"
+          : "") +
+        `  Изменить роли: redmine.ts update-member ${existing.id} --role <роль> --instance ${rm.name}`,
+    );
+  }
+
+  const req = addMemberRequest(project.id, principal.id, picked.map((r) => r.id));
+  const preview = addMemberPreview({
+    instance: rm.name,
+    project: toMemberProject(rm, project),
+    principal,
+    roles: picked,
+    memberCount: current.length,
+  });
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  await withMemberErrors({ action: "add", project: title, who }, () => sendMembership(rm, req));
+  forgetMembers(rm);
+  const placed = findMembership(await loadMemberships(rm, project.id), principal.id);
+  const check = checkMemberRoles(placed, picked);
+  emit({ membership: placed ?? null, check }, () =>
+    (placed
+      ? `Участник добавлен: ${who} → проект ${title}, членство ${placed.id}\n` +
+        `${projectUrl(rm, project.identifier)}\nРоли: ${describeMemberRoles(placed.roles)}\n`
+      : "") + roleCheckText(check, who),
+  );
+  if (!check.ok) process.exitCode = 1;
+}
+
+async function cmdUpdateMember(rm: Resolved, args: Args): Promise<void> {
+  const input = readUpdateMember(args);
+  const membership = await loadMembership(rm, input.membershipId, "update");
+  const project = await memberProjectOf(rm, membership.project);
+  const title = projectTitle(project);
+  const catalogue = await roles(rm);
+  const picked = resolveRoles(catalogue, input.roles);
+  const me = await currentUser(rm);
+  const principal = principalOf(membership, me.id);
+  const who = principalName(principal);
+
+  const own = ownRoles(membership);
+  const same = own.length === picked.length && picked.every((r) => own.some((o) => o.id === r.id));
+  if (same) {
+    throw new UserError(`У ${who} в проекте ${title} уже ровно эти роли: ${describeMemberRoles(own)}. Менять нечего.`);
+  }
+
+  const manages = (ids: number[]): boolean =>
+    ids.some((id) => catalogue.find((r) => r.id === id)?.permissions?.includes("manage_members") === true);
+  const selfLosesManage =
+    principal.self &&
+    manages(membership.roles.map((r) => r.id)) &&
+    !manages([...picked.map((r) => r.id), ...inheritedRoles(membership).map((r) => r.id)]);
+
+  const req = updateMemberRequest(membership.id, picked.map((r) => r.id));
+  const preview = updateMemberPreview({ instance: rm.name, project, principal, membership, roles: picked, selfLosesManage });
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  await withMemberErrors({ action: "update", project: title, who }, () => sendMembership(rm, req));
+  forgetMembers(rm);
+  const after = (await request<{ membership: Membership }>(rm, "GET", `memberships/${membership.id}.json`)).membership;
+  const check = checkMemberRoles(after, picked);
+  emit({ membership: after, check }, () =>
+    `Роли изменены: ${who} в проекте ${title}, членство ${after.id}\n${project.url}\n` +
+      `Было: ${describeMemberRoles(membership.roles)}\nСтало: ${describeMemberRoles(after.roles)}\n` +
+      roleCheckText(check, who),
+  );
+  if (!check.ok) process.exitCode = 1;
+}
+
+async function cmdRemoveMember(rm: Resolved, args: Args): Promise<void> {
+  const input = readRemoveMember(args);
+  const membership = await loadMembership(rm, input.membershipId, "remove");
+  const project = await memberProjectOf(rm, membership.project);
+  const title = projectTitle(project);
+  const me = await currentUser(rm);
+  const principal = principalOf(membership, me.id);
+  const who = principalName(principal);
+
+  // Redmine не удаляет членство с унаследованной ролью и отвечает на это пустым отказом — говорим заранее.
+  const inherited = inheritedRoles(membership);
+  if (inherited.length > 0) {
+    throw new UserError(
+      `Удалить ${who} из проекта ${title} этой командой нельзя: роли ${inherited.map((r) => r.name).join(", ")} ` +
+        "унаследованы — от группы, в которой он состоит, или от родительского проекта.\n" +
+        "  Удалять нужно там, откуда роль пришла: членство группы (redmine.ts members — строка группы) либо\n" +
+        "  наследование участников в настройках проекта." +
+        (ownRoles(membership).length > 0
+          ? `\n  Собственные роли (${ownRoles(membership).map((r) => r.name).join(", ")}) можно сократить: update-member ${membership.id}.`
+          : ""),
+    );
+  }
+
+  const openIssues = principal.kind === "user" ? await openAssignedCount(rm, project.id, principal.id) : null;
+  const preview = removeMemberPreview({ instance: rm.name, project, principal, membership, openIssues });
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes — только после отдельного «да» на удаление")) {
+    return;
+  }
+
+  await withMemberErrors({ action: "remove", project: title, who }, () =>
+    sendMembership(rm, removeMemberRequest(membership.id)),
+  );
+  forgetMembers(rm);
+
+  let verdict: string;
+  let gone: boolean;
+  try {
+    const after = await loadMemberships(rm, project.id);
+    gone = !after.some((m) => m.id === membership.id);
+    verdict = gone
+      ? `Сверка: членства ${membership.id} в проекте больше нет.`
+      : `РАСХОЖДЕНИЕ: Redmine ответил успехом, но членство ${membership.id} на месте. Проверьте: redmine.ts members ${project.identifier}.`;
+  } catch (error) {
+    // Удалив себя из закрытого проекта, ключ теряет право читать его участников — это и есть подтверждение.
+    if (!(error instanceof ApiError) || !principal.self || (error.status !== 403 && error.status !== 404)) throw error;
+    gone = true;
+    verdict = "Сверка: проект больше не виден владельцу ключа — удаление себя из него подтверждено этим.";
+  }
+  emit({ removed: membership.id, verified: gone }, () =>
+    `Участник удалён: ${who} больше не в проекте ${title} (членство ${membership.id}).\n${verdict}`,
+  );
+  if (!gone) process.exitCode = 1;
 }
 
 // ───────────────────────────── задачи ─────────────────────────────────
@@ -2264,7 +3385,8 @@ async function reportCrossInstance(rm: Resolved, ref: IssueRef, fromId: number):
   const target = await resolveInstance(ref.instance);
   const issue = await tryIssue(target, ref.id);
   const url = issueUrl(target, ref.id);
-  const markup = target.markup ?? "html";
+  // Строка вставляется в #fromId на исходном инстансе — значит, и разметка нужна его, а не инстанса задачи.
+  const markup = rm.markup ?? "html";
   const line = issue
     ? formatXref({ url, id: ref.id, project: issue.project.name, subject: issue.subject }, markup)
     : null;
@@ -3171,11 +4293,37 @@ type TreePlan = {
   }[];
 };
 
+/** Операции с путями — платформенные по умолчанию; самопроверка подставляет win32 или posix явно. */
+type PathApi = Pick<typeof import("node:path"), "dirname" | "isAbsolute" | "join">;
+const NATIVE_PATH: PathApi = { dirname, isAbsolute, join };
+
+/**
+ * Каталог, от которого считаются `descriptionFile` плана. Прежняя регулярка «отрезать всё после
+ * последнего слэша» на голом `plan.json` ничего не отрезала, каталогом становился сам файл,
+ * и описания искались как `plan.json\parent.html`.
+ */
+export function planBaseDir(
+  file: string | undefined,
+  base: string | undefined,
+  path: PathApi = NATIVE_PATH,
+): string | undefined {
+  if (base !== undefined && base !== "") return base;
+  return file === undefined ? undefined : path.dirname(file);
+}
+
+/**
+ * Путь к описанию из плана: абсолютный берётся как есть, относительный — от каталога плана.
+ * Абсолютность определяет `isAbsolute`: проверка «есть двоеточие» путала диск Windows
+ * с чем угодно, где двоеточие встретилось.
+ */
+export function planTextPath(base: string | undefined, file: string, path: PathApi = NATIVE_PATH): string {
+  return base !== undefined && base !== "" && !path.isAbsolute(file) ? path.join(base, file) : file;
+}
+
 async function readPlanText(base: string | undefined, inline: string | undefined, file: string | undefined): Promise<string | undefined> {
   if (inline !== undefined) return inline;
   if (file === undefined) return undefined;
-  const path = base && !file.includes(":") && !file.startsWith("/") ? join(base, file) : file;
-  return Bun.file(path).text();
+  return Bun.file(planTextPath(base, file)).text();
 }
 
 async function cmdCreateTree(rm: Resolved, args: Args): Promise<void> {
@@ -3192,7 +4340,7 @@ async function cmdCreateTree(rm: Resolved, args: Args): Promise<void> {
   if (!isRecord(plan.parent) || !Array.isArray(plan.children)) {
     throw new UserError("В плане нужны поля parent (объект) и children (массив).");
   }
-  const baseDir = str(args, "base") ?? (file ? file.replace(/[\\/][^\\/]*$/, "") : undefined);
+  const baseDir = planBaseDir(file, str(args, "base"));
 
   const project = str(args, "project") ?? plan.project ?? rm.defaultProject;
   if (!project) throw new UserError("Не задан проект: --project или поле project в плане.");
@@ -4320,8 +5468,9 @@ function cmdHelp(): void {
 Общие флаги: --instance <имя|хост>  --all-instances (для inbox/due)  --json  --no-cache
 
 ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: команды log, batch, comment, create-issue, create-tree,
-update-issue, edit, create-project, update-project, archive-project без --yes печатают
-полный предпросмотр и ничего не отправляют.
+update-issue, edit, create-project, update-project, archive-project, relate, unrelate,
+add-member, update-member, remove-member без --yes печатают полный предпросмотр
+и ничего не отправляют.
 Любой уходящий текст проверяется на компрометацию (секреты, ПДн, внутренние адреса,
 самооговор). Запрет снимается только флагом --override-guard.
   scan --text "..."|--file f [--audience client|internal]   проверить текст отдельно
@@ -4344,6 +5493,18 @@ update-issue, edit, create-project, update-project, archive-project без --yes
                  [--module <имя> ...] [--field "<имя|id>=<значение>" ...] [--yes]
   archive-project <identifier|id> --yes | unarchive-project <identifier|id> --yes
         только для администратора Redmine; обычному ключу инстанс ответит отказом
+
+Участники проекта
+  members <проект>                  участники: пользователь или группа, роли, номер членства
+  roles                             справочник ролей и что каждая даёт словами
+  add-member <проект> --user <id|"Имя Фамилия"|me> --role <имя|id> [--role …] [--yes]
+        имя ищется среди участников видимых проектов (и в /users.json, если ключ администраторский);
+        неоднозначное или ненайденное имя — остановка со списком кандидатов;
+        уже состоящего в проекте не добавляет — для него update-member
+  update-member <членство> --role <имя|id> [--role …] [--yes]
+        задаёт собственные роли целиком; унаследованные от группы или родителя остаются
+  remove-member <членство> [--yes]  убрать из проекта: отдельное подтверждение, как у delete
+        после записи участники перечитываются и сверяются с запрошенным
 
 Что нового и сроки
   inbox [--since 2026-09-20|-3|12h] [--mark] [--watched] [--authored] [--include-own]
@@ -4404,7 +5565,8 @@ update-issue, edit, create-project, update-project, archive-project без --yes
   edit <entryId> [--hours|--date|--comment|--activity|--issue] [--dry-run]
   delete <entryId> --yes
 
-Форматы: часы 2 | 2.5 | 1h30 | 1:30 | 90m; даты YYYY-MM-DD | DD.MM[.YYYY] | today | yesterday | -3.
+Форматы: часы 2 | 2.5 | 1h30 | 1:30 | 90m; даты YYYY-MM-DD | DD.MM[.YYYY] | today | yesterday | -3;
+         периоды week | last-week | month | last-month | YYYY-MM | A..B (концы — даты или месяцы: 2026-07..2026-09).
 Конфиг: ${CONFIG_PATH} (env REDMINE_URL / REDMINE_API_KEY / REDMINE_INSTANCE имеют приоритет).`);
 }
 
@@ -4455,6 +5617,11 @@ async function main(): Promise<void> {
     "update-project": cmdUpdateProject,
     "archive-project": cmdArchiveProject,
     "unarchive-project": cmdArchiveProject,
+    members: cmdMembers,
+    roles: cmdRoles,
+    "add-member": cmdAddMember,
+    "update-member": cmdUpdateMember,
+    "remove-member": cmdRemoveMember,
     issue: cmdIssue,
     issues: cmdIssues,
     search: cmdSearch,

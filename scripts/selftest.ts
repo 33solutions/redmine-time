@@ -23,6 +23,41 @@ import {
   formatXref,
   xrefLabel,
 } from "./redmine.ts";
+import {
+  parseArgs,
+  readAddMember,
+  readUpdateMember,
+  readRemoveMember,
+  describeRole,
+  resolveRoles,
+  matchPeople,
+  pickPerson,
+  accountSeen,
+  findMembership,
+  ownRoles,
+  inheritedRoles,
+  describeMemberRoles,
+  addMemberRequest,
+  updateMemberRequest,
+  removeMemberRequest,
+  explainMembershipRejection,
+  explainMemberForbidden,
+  checkMemberRoles,
+  roleCheckText,
+  projectTitle,
+  addMemberPreview,
+  updateMemberPreview,
+  removeMemberPreview,
+  CLIENT_NOTICE,
+  SEPARATE_CONFIRMATION,
+  type RoleInfo,
+  type PersonCandidate,
+  type Membership,
+  type MemberProject,
+  type Principal,
+} from "./redmine.ts";
+import { planBaseDir, planTextPath } from "./redmine.ts";
+import { posix, win32 } from "node:path";
 
 let passed = 0;
 const failures: string[] = [];
@@ -80,6 +115,12 @@ check("период: месяц по номеру", parsePeriod("2026-09"), ["20
 check("период: февраль високосного", parsePeriod("2024-02"), ["2024-02-01", "2024-02-29"]);
 check("период: диапазон", parsePeriod("2026-09-01..2026-09-15"), ["2026-09-01", "2026-09-15"]);
 check("период: один день", parsePeriod("2026-09-07"), ["2026-09-07", "2026-09-07"]);
+check("период: диапазон месяцев", parsePeriod("2026-07..2026-09"), ["2026-07-01", "2026-09-30"]);
+check("период: дата и месяц", parsePeriod("2026-07-15..2026-09"), ["2026-07-15", "2026-09-30"]);
+check("период: месяц и дата", parsePeriod("2026-07..15.09.2026"), ["2026-07-01", "2026-09-15"]);
+check("период: месяцы через год", parsePeriod("2025-12..2026-02"), ["2025-12-01", "2026-02-28"]);
+checkThrows("период: тринадцатый месяц", () => parsePeriod("2026-13"));
+checkThrows("период: нулевой месяц в диапазоне", () => parsePeriod("2026-00..2026-03"));
 
 // ── очистка разметки ──────────────────────────────────────────────────
 check("html: абзацы", plain("<p>Первый</p><p>Второй</p>"), "Первый\nВторой");
@@ -682,6 +723,463 @@ check(
   '<a href="https://tracker.example.ru/redmine/issues/25185">33 Решения #25185 — Обмен &lt;b&gt;«ЮЛ &amp; ИП»&lt;/b&gt;</a>',
 );
 check("xref: адрес в строке есть всегда", formatXref(xref).includes(xref.url), true);
+
+// ── план дерева: каталог описаний ─────────────────────────────────────
+// Регулярка «отрезать после последнего слэша» на голом plan.json ничего не отрезала,
+// и описания искались как plan.json\parent.html.
+check("план: голое имя файла — текущий каталог", planBaseDir("plan.json", undefined), ".");
+check("план: голое имя файла (posix)", planBaseDir("plan.json", undefined, posix), ".");
+check("план: голое имя файла (win32)", planBaseDir("plan.json", undefined, win32), ".");
+check("план: относительный каталог", planBaseDir("./dir/plan.json", undefined, posix), "./dir");
+check("план: относительный каталог (win32)", planBaseDir("./dir/plan.json", undefined, win32), "./dir");
+check("план: абсолютный путь Windows", planBaseDir("C:\\x\\plan.json", undefined, win32), "C:\\x");
+check("план: --base важнее каталога файла", planBaseDir("./dir/plan.json", "/tmp/texts", posix), "/tmp/texts");
+check("план: из stdin каталога нет", planBaseDir(undefined, undefined), undefined);
+check("описание: план без каталога", planTextPath(".", "parent.html", posix), "parent.html");
+check("описание: план без каталога (win32)", planTextPath(".", "parent.html", win32), "parent.html");
+check("описание: из каталога плана", planTextPath("./dir", "child-1.html", posix), "dir/child-1.html");
+check("описание: из каталога плана Windows", planTextPath("C:\\x", "parent.html", win32), "C:\\x\\parent.html");
+check("описание: абсолютный путь Windows не трогается", planTextPath("C:\\x", "D:\\texts\\p.html", win32), "D:\\texts\\p.html");
+check("описание: абсолютный путь posix не трогается", planTextPath("/plans", "/tmp/p.html", posix), "/tmp/p.html");
+check("описание: без каталога плана — как есть", planTextPath(undefined, "parent.html"), "parent.html");
+// Прежняя проверка считала абсолютным любой путь с двоеточием.
+check("описание: двоеточие не делает путь абсолютным", planTextPath("/plans", "этап:1.html", posix), "/plans/этап:1.html");
+
+// ── участники проекта ─────────────────────────────────────────────────
+function errorText(fn: () => unknown): string {
+  try {
+    fn();
+    return "";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+// Разбор аргументов.
+check(
+  "add-member: проект, пользователь и повторяемая роль",
+  readAddMember(parseArgs(["add-member", "3097", "--user", "Фёдор Иванов", "--role", "Разработчик", "--role", "Клиент"])),
+  { project: "3097", user: "Фёдор Иванов", roles: ["Разработчик", "Клиент"] },
+);
+check(
+  "add-member: роли списком через запятую",
+  readAddMember(parseArgs(["add-member", "primer", "--user", "me", "--role", "Разработчик,Клиент"])).roles,
+  ["Разработчик", "Клиент"],
+);
+check(
+  "add-member: проект флагом",
+  readAddMember(parseArgs(["add-member", "--project", "primer", "--user", "27", "--role", "4"])).project,
+  "primer",
+);
+check(
+  "add-member: общие флаги не мешают",
+  readAddMember(parseArgs(["add-member", "3097", "--user", "me", "--role", "3", "--instance", "ru", "--yes"])),
+  { project: "3097", user: "me", roles: ["3"] },
+);
+checkThrows("add-member: без проекта", () => readAddMember(parseArgs(["add-member", "--user", "me", "--role", "3"])));
+checkThrows("add-member: без пользователя", () => readAddMember(parseArgs(["add-member", "3097", "--role", "3"])));
+checkThrows("add-member: --user без значения", () =>
+  readAddMember(parseArgs(["add-member", "3097", "--user", "--role", "3"])),
+);
+checkThrows("add-member: без роли", () => readAddMember(parseArgs(["add-member", "3097", "--user", "me"])));
+check(
+  "add-member: имя без кавычек — остановка с подсказкой",
+  errorText(() =>
+    readAddMember(parseArgs(["add-member", "3097", "--user", "Фёдор", "Иванов", "--role", "Разработчик"])),
+  ).includes("в кавычки"),
+  true,
+);
+check(
+  "update-member: номер членства с решёткой",
+  readUpdateMember(parseArgs(["update-member", "#812", "--role", "Менеджер"])),
+  { membershipId: 812, roles: ["Менеджер"] },
+);
+checkThrows("update-member: без ролей", () => readUpdateMember(parseArgs(["update-member", "812"])));
+checkThrows("update-member: номер не число", () => readUpdateMember(parseArgs(["update-member", "abc", "--role", "3"])));
+checkThrows("update-member: ноль", () => readUpdateMember(parseArgs(["update-member", "0", "--role", "3"])));
+check("remove-member: номер членства", readRemoveMember(parseArgs(["remove-member", "812", "--yes"])), { membershipId: 812 });
+checkThrows("remove-member: без номера", () => readRemoveMember(parseArgs(["remove-member"])));
+checkThrows("remove-member: два номера разом", () => readRemoveMember(parseArgs(["remove-member", "812", "813"])));
+
+// Роли словами.
+const rolesFixture: RoleInfo[] = [
+  {
+    id: 3,
+    name: "Менеджер",
+    assignable: true,
+    issues_visibility: "all",
+    time_entries_visibility: "all",
+    permissions: [
+      "view_issues",
+      "add_issues",
+      "edit_issues",
+      "add_issue_notes",
+      "delete_issues",
+      "view_time_entries",
+      "log_time",
+      "edit_time_entries",
+      "manage_members",
+      "edit_project",
+    ],
+  },
+  {
+    id: 4,
+    name: "Разработчик",
+    assignable: true,
+    issues_visibility: "default",
+    time_entries_visibility: "all",
+    permissions: ["view_issues", "add_issues", "edit_issues", "add_issue_notes", "view_time_entries", "log_time", "view_wiki_pages"],
+  },
+  {
+    id: 6,
+    name: "Клиент",
+    assignable: false,
+    issues_visibility: "own",
+    time_entries_visibility: "own",
+    permissions: ["view_issues", "add_issues", "add_issue_notes", "view_time_entries"],
+  },
+  { id: 8, name: "Бот чата", assignable: true, permissions: [] },
+  { id: 9, name: "Старая роль", permissions: null },
+];
+const [manager, developer, client, bot, legacy] = rolesFixture as [RoleInfo, RoleInfo, RoleInfo, RoleInfo, RoleInfo];
+
+check("роль: менеджер видит все задачи", describeRole(manager).startsWith("задачи: видит все;"), true);
+check("роль: менеджер управляет участниками", describeRole(manager).includes("управляет участниками"), true);
+check("роль: менеджер может быть исполнителем", describeRole(manager).includes("может быть исполнителем задач"), true);
+check("роль: приватные задачи скрыты", describeRole(developer).includes("видит все, кроме приватных"), true);
+check("роль: доступ к вики назван", describeRole(developer).includes("также: вики"), true);
+check(
+  "роль: клиент видит только свои задачи",
+  describeRole(client).includes("видит только созданные им или назначенные на него"),
+  true,
+);
+check("роль: клиент видит только свои списания", describeRole(client).includes("видит только свои списания"), true);
+check("роль: клиент не исполнитель", describeRole(client).includes("исполнителем задач быть не может"), true);
+check("роль: клиент не редактирует чужое", describeRole(client).includes("редактирует"), false);
+check("роль без прав: задач не видит", describeRole(bot).includes("задач не видит"), true);
+check("роль без прав: трудозатрат не видит", describeRole(bot).includes("трудозатрат не видит"), true);
+check("роль: права не прочитаны — сказано прямо", describeRole(legacy).includes("не прочитаны"), true);
+
+check("роли: по имени без учёта регистра", resolveRoles(rolesFixture, ["менеджер"]).map((r) => r.id), [3]);
+check("роли: по номеру", resolveRoles(rolesFixture, ["4"]).map((r) => r.id), [4]);
+check("роли: по однозначному началу", resolveRoles(rolesFixture, ["Разраб"]).map((r) => r.id), [4]);
+check("роли: повтор не дублируется", resolveRoles(rolesFixture, ["Менеджер", "Клиент", "менеджер"]).map((r) => r.id), [3, 6]);
+checkThrows("роли: пустой список", () => resolveRoles(rolesFixture, []));
+checkThrows("роли: неизвестный номер", () => resolveRoles(rolesFixture, ["99"]));
+const unknownRole = errorText(() => resolveRoles(rolesFixture, ["Бухгалтер"]));
+check("роли: неизвестная названа", unknownRole.includes("Бухгалтер"), true);
+check("роли: перечислены доступные", unknownRole.includes("Менеджер, Разработчик, Клиент"), true);
+check("роли: подсказка про справочник", unknownRole.includes("redmine.ts roles"), true);
+
+// Поиск человека по имени.
+const people: PersonCandidate[] = [
+  { id: 27, name: "Фёдор Иванов", kind: "user", projects: ["Альфа", "Бета"] },
+  { id: 31, name: "Иван Петров", kind: "user", projects: ["Альфа"] },
+  { id: 32, name: "Иван Петров", kind: "user", projects: ["Гамма"] },
+  { id: 40, name: "Иван Петрович Сидоров", kind: "user", projects: ["Бета"] },
+  { id: 9, name: "Разработка 1С", kind: "group", projects: ["Альфа"] },
+];
+const oneId = (needle: string): number | null => {
+  const m = matchPeople(people, needle);
+  return m.kind === "one" ? m.person.id : null;
+};
+check("имя: полное", oneId("Фёдор Иванов"), 27);
+check("имя: порядок слов и «ё» не важны", oneId("иванов федор"), 27);
+check("имя: одна фамилия", oneId("Иванов"), 27);
+check("имя: начала слов", oneId("Фёд Иван"), 27);
+check("имя: группа находится", oneId("Разработка"), 9);
+check("имя: полное совпадение важнее частичного", oneId("Сидоров"), 40);
+const namesakes = matchPeople(people, "Иван Петров");
+check(
+  "имя: однофамильцы — неоднозначность, а не выбор",
+  namesakes.kind === "many" ? namesakes.candidates.map((c) => c.id) : [],
+  [31, 32],
+);
+const noOne = matchPeople(people, "Федр");
+check("имя: опечатка — не найден", noOne.kind, "none");
+check("имя: опечатка — похожие предложены", noOne.kind === "none" ? noOne.similar.map((c) => c.id) : [], [27]);
+
+const closedDirectory = { projects: 12, directory: "closed" as const, serverHits: [] };
+const ambiguous = errorText(() => pickPerson(people, "Иван Петров", closedDirectory));
+check("выбор: кандидаты с номерами", ambiguous.includes("id=31") && ambiguous.includes("id=32"), true);
+check("выбор: кандидаты с проектами", ambiguous.includes("проекты: Альфа") && ambiguous.includes("проекты: Гамма"), true);
+check("выбор: подсказка про номер", ambiguous.includes("--user <id>"), true);
+const missing = errorText(() => pickPerson(people, "Федр", closedDirectory));
+check("выбор: сказано, где искали", missing.includes("среди участников 12 видимых проектов"), true);
+check("выбор: похожий кандидат в списке", missing.includes("Фёдор Иванов (id=27)"), true);
+check("выбор: объяснено, почему не найти вне проектов", missing.includes("только администратору"), true);
+check(
+  "выбор: справочник администратора упомянут",
+  errorText(() => pickPerson(people, "Пётр Нетов", { projects: 12, directory: "admin", serverHits: [] })).includes(
+    "в справочнике пользователей",
+  ),
+  true,
+);
+const byLogin: PersonCandidate = { id: 77, name: "Пётр Логинов", kind: "user", projects: [] };
+check(
+  "выбор: совпадение по логину из справочника",
+  pickPerson([...people, byLogin], "plogin", { projects: 12, directory: "admin", serverHits: [byLogin] }).id,
+  77,
+);
+check("выбор: единственный кандидат выбирается", pickPerson(people, "Иванов", closedDirectory).id, 27);
+
+check(
+  "учётная запись: заведена и входили",
+  accountSeen({ created_on: "2024-01-10T08:00:00Z", last_login_on: "2026-09-01T10:00:00Z" }),
+  "заведён 2024-01-10, последний вход 2026-09-01",
+);
+check(
+  "учётная запись: не входил ни разу",
+  accountSeen({ created_on: "2024-01-10T08:00:00Z", last_login_on: null }),
+  "заведён 2024-01-10, не входил ни разу",
+);
+check("учётная запись: дату входа не показали — не выдумываем", accountSeen({ created_on: "2024-01-10T08:00:00Z" }), "заведён 2024-01-10");
+check("учётная запись: ничего не известно", accountSeen({}), undefined);
+
+// Членства.
+const membershipFixture: Membership = {
+  id: 812,
+  project: { id: 3097, name: "Пример" },
+  user: { id: 27, name: "Фёдор Иванов" },
+  roles: [
+    { id: 4, name: "Разработчик" },
+    { id: 5, name: "Наблюдатель", inherited: true },
+    { id: 5, name: "Наблюдатель", inherited: true },
+  ],
+};
+const groupMembership: Membership = {
+  id: 700,
+  project: { id: 3097, name: "Пример" },
+  group: { id: 9, name: "Разработка 1С" },
+  roles: [{ id: 5, name: "Наблюдатель" }],
+};
+check("членство: найдено по пользователю", findMembership([groupMembership, membershipFixture], 27)?.id, 812);
+check("членство: найдено по группе", findMembership([groupMembership, membershipFixture], 9)?.id, 700);
+check("членство: чужого нет", findMembership([groupMembership, membershipFixture], 999), undefined);
+check("членство: собственные роли", ownRoles(membershipFixture).map((r) => r.id), [4]);
+check("членство: унаследованные роли", inheritedRoles(membershipFixture).length, 2);
+check(
+  "членство: унаследованная роль от двух групп показана один раз",
+  describeMemberRoles(membershipFixture.roles),
+  "Разработчик + унасл.: Наблюдатель",
+);
+check("членство: только унаследованные", describeMemberRoles([{ id: 5, name: "Наблюдатель", inherited: true }]), "унасл.: Наблюдатель");
+check("членство: без ролей", describeMemberRoles([]), "—");
+
+// Тела запросов.
+check("запрос: добавление", addMemberRequest(3097, 27, [4, 6, 4]), {
+  method: "POST",
+  path: "projects/3097/memberships.json",
+  body: { membership: { user_id: 27, role_ids: [4, 6] } },
+});
+checkThrows("запрос: добавление без ролей", () => addMemberRequest(3097, 27, []));
+checkThrows("запрос: добавление без пользователя", () => addMemberRequest(3097, 0, [4]));
+checkThrows("запрос: дробный номер роли", () => addMemberRequest(3097, 27, [4.5]));
+check("запрос: смена ролей", updateMemberRequest(812, [3]), {
+  method: "PUT",
+  path: "memberships/812.json",
+  body: { membership: { role_ids: [3] } },
+});
+checkThrows("запрос: смена ролей на пустой набор", () => updateMemberRequest(812, []));
+check("запрос: удаление без тела", removeMemberRequest(812), { method: "DELETE", path: "memberships/812.json" });
+checkThrows("запрос: удаление без номера", () => removeMemberRequest(-1));
+
+// Отказы словами, без кода ответа.
+const rejectCtx = { action: "add" as const, project: "«Пример» (primer, id=3097)", who: "Фёдор Иванов (id=27)" };
+const taken = explainMembershipRejection(["User has already been taken"], rejectCtx);
+check("отказ членства: уже участник", taken.includes("уже участник") && taken.includes("update-member"), true);
+check(
+  "отказ членства: уже участник по-русски",
+  explainMembershipRejection(["Пользователь уже существует"], rejectCtx).includes("уже участник"),
+  true,
+);
+check(
+  "отказ членства: роли отброшены",
+  explainMembershipRejection(["Роль не может быть пустым"], rejectCtx).includes("только эти роли"),
+  true,
+);
+check(
+  "отказ членства: роли отброшены (англ.)",
+  explainMembershipRejection(["Role cannot be blank"], rejectCtx).includes("только эти роли"),
+  true,
+);
+check(
+  "отказ членства: нет такого пользователя",
+  explainMembershipRejection(["User cannot be blank"], rejectCtx).includes("нет или он заблокирован"),
+  true,
+);
+check(
+  "отказ членства: удаление унаследованного",
+  explainMembershipRejection([], { ...rejectCtx, action: "remove" }).includes("унаследованные"),
+  true,
+);
+check(
+  "отказ членства: незнакомая причина не теряется",
+  explainMembershipRejection(["Something odd"], rejectCtx).includes("Something odd"),
+  true,
+);
+check(
+  "отказ членства: кода ответа в тексте нет",
+  [
+    explainMembershipRejection(["User has already been taken"], rejectCtx),
+    explainMembershipRejection([], { ...rejectCtx, action: "remove" }),
+    explainMemberForbidden("add", rejectCtx.project),
+    explainMemberForbidden("list", rejectCtx.project),
+  ].some((text) => /\b(403|404|422)\b/.test(text)),
+  false,
+);
+const forbidden = explainMemberForbidden("add", rejectCtx.project);
+check("403: названо право", forbidden.includes("«Управление участниками»"), true);
+check("403: сказано, кто выдаёт", forbidden.includes("администратор Redmine или менеджер"), true);
+check("403 на чтение: право просмотра", explainMemberForbidden("list", rejectCtx.project).includes("«Просмотр участников»"), true);
+
+// Сверка после записи.
+check("сверка ролей: совпало, унаследованные не мешают", checkMemberRoles(membershipFixture, [developer]).ok, true);
+const dropped = checkMemberRoles(membershipFixture, [developer, manager]);
+check("сверка ролей: молча отброшенная роль видна", dropped.ok, false);
+check("сверка ролей: названо, какая не легла", dropped.missing.map((r) => r.name), ["Менеджер"]);
+const leftover = checkMemberRoles(membershipFixture, [manager]);
+check("сверка ролей: неснятая роль видна", leftover.extra.map((r) => r.name), ["Разработчик"]);
+check("сверка ролей: участника нет", checkMemberRoles(undefined, [developer]).absent, true);
+check("сверка ролей: текст при совпадении", roleCheckText(checkMemberRoles(membershipFixture, [developer]), "А").includes("совпадают"), true);
+const droppedText = roleCheckText(dropped, "Фёдор Иванов (id=27)");
+check("сверка ролей: расхождение названо", droppedText.includes("РАСХОЖДЕНИЕ") && droppedText.includes("не легли роли Менеджер"), true);
+check("сверка ролей: причина объяснена", droppedText.includes("только эти роли"), true);
+check("сверка ролей: отсутствие названо", roleCheckText(checkMemberRoles(undefined, [developer]), "А").includes("нет"), true);
+
+// Предпросмотры.
+const memberProject: MemberProject = {
+  id: 3097,
+  name: "Пример",
+  identifier: "primer",
+  url: "https://redmine.example.com/projects/primer",
+  isPublic: false,
+};
+const ivanov: Principal = { id: 27, name: "Фёдор Иванов", kind: "user", projects: ["Альфа"], self: false };
+check("проект: название, идентификатор и номер", projectTitle(memberProject), "«Пример» (primer, id=3097)");
+
+const addText = addMemberPreview({ instance: "company", project: memberProject, principal: ivanov, roles: [developer], memberCount: 7 });
+check("предпросмотр добавления: проект", addText.includes("«Пример» (primer, id=3097)"), true);
+check("предпросмотр добавления: закрытость проекта", addText.includes("закрытый"), true);
+check("предпросмотр добавления: пользователь с номером", addText.includes("Фёдор Иванов (id=27)"), true);
+check("предпросмотр добавления: где уже состоит", addText.includes("уже состоит в: Альфа"), true);
+check("предпросмотр добавления: роль словами", addText.includes(`Разработчик (id=4): ${describeRole(developer)}`), true);
+check("предпросмотр добавления: видимость и уведомления", addText.includes(CLIENT_NOTICE), true);
+check(
+  "предпросмотр добавления: формулировка про клиентский проект",
+  addText.includes("видит задачи проекта в объёме своей роли и получает уведомления"),
+  true,
+);
+check("предпросмотр добавления: число участников", addText.includes("сейчас 7, станет 8"), true);
+check("предпросмотр добавления: нужное право", addText.includes("«Управление участниками»"), true);
+check(
+  "предпросмотр добавления: группа",
+  addMemberPreview({
+    instance: "company",
+    project: memberProject,
+    principal: { id: 9, name: "Разработка 1С", kind: "group", projects: [], self: false },
+    roles: [developer],
+    memberCount: 7,
+  }).includes("роли получат все её участники"),
+  true,
+);
+const unknownName = addMemberPreview({
+  instance: "company",
+  project: memberProject,
+  principal: { id: 27, name: null, kind: "unknown", projects: [], self: false, note: "имя узнать не удалось" },
+  roles: [developer],
+  memberCount: 7,
+});
+check("предпросмотр добавления: номер без имени", unknownName.includes("пользователь id=27") && unknownName.includes("имя узнать не удалось"), true);
+check(
+  "предпросмотр добавления: публичный проект",
+  addMemberPreview({ instance: "company", project: { ...memberProject, isPublic: true }, principal: ivanov, roles: [developer], memberCount: 7 }).includes(
+    "Проект публичный",
+  ),
+  true,
+);
+check(
+  "предпросмотр добавления: себя",
+  addMemberPreview({ instance: "company", project: memberProject, principal: { ...ivanov, self: true }, roles: [developer], memberCount: 7 }).includes(
+    "это вы",
+  ),
+  true,
+);
+
+const lineOf = (text: string, head: string): string => text.split("\n").find((l) => l.startsWith(head)) ?? "";
+const updateText = updateMemberPreview({
+  instance: "company",
+  project: memberProject,
+  principal: ivanov,
+  membership: membershipFixture,
+  roles: [manager],
+  selfLosesManage: false,
+});
+check("предпросмотр ролей: номер членства", updateText.includes("членство 812"), true);
+check("предпросмотр ролей: что добавляется", lineOf(updateText, "Добавляются").includes("Менеджер"), true);
+check("предпросмотр ролей: что снимается", lineOf(updateText, "Снимаются").includes("Разработчик"), true);
+check("предпросмотр ролей: унаследованные остаются", lineOf(updateText, "Станут").includes("унаследованные: Наблюдатель"), true);
+check("предпросмотр ролей: почему не снимаются", updateText.includes("этой командой они не снимаются"), true);
+check("предпросмотр ролей: новая роль словами", updateText.includes(describeRole(manager)), true);
+check("предпросмотр ролей: новые права — предупреждение о видимости", updateText.includes(CLIENT_NOTICE), true);
+check("предпросмотр ролей: снятие действует сразу", updateText.includes("перестаёт действовать сразу"), true);
+const narrowing = updateMemberPreview({
+  instance: "company",
+  project: memberProject,
+  principal: ivanov,
+  membership: { ...membershipFixture, roles: [{ id: 4, name: "Разработчик" }, { id: 3, name: "Менеджер" }] },
+  roles: [developer],
+  selfLosesManage: true,
+});
+check("предпросмотр ролей: только сужение — без предупреждения о видимости", narrowing.includes(CLIENT_NOTICE), false);
+check("предпросмотр ролей: потеря управления собой", narrowing.includes("вернуть её себе сами не сможете"), true);
+
+const removeText = removeMemberPreview({
+  instance: "company",
+  project: memberProject,
+  principal: ivanov,
+  membership: { ...membershipFixture, roles: [{ id: 4, name: "Разработчик" }] },
+  openIssues: 3,
+});
+check("предпросмотр удаления: отдельное подтверждение", removeText.includes(SEPARATE_CONFIRMATION), true);
+check("предпросмотр удаления: слово «отдельное подтверждение»", removeText.includes("отдельное подтверждение"), true);
+check("предпросмотр удаления: проект и участник", removeText.includes("«Пример» (primer, id=3097)") && removeText.includes("Фёдор Иванов (id=27)"), true);
+check("предпросмотр удаления: роли", lineOf(removeText, "Роли").includes("Разработчик"), true);
+check("предпросмотр удаления: открытые задачи", removeText.includes("3 — останутся назначенными"), true);
+check("предпросмотр удаления: что остаётся", removeText.includes("Списанные часы"), true);
+check(
+  "предпросмотр удаления: себя",
+  removeMemberPreview({
+    instance: "company",
+    project: memberProject,
+    principal: { ...ivanov, self: true },
+    membership: membershipFixture,
+    openIssues: 0,
+  }).includes("это ваше собственное членство"),
+  true,
+);
+check(
+  "предпросмотр удаления: группа",
+  removeMemberPreview({
+    instance: "company",
+    project: memberProject,
+    principal: { id: 9, name: "Разработка 1С", kind: "group", projects: [], self: false },
+    membership: groupMembership,
+    openIssues: null,
+  }).includes("потеряют доступ вместе с ней"),
+  true,
+);
+check(
+  "предпросмотр удаления: у группы задач не считаем",
+  removeMemberPreview({
+    instance: "company",
+    project: memberProject,
+    principal: { id: 9, name: "Разработка 1С", kind: "group", projects: [], self: false },
+    membership: groupMembership,
+    openIssues: null,
+  }).includes("Открытые задачи"),
+  false,
+);
 
 // ── итог ──────────────────────────────────────────────────────────────
 console.log(`Проверок пройдено: ${passed}`);
