@@ -9,7 +9,7 @@
 
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { guard, scanText, formatFindings, type Audience, type Finding } from "./guard.ts";
-import { harvestRepo, isGitRepo, repoName, draftDescription, type RepoBinding } from "./harvest.ts";
+import { harvestRepo, isGitRepo, repoName, draftDescription, plural, type RepoBinding } from "./harvest.ts";
 
 // ─────────────────────────────── конфиг ───────────────────────────────
 
@@ -532,12 +532,25 @@ async function roles(rm: Resolved): Promise<RoleInfo[]> {
 
 const userMemo = new Map<string, CurrentUser>();
 
+/**
+ * Redmine кладёт в `users/current.json` ключ API владельца (`api_key`). Объект пользователя уходит
+ * в вывод целиком — `whoami --json`, `--json` других команд, — поэтому из ответа берутся только
+ * известные поля: ключ не должен попасть ни в один вывод, ни в лог, ни в отчёт агента.
+ */
+export function safeCurrentUser(raw: CurrentUser): CurrentUser {
+  const user: CurrentUser = { id: raw.id, login: raw.login, firstname: raw.firstname, lastname: raw.lastname };
+  if (raw.mail !== undefined) user.mail = raw.mail;
+  if (raw.admin !== undefined) user.admin = raw.admin;
+  return user;
+}
+
 async function currentUser(rm: Resolved): Promise<CurrentUser> {
   const hit = userMemo.get(rm.name);
   if (hit) return hit;
   const r = await request<{ user: CurrentUser }>(rm, "GET", "users/current.json");
-  userMemo.set(rm.name, r.user);
-  return r.user;
+  const user = safeCurrentUser(r.user);
+  userMemo.set(rm.name, user);
+  return user;
 }
 
 function matchByName<T extends IdName>(items: T[], needle: string, kind: string): T {
@@ -634,10 +647,12 @@ async function resolveProjectKey(rm: Resolved, value: string): Promise<string | 
 
 // ───────────────────────────── проекты ────────────────────────────────
 
-/** Карточка проекта целиком — для предпросмотра и разбора иерархии. */
-async function findProject(rm: Resolved, value: string): Promise<ProjectRef> {
-  const key = (rm.projectAliases?.[value] ?? value).trim().replace(/^#/, "");
-  const list = await projects(rm);
+function projectKey(rm: Resolved, value: string): string {
+  return (rm.projectAliases?.[value] ?? value).trim().replace(/^#/, "");
+}
+
+/** Проект из списка по номеру, идентификатору или части названия. null — не найден; неоднозначность — ошибка. */
+function matchProject(list: ProjectRef[], key: string, value: string): ProjectRef | null {
   if (/^\d+$/.test(key)) {
     const byId = list.find((p) => p.id === Number(key));
     if (byId) return byId;
@@ -652,7 +667,57 @@ async function findProject(rm: Resolved, value: string): Promise<ProjectRef> {
       `Проект "${value}" неоднозначен: ${byName.map((p) => `${p.name} (${p.identifier})`).join(", ")}.`,
     );
   }
+  return null;
+}
+
+/** Карточка проекта целиком — для предпросмотра и разбора иерархии. */
+async function findProject(rm: Resolved, value: string): Promise<ProjectRef> {
+  const found = matchProject(await projects(rm), projectKey(rm, value), value);
+  if (found) return found;
   throw new UserError(`Проект "${value}" не найден. Список: redmine.ts projects`);
+}
+
+/**
+ * Закрытые проекты. В projects.json по умолчанию их нет (фильтр «действующие»), а открыть проект
+ * обратно или прочитать wiki закрытого проекта надо уметь. Redmine без фильтра по статусу отдаёт
+ * всё видимое, поэтому статус сверяется здесь же. Без кэша: список меняется этими же командами.
+ */
+async function closedProjects(rm: Resolved): Promise<ProjectRef[]> {
+  const list = await fetchAll<ProjectRef>(
+    rm,
+    "projects.json",
+    "projects",
+    { status: PROJECT_STATUS.closed, include: "trackers,enabled_modules" },
+    1000,
+  );
+  return list.filter((p) => p.status === PROJECT_STATUS.closed);
+}
+
+/** Проект в любом видимом статусе: сначала среди действующих, затем среди закрытых, затем карточкой. */
+async function findProjectAnyStatus(rm: Resolved, value: string): Promise<ProjectRef> {
+  const key = projectKey(rm, value);
+  const active = matchProject(await projects(rm), key, value);
+  if (active) return active;
+  const closed = matchProject(await closedProjects(rm), key, value);
+  if (closed) return closed;
+  // Проект может быть виден по идентификатору, но не попасть в списки (например, статус сменили только что).
+  if (/^[a-z0-9_-]+$/i.test(key)) {
+    try {
+      return await freshProject(rm, key);
+    } catch (error) {
+      if (!(error instanceof ApiError) || (error.status !== 403 && error.status !== 404)) throw error;
+    }
+  }
+  throw new UserError(`Проект "${value}" не найден ни среди действующих, ни среди закрытых. Список: redmine.ts projects`);
+}
+
+/**
+ * Свежая карточка проекта в обход суточного кэша: статус и публичность в предпросмотре изменяющей
+ * команды должны быть сегодняшними — проект могли закрыть или открыть в интерфейсе час назад.
+ */
+async function freshProject(rm: Resolved, key: string | number): Promise<ProjectRef> {
+  return (await request<{ project: ProjectRef }>(rm, "GET", `projects/${key}.json`, { include: "trackers,enabled_modules" }))
+    .project;
 }
 
 function projectUrl(rm: Resolved, identifier: string): string {
@@ -1097,6 +1162,15 @@ function fmtDate(d: Date): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+/** Отметка времени Redmine (ISO, UTC) → местные дата и время: «2026-09-23 14:05». */
+function stamp(iso: string | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${fmtDate(d)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function shiftDays(d: Date, days: number): Date {
   const c = new Date(d);
   c.setDate(c.getDate() + days);
@@ -1313,8 +1387,12 @@ function issueUrl(rm: Resolved, id: number): string {
  * Любой текст, уходящий в Redmine, проходит проверку на компрометацию.
  * Запрет снимается только явным --override-guard, предупреждения печатаются всегда.
  */
-function checkOutgoing(fields: Record<string, string | undefined>, args: Args): Finding[] {
-  const audience: Audience = str(args, "audience") === "internal" ? "internal" : "client";
+function checkOutgoing(
+  fields: Record<string, string | undefined>,
+  args: Args,
+  // Аудиторию может задать сама команда: страницу wiki публичного проекта читают все, и --audience internal там не действует.
+  audience: Audience = str(args, "audience") === "internal" ? "internal" : "client",
+): Finding[] {
   const result = guard(fields, { audience });
   if (result.findings.length === 0) return [];
 
@@ -1811,6 +1889,1245 @@ async function cmdArchiveProject(rm: Resolved, args: Args): Promise<void> {
   emit({ project: key, archived: !unarchive }, () =>
     `Проект ${title} ${unarchive ? "разархивирован" : "архивирован"} на инстансе ${rm.name}.`,
   );
+}
+
+// ─────────────────────── права владельца ключа в проекте ───────────────────────
+
+/**
+ * Есть ли у владельца ключа право в проекте — чтобы предпросмотр сказал об отказе заранее,
+ * а не после «да». `unknown` — проверить нельзя, решит Redmine; это не запрет.
+ */
+export type RightsCheck = { state: "admin" | "yes" | "no" | "unknown"; roles: string[]; note?: string };
+
+export function rightsFromRoles(input: {
+  admin: boolean;
+  /** Роли владельца ключа в проекте; null — он не участник проекта. */
+  roles: RoleInfo[] | null;
+  permission: string;
+  isPublic: boolean | null;
+  /** Право выдаётся только участникам: ролям «Не участник» и «Аноним» Redmine его не даёт. */
+  requiresMember: boolean;
+}): RightsCheck {
+  if (input.admin) return { state: "admin", roles: [] };
+  if (input.roles === null) {
+    if (input.requiresMember) return { state: "no", roles: [], note: "владелец ключа не участник проекта" };
+    return input.isPublic === true
+      ? {
+          state: "unknown",
+          roles: [],
+          note: "владелец ключа не участник: в публичном проекте его права задаёт роль «Не участник», а её через API не прочитать",
+        }
+      : { state: "no", roles: [], note: "владелец ключа не участник закрытого проекта" };
+  }
+  const granting = input.roles.filter((r) => r.permissions?.includes(input.permission) === true);
+  if (granting.length > 0) return { state: "yes", roles: granting.map((r) => r.name) };
+  const names = input.roles.map((r) => r.name);
+  if (input.roles.some((r) => r.permissions === null)) {
+    return { state: "unknown", roles: names, note: "права ролей этому ключу не видны" };
+  }
+  return { state: "no", roles: names };
+}
+
+export function rightsText(check: RightsCheck, permission: string): string {
+  switch (check.state) {
+    case "admin":
+      return "владелец ключа — администратор Redmine: право есть";
+    case "yes":
+      return `есть: ${check.roles.map((r) => `«${r}»`).join(", ")} ${check.roles.length > 1 ? "дают" : "даёт"} право ${permission}`;
+    case "no":
+      return (
+        `НЕТ права ${permission}` +
+        (check.note
+          ? ` (${check.note})`
+          : check.roles.length > 0
+            ? ` у ролей ${check.roles.map((r) => `«${r}»`).join(", ")}`
+            : "") +
+        " — Redmine откажет (403); это не поломка скилла"
+      );
+    case "unknown":
+      return `проверить заранее не удалось${check.note ? ` (${check.note})` : ""}; если права нет, Redmine откажет (403)`;
+  }
+}
+
+/** Роли владельца ключа в проекте по `users/current.json?include=memberships` и права ролей из справочника. */
+async function keyRights(
+  rm: Resolved,
+  project: { id: number; is_public?: boolean },
+  permission: string,
+  requiresMember: boolean,
+): Promise<RightsCheck> {
+  type Own = { admin?: boolean; memberships?: { project: IdName; roles: MemberRole[] }[] };
+  let own: Own;
+  try {
+    // В этом ответе Redmine отдаёт и ключ API владельца: берём только признак администратора и членства.
+    own = (await request<{ user: Own }>(rm, "GET", "users/current.json", { include: "memberships" })).user;
+  } catch (error) {
+    if (error instanceof ApiError) return { state: "unknown", roles: [], note: "роли владельца ключа не прочитались" };
+    throw error;
+  }
+  const membership = (own.memberships ?? []).find((m) => m.project.id === project.id);
+  let held: RoleInfo[] | null = null;
+  if (membership) {
+    const catalogue = await roles(rm);
+    const ids = [...new Set(membership.roles.map((r) => r.id))];
+    held = ids.map((id) => {
+      const known = catalogue.find((r) => r.id === id);
+      const name = membership.roles.find((r) => r.id === id)?.name ?? `#${id}`;
+      return known ?? { id, name, permissions: null };
+    });
+  }
+  return rightsFromRoles({
+    admin: own.admin === true,
+    roles: held,
+    permission,
+    isPublic: project.is_public ?? null,
+    requiresMember,
+  });
+}
+
+// ─────────────────────── закрытие и открытие проекта ───────────────────────
+
+/** Статусы проекта в Redmine: закрытый доступен только для чтения, архивный скрыт целиком. */
+export const PROJECT_STATUS = { active: 1, closed: 5, archived: 9, deleting: 10 } as const;
+
+export function describeProjectStatus(status: number | undefined): string {
+  switch (status) {
+    case PROJECT_STATUS.active:
+      return "открыт (действующий)";
+    case PROJECT_STATUS.closed:
+      return "закрыт — только чтение";
+    case PROJECT_STATUS.archived:
+      return "в архиве";
+    case PROJECT_STATUS.deleting:
+      return "запланирован к удалению";
+    default:
+      return status === undefined ? "неизвестен" : `неизвестный статус ${status}`;
+  }
+}
+
+export type ProjectStatusAction = "close" | "reopen";
+
+/** Название права так, как его показывает русский интерфейс Redmine («Роли и права»). */
+export const CLOSE_PERMISSION = "«Закрывать / открывать проекты»";
+
+/** Где это делается руками: кнопка на странице проекта, а не в его настройках. */
+export function projectStatusUiPath(action: ProjectStatusAction): string {
+  return `страница проекта «Обзор» → «${action === "close" ? "Сделать закрытым" : "Сделать открытым"}» (справа вверху)`;
+}
+
+/**
+ * Все потомки проекта по цепочке родителей. Закрытие и открытие в Redmine касаются всего дерева
+ * (`self_and_descendants`), поэтому предпросмотр обязан назвать каждый подпроект, а не только детей.
+ */
+export function projectDescendants<T extends { id: number; parent?: { id: number } }>(all: T[], rootId: number): T[] {
+  const children = new Map<number, T[]>();
+  for (const p of all) {
+    if (!p.parent) continue;
+    children.set(p.parent.id, [...(children.get(p.parent.id) ?? []), p]);
+  }
+  const out: T[] = [];
+  const seen = new Set<number>([rootId]);
+  const queue = [rootId];
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    for (const child of children.get(id) ?? []) {
+      if (seen.has(child.id)) continue;
+      seen.add(child.id);
+      out.push(child);
+      queue.push(child.id);
+    }
+  }
+  return out;
+}
+
+export function readProjectStatusArgs(args: Args): { project: string } {
+  const fromPositional = args.positional[0];
+  const project = (fromPositional ?? str(args, "project"))?.trim();
+  if (!project) throw new UserError(`Укажите проект: redmine.ts ${args.cmd} <identifier|id|название>.`);
+  noExtraWords(args, fromPositional === undefined ? 0 : 1, `${args.cmd} "Название проекта"`);
+  return { project };
+}
+
+/** PUT /projects/:id/close.json и /reopen.json — есть в REST API с Redmine 5.0; отвечают 200 без тела. */
+export function projectStatusRequest(projectId: number, action: ProjectStatusAction): { method: "PUT"; path: string } {
+  return { method: "PUT", path: `projects/${positiveId(projectId, "Номер проекта")}/${action}.json` };
+}
+
+type ProjectBrief = { name: string; identifier: string };
+
+export type ProjectStatusContext = {
+  instance: string;
+  action: ProjectStatusAction;
+  project: { id: number; name: string; identifier: string; url: string; status: number };
+  /** Подпроекты, чей статус сменится вместе с проектом. */
+  affected: ProjectBrief[];
+  /** Подпроекты, которые не изменятся: уже закрыты (при закрытии) или уже действуют (при открытии). */
+  unchanged: ProjectBrief[];
+  /** Закрытый родитель — при открытии подпроекта он так и останется закрытым. */
+  closedParent: ProjectBrief | null;
+  rights: RightsCheck;
+};
+
+function briefList(list: ProjectBrief[]): string {
+  return list.map((p) => `«${p.name}» (${p.identifier})`).join(", ");
+}
+
+export function projectStatusPreview(ctx: ProjectStatusContext): string {
+  const closing = ctx.action === "close";
+  const rows: string[][] = [
+    ["Проект", projectTitle(ctx.project)],
+    ["Адрес", ctx.project.url],
+    ["Сейчас", describeProjectStatus(ctx.project.status)],
+    ["Станет", describeProjectStatus(closing ? PROJECT_STATUS.closed : PROJECT_STATUS.active)],
+    [
+      "Подпроекты",
+      ctx.affected.length > 0
+        ? `${closing ? "закроются" : "откроются"} вместе с ним (${ctx.affected.length}): ${briefList(ctx.affected)}`
+        : ctx.unchanged.length > 0
+          ? `${closing ? "действующих" : "закрытых"} нет`
+          : "нет (среди видимых владельцу ключа)",
+    ],
+  ];
+  if (ctx.unchanged.length > 0) {
+    rows.push([
+      closing ? "Уже закрыты" : "Уже открыты",
+      `${briefList(ctx.unchanged)} — ${closing ? "останутся закрытыми" : "не изменятся"}`,
+    ]);
+  }
+  if (!closing && ctx.closedParent) {
+    rows.push(["Родитель", `«${ctx.closedParent.name}» (${ctx.closedParent.identifier}) закрыт и останется закрытым`]);
+  }
+  rows.push(["Права", rightsText(ctx.rights, CLOSE_PERMISSION)]);
+
+  const meaning = closing
+    ? [
+        "Что меняет закрытие:",
+        "  • проект становится доступен только для чтения: задачи, wiki, документы и файлы видны, но ничего не создаётся и не меняется;",
+        "  • задачи нельзя создавать, менять и комментировать;",
+        "  • списывать время нельзя — ни на задачи проекта, ни на сам проект;",
+        "  • закрывается всё дерево: Redmine закрывает и действующие подпроекты — в том числе невидимые владельцу ключа и те,",
+        "    где у него нет роли: право проверяется только на этом проекте;",
+        "  • участники, задачи и списанное время сохраняются; писем при закрытии Redmine не рассылает;",
+        "  • это не архив: проект остаётся виден участникам. В выдаче скилла он пропадает из projects,",
+        "    а его задачи — из issues (покажет --include-closed-projects).",
+        `Открыть обратно — reopen-project ${ctx.project.identifier} --instance ${ctx.instance}: Redmine откроет его вместе с закрытыми подпроектами.`,
+      ]
+    : [
+        "Что меняет открытие:",
+        "  • проект снова рабочий: задачи создаются и меняются, время списывается, wiki правится;",
+        "  • Redmine открывает всё закрытое дерево под проектом — и подпроекты, закрытые вместе с ним, и закрытые",
+        "    отдельно раньше (в том числе невидимые владельцу ключа). Если какой-то подпроект должен остаться закрытым,",
+        "    закройте его снова: close-project <подпроект>;",
+        "  • писем при открытии Redmine не рассылает.",
+        `Закрыть обратно — close-project ${ctx.project.identifier} --instance ${ctx.instance}.`,
+      ];
+
+  return (
+    `${closing ? "ЗАКРЫТИЕ" : "ОТКРЫТИЕ"} ПРОЕКТА · инстанс ${ctx.instance}\n${table(rows)}\n${RULE}\n${meaning.join("\n")}\n${RULE}\n` +
+    `Нужно право ${CLOSE_PERMISSION} в этом проекте (обычно у роли «Менеджер») или администратор Redmine.\n` +
+    `${closing ? "Закрытие" : "Открытие"} через API есть в Redmine 5.0 и новее. На более старом инстансе команда ничего не изменит ` +
+    `и скажет сделать это в интерфейсе: ${projectStatusUiPath(ctx.action)}.`
+  );
+}
+
+/** Отказ Redmine при закрытии или открытии — словами: чего не хватает и где сделать руками. null — объяснить нечем. */
+export function explainProjectStatusRejection(
+  action: ProjectStatusAction,
+  status: number,
+  project: string,
+): string | null {
+  const head = action === "close" ? `Проект ${project} не закрыт.` : `Проект ${project} не открыт.`;
+  if (status === 403) {
+    return (
+      `${head}\n  У владельца ключа нет права ${CLOSE_PERMISSION} в этом проекте. Право входит в роль проекта —\n` +
+      "  обычно «Менеджер»; выдаёт его администратор Redmine или менеджер проекта. Что делать: попросить выдать роль\n" +
+      `  либо поручить операцию тому, у кого право есть (в интерфейсе: ${projectStatusUiPath(action)}). Обходного пути нет.`
+    );
+  }
+  if (status === 404) {
+    // Проект перед отправкой прочитан заново, значит «не найдено» — это отсутствующий эндпоинт (Redmine до 5.0).
+    return (
+      `${head}\n  Инстанс не поддерживает ${action === "close" ? "закрытие" : "открытие"} через API: эндпоинт появился в Redmine 5.0. ` +
+      "Ничего не изменено.\n" +
+      `  ${action === "close" ? "Закрыть" : "Открыть"} проект можно только через интерфейс: ${projectStatusUiPath(action)}.`
+    );
+  }
+  return null;
+}
+
+export type StatusCheck = { ok: boolean; text: string };
+
+/** Сверка после записи: Redmine отвечает 200 без тела, верить можно только перечитанным статусам. */
+export function checkProjectStatus(
+  action: ProjectStatusAction,
+  projectStatus: number,
+  subprojects: { name: string; status: number | null }[],
+): StatusCheck {
+  const want = action === "close" ? PROJECT_STATUS.closed : PROJECT_STATUS.active;
+  const problems: string[] = [];
+  if (projectStatus !== want) problems.push(`статус проекта — ${describeProjectStatus(projectStatus)}`);
+  const wrong = subprojects.filter((p) => p.status !== null && p.status !== want);
+  const unknown = subprojects.filter((p) => p.status === null);
+  if (wrong.length > 0) {
+    problems.push(`подпроекты ${wrong.map((p) => `«${p.name}» (${describeProjectStatus(p.status ?? undefined)})`).join(", ")}`);
+  }
+  const done = subprojects.length - wrong.length - unknown.length;
+  const tail =
+    (subprojects.length > 0 ? `; подпроекты ${action === "close" ? "закрыты" : "открыты"}: ${done} из ${subprojects.length}` : "") +
+    (unknown.length > 0 ? ` (не удалось перечитать: ${unknown.map((p) => `«${p.name}»`).join(", ")})` : "");
+  if (problems.length > 0) {
+    return { ok: false, text: `РАСХОЖДЕНИЕ: Redmine ответил успехом, но ${problems.join("; ")}${tail}.` };
+  }
+  return { ok: true, text: `Сверка: статус проекта — ${describeProjectStatus(projectStatus)}${tail}.` };
+}
+
+/** Действующие и закрытые проекты свежим списком: дерево строится по нему, кэш тут врёт. */
+async function visibleProjects(rm: Resolved): Promise<ProjectRef[]> {
+  const list = await fetchAll<ProjectRef>(rm, "projects.json", "projects", { status: "1|5" }, 2000);
+  const byId = new Map<number, ProjectRef>();
+  for (const p of list) byId.set(p.id, p);
+  return [...byId.values()];
+}
+
+async function cmdProjectStatus(rm: Resolved, args: Args): Promise<void> {
+  const action: ProjectStatusAction = args.cmd === "reopen-project" ? "reopen" : "close";
+  const input = readProjectStatusArgs(args);
+  const found = await findProjectAnyStatus(rm, input.project);
+  const project = await freshProject(rm, found.id);
+  const title = projectTitle(project);
+  const from = action === "close" ? PROJECT_STATUS.active : PROJECT_STATUS.closed;
+  if (project.status !== from) {
+    throw new UserError(
+      action === "close"
+        ? project.status === PROJECT_STATUS.closed
+          ? `Проект ${title} уже закрыт. Открыть обратно: redmine.ts reopen-project ${project.identifier} --instance ${rm.name}`
+          : `Проект ${title}: статус «${describeProjectStatus(project.status)}» — закрыть можно только действующий проект.`
+        : project.status === PROJECT_STATUS.active
+          ? `Проект ${title} и так открыт. Закрыть: redmine.ts close-project ${project.identifier} --instance ${rm.name}`
+          : `Проект ${title}: статус «${describeProjectStatus(project.status)}» — открыть можно только закрытый проект.`,
+    );
+  }
+
+  const tree = await visibleProjects(rm);
+  const descendants = projectDescendants(tree, project.id);
+  const target = action === "close" ? PROJECT_STATUS.active : PROJECT_STATUS.closed;
+  const affected = descendants.filter((p) => p.status === target);
+  const unchanged = descendants.filter((p) => p.status !== target);
+  const parent = project.parent ? tree.find((p) => p.id === project.parent?.id) : undefined;
+  const closedParent = parent && parent.status === PROJECT_STATUS.closed ? parent : null;
+  const rights = await keyRights(rm, project, "close_project", true);
+  const url = projectUrl(rm, project.identifier);
+
+  const preview = projectStatusPreview({
+    instance: rm.name,
+    action,
+    project: { id: project.id, name: project.name, identifier: project.identifier, url, status: project.status },
+    affected,
+    unchanged,
+    closedParent,
+    rights,
+  });
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  const req = projectStatusRequest(project.id, action);
+  try {
+    await request(rm, req.method, req.path);
+  } catch (error) {
+    if (error instanceof ApiError) {
+      const explained = explainProjectStatusRejection(action, error.status, title);
+      if (explained) throw new UserError(explained);
+    }
+    throw error;
+  }
+  await cacheDrop(rm, "projects");
+
+  const after = await freshProject(rm, project.id);
+  const rechecked = await mapLimit(affected, 4, async (p) => {
+    try {
+      return { name: p.name, identifier: p.identifier, status: (await freshProject(rm, p.id)).status as number | null };
+    } catch (error) {
+      if (error instanceof ApiError) return { name: p.name, identifier: p.identifier, status: null };
+      throw error;
+    }
+  });
+  const check = checkProjectStatus(action, after.status, rechecked);
+  emit({ project: { id: after.id, identifier: after.identifier, status: after.status }, subprojects: rechecked, check }, () =>
+    `Проект ${title} ${action === "close" ? "закрыт" : "открыт"} на инстансе ${rm.name}.\n${url}\n${check.text}` +
+    (action === "close" ? `\nОткрыть обратно: redmine.ts reopen-project ${after.identifier} --instance ${rm.name}` : ""),
+  );
+  if (!check.ok) process.exitCode = 1;
+}
+
+// ───────────────────────────── wiki проекта ─────────────────────────────
+
+/** Страница в списке wiki: текст в список не входит. */
+export type WikiPageRef = {
+  title: string;
+  parent?: { title: string };
+  version: number;
+  created_on?: string;
+  updated_on?: string;
+};
+
+/** Страница или её версия: автор и комментарий — той версии, которую запросили. */
+export type WikiPage = WikiPageRef & { text: string; author?: IdName; comments?: string | null };
+
+/**
+ * Название страницы так, как его сохранит Redmine (`Wiki.titleize`): пробелы → «_», без , . / ? ; | :
+ * и с заглавной первой буквой. Принимается и адрес страницы из браузера.
+ */
+export function wikiTitle(raw: string): string {
+  let value = raw.trim();
+  const fromUrl = /^https?:\/\//i.test(value) ? value.match(/\/wiki\/([^/?#]+)/) : null;
+  if (fromUrl) {
+    try {
+      value = decodeURIComponent(fromUrl[1]!);
+    } catch {
+      value = fromUrl[1]!;
+    }
+  }
+  const cleaned = value.replace(/\s+/g, "_").replace(/[,./?;|:]/g, "");
+  if (!cleaned) throw new UserError(`Название страницы wiki "${raw}" пусто после приведения к виду Redmine.`);
+  const title = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+  if (title.length > 255) throw new UserError(`Название страницы wiki длиннее 255 знаков (${title.length}).`);
+  return title;
+}
+
+/** Путь запроса к странице или её версии. */
+export function wikiPath(project: string, title: string, version?: number): string {
+  const base = `projects/${encodeURIComponent(project)}/wiki/${encodeURIComponent(title)}`;
+  return version === undefined ? `${base}.json` : `${base}/${version}.json`;
+}
+
+/** Адрес для человека: кириллица остаётся читаемой, кодируется только то, что ломает ссылку. */
+export function wikiPageUrl(base: string, project: string, title?: string): string {
+  const tail = title === undefined ? "" : `/${title.replace(/[^\p{L}\p{N}_\-()]/gu, (c) => encodeURIComponent(c))}`;
+  return `${base}projects/${project}/wiki${tail}`;
+}
+
+function wikiTarget(args: Args, needPage: boolean, usage: string): { project: string; page: string | undefined; used: number } {
+  // Проект флагом (--project) освобождает первое слово под страницу.
+  const flagProject = str(args, "project")?.trim();
+  const project = flagProject ?? args.positional[0]?.trim();
+  if (!project) throw new UserError(`Укажите проект: redmine.ts ${usage}.`);
+  const pageIndex = flagProject !== undefined ? 0 : 1;
+  const pagePositional = args.positional[pageIndex];
+  const page = (pagePositional ?? str(args, "page"))?.trim() || undefined;
+  if (needPage && !page) throw new UserError(`Укажите страницу: redmine.ts ${usage}. Список страниц — redmine.ts wiki <проект>.`);
+  const used = pageIndex + (pagePositional === undefined ? 0 : 1);
+  noExtraWords(args, used, '"Название страницы" (или с подчёркиваниями: Как_подать_заявку)');
+  return { project, page, used };
+}
+
+function positiveFlag(args: Args, name: string, min: number): number | undefined {
+  const raw = str(args, name);
+  if (raw === undefined) {
+    if (args.flags.has(name)) throw new UserError(`Флаг --${name} ожидает число.`);
+    return undefined;
+  }
+  const n = Number(raw.trim());
+  if (!Number.isInteger(n) || n < min) {
+    throw new UserError(`Флаг --${name} ожидает целое число${min > 0 ? ` не меньше ${min}` : " не меньше 0"}, получено "${raw}".`);
+  }
+  return n;
+}
+
+export function readWikiRead(args: Args): {
+  project: string;
+  page: string | undefined;
+  version: number | undefined;
+  out: string | undefined;
+} {
+  const { project, page } = wikiTarget(args, false, "wiki <проект> [<страница>] [--version N] [--out файл]");
+  const version = positiveFlag(args, "version", 1);
+  const out = str(args, "out");
+  if (!page && (version !== undefined || out !== undefined)) {
+    throw new UserError("--version и --out относятся к странице: redmine.ts wiki <проект> <страница> --version N --out файл.");
+  }
+  return { project, page, version, out };
+}
+
+export function readWikiHistory(args: Args): { project: string; page: string; limit: number } {
+  const { project, page } = wikiTarget(args, true, "wiki-history <проект> <страница> [--limit N]");
+  const limit = positiveFlag(args, "limit", 1) ?? 20;
+  return { project, page: page!, limit: Math.min(limit, 200) };
+}
+
+export function readWikiUpdate(args: Args): {
+  project: string;
+  page: string;
+  textFile: string;
+  comment: string | undefined;
+  baseVersion: number | undefined;
+} {
+  const usage = 'wiki-update <проект> <страница> --text-file <файл> [--comment "…"]';
+  const { project, page } = wikiTarget(args, true, usage);
+  if (args.flags.has("text")) {
+    throw new UserError(`Текст страницы передаётся только файлом, чтобы не ломались разметка и кавычки: redmine.ts ${usage}.`);
+  }
+  const textFile = str(args, "text-file");
+  if (!textFile) throw new UserError(`Нужен файл с новым текстом страницы: redmine.ts ${usage}.`);
+  const comment = str(args, "comment");
+  if (args.flags.has("comment") && comment === undefined) throw new UserError('Флаг --comment ожидает текст: --comment "что изменено".');
+  return { project, page: page!, textFile, comment, baseVersion: positiveFlag(args, "base-version", 0) };
+}
+
+export type WikiRequest = {
+  method: "PUT";
+  path: string;
+  body: { wiki_page: { text: string; comments?: string; version?: number } };
+};
+
+/** Длина комментария к версии в Redmine ограничена 1024 знаками (WikiContent). */
+const WIKI_COMMENT_MAX = 1024;
+
+/**
+ * PUT создаёт страницу, если её нет, и обновляет существующую. `version` — версия, с которой снята
+ * правка: если страницу успели изменить, Redmine отвечает 409 и ничего не перезаписывает.
+ */
+export function wikiUpdateRequest(
+  project: string,
+  title: string,
+  text: string,
+  comment: string | undefined,
+  version: number | null,
+): WikiRequest {
+  if (!text.trim()) throw new UserError("Текст страницы пуст: Redmine пустую страницу не сохраняет.");
+  const page: WikiRequest["body"]["wiki_page"] = { text };
+  const note = comment?.trim();
+  if (note) {
+    if (note.length > WIKI_COMMENT_MAX) {
+      throw new UserError(`Комментарий к версии длиннее ${WIKI_COMMENT_MAX} знаков (${note.length}): Redmine его не примет.`);
+    }
+    page.comments = note;
+  }
+  if (version !== null) page.version = positiveId(version, "Номер версии");
+  return { method: "PUT", path: wikiPath(project, title), body: { wiki_page: page } };
+}
+
+/** Строки перевода — как в Redmine, хвостовые пробелы для сравнения не важны. */
+export function normalizeWikiText(text: string): string {
+  return text.replace(/\r\n?/g, "\n").replace(/\s+$/, "");
+}
+
+// ── сравнение текстов ──
+
+export type DiffOp = { kind: "same" | "del" | "add"; text: string };
+export type TextDiff = {
+  ops: DiffOp[];
+  removedLines: number;
+  addedLines: number;
+  removedChars: number;
+  addedChars: number;
+  beforeChars: number;
+  afterChars: number;
+  /** false — текст изменён так сильно, что середина показана заменой целиком, без построчного сравнения. */
+  exact: boolean;
+};
+
+/** Строки для сравнения. Длинная строка HTML режется по блочным тегам: иначе правка абзаца выглядит заменой страницы. */
+export function diffUnits(text: string): string[] {
+  const out: string[] = [];
+  for (const line of normalizeWikiText(text).split("\n")) {
+    if (line.length <= 300) {
+      out.push(line);
+      continue;
+    }
+    out.push(
+      ...line
+        .replace(/(<\/(?:p|li|h[1-6]|tr|table|ul|ol|div|blockquote|pre)>|<br\s*\/?>)/gi, "$1\n")
+        .split("\n")
+        .filter((part) => part.length > 0),
+    );
+  }
+  return out;
+}
+
+/** Предел таблицы сравнения: min(n, m) ≤ 2000, поэтому хватает 16-битных ячеек (8 МБ памяти). */
+const DIFF_CELLS = 4_000_000;
+
+export function textDiff(before: string, after: string): TextDiff {
+  const a = diffUnits(before);
+  const b = diffUnits(after);
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA--;
+    endB--;
+  }
+  const ops: DiffOp[] = a.slice(0, start).map((text) => ({ kind: "same", text }));
+  const midA = a.slice(start, endA);
+  const midB = b.slice(start, endB);
+  const n = midA.length;
+  const m = midB.length;
+  let exact = true;
+  if (n * m <= DIFF_CELLS) {
+    // Наибольшая общая подпоследовательность строк; таблица считается с конца, чтобы проход шёл вперёд.
+    const width = m + 1;
+    const lcs = new Uint16Array((n + 1) * width);
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        lcs[i * width + j] =
+          midA[i] === midB[j]
+            ? (lcs[(i + 1) * width + j + 1] ?? 0) + 1
+            : Math.max(lcs[(i + 1) * width + j] ?? 0, lcs[i * width + j + 1] ?? 0);
+      }
+    }
+    let i = 0;
+    let j = 0;
+    while (i < n && j < m) {
+      if (midA[i] === midB[j]) {
+        ops.push({ kind: "same", text: midA[i]! });
+        i++;
+        j++;
+      } else if ((lcs[(i + 1) * width + j] ?? 0) >= (lcs[i * width + j + 1] ?? 0)) {
+        ops.push({ kind: "del", text: midA[i]! });
+        i++;
+      } else {
+        ops.push({ kind: "add", text: midB[j]! });
+        j++;
+      }
+    }
+    for (; i < n; i++) ops.push({ kind: "del", text: midA[i]! });
+    for (; j < m; j++) ops.push({ kind: "add", text: midB[j]! });
+  } else {
+    exact = false;
+    for (const text of midA) ops.push({ kind: "del", text });
+    for (const text of midB) ops.push({ kind: "add", text });
+  }
+  for (const text of a.slice(endA)) ops.push({ kind: "same", text });
+
+  const count = (kind: DiffOp["kind"]) => ops.filter((o) => o.kind === kind);
+  const chars = (list: DiffOp[]) => list.reduce((sum, o) => sum + o.text.length, 0);
+  return {
+    ops,
+    removedLines: count("del").length,
+    addedLines: count("add").length,
+    removedChars: chars(count("del")),
+    addedChars: chars(count("add")),
+    // Объём — как у страницы в `wiki`: знаки текста с переводами строк «\n», без обрезки хвоста.
+    beforeChars: normalizeLineBreaks(before).length,
+    afterChars: normalizeLineBreaks(after).length,
+    exact,
+  };
+}
+
+function thousands(n: number): string {
+  return n.toLocaleString("ru-RU");
+}
+
+export function diffSummary(d: TextDiff): string {
+  return (
+    `убрано строк ${d.removedLines} (${thousands(d.removedChars)} знаков), добавлено ${d.addedLines} ` +
+    `(${thousands(d.addedChars)} знаков); объём ${thousands(d.beforeChars)} → ${thousands(d.afterChars)} знаков` +
+    (d.exact ? "" : " — текст изменён слишком сильно для построчного сравнения: середина показана заменой целиком")
+  );
+}
+
+/** Построчное сравнение для предпросмотра: изменения с одной строкой контекста, неизменное свёрнуто. */
+export function formatDiff(d: TextDiff, maxLines = 80, width = 200): string {
+  const changed = d.ops.map((o) => o.kind !== "same");
+  const near = (i: number): boolean => changed[i] === true || changed[i - 1] === true || changed[i + 1] === true;
+  const lines: string[] = [];
+  let hidden = 0;
+  const flush = (): void => {
+    if (hidden > 0) lines.push(`  … без изменений: ${plural(hidden, ["строка", "строки", "строк"])}`);
+    hidden = 0;
+  };
+  d.ops.forEach((op, i) => {
+    if (!near(i)) {
+      hidden++;
+      return;
+    }
+    flush();
+    const text = op.text.length > width ? op.text.slice(0, width - 1) + "…" : op.text;
+    lines.push(`${op.kind === "del" ? "-" : op.kind === "add" ? "+" : " "} ${text}`);
+  });
+  flush();
+  if (!changed.includes(true)) return "(строки совпадают)";
+  if (lines.length <= maxLines) return lines.join("\n");
+  return (
+    lines.slice(0, maxLines).join("\n") +
+    `\n… не показано строк сравнения: ${lines.length - maxLines} — новый текст целиком ниже.`
+  );
+}
+
+// ── аудитория, разметка, предпросмотр ──
+
+/**
+ * Страницу публичного проекта читают все, у кого есть учётная запись: мягкая проверка
+ * для неё не применяется, даже если её попросили.
+ */
+export function wikiAudience(isPublic: boolean | null, requested: string | undefined): { audience: Audience; note: string | null } {
+  if (isPublic === true) {
+    return {
+      audience: "client",
+      note:
+        requested === "internal"
+          ? "--audience internal не применён: проект публичный, страницу читают все пользователи — проверка строгая."
+          : null,
+    };
+  }
+  if (requested === "internal") {
+    return { audience: "internal", note: "Проверка мягкая (--audience internal): проект закрытый, страницу видят только его участники." };
+  }
+  return { audience: "client", note: null };
+}
+
+export function describeWikiAccess(isPublic: boolean | null): string {
+  if (isPublic === true) {
+    return (
+      "ПУБЛИЧНЫЙ проект: страницу видят все пользователи с учётной записью на инстансе, включая заказчиков " +
+      "(и гости без входа, если инстанс их пускает)"
+    );
+  }
+  if (isPublic === false) return "закрытый проект: страницу видят участники проекта с правом «Просмотр Wiki»";
+  return "неизвестно — проект не виден в списке";
+}
+
+/** Текст в чужой разметке на странице ломается молча: теги видны как есть или абзацы сливаются. */
+export function markupWarning(markup: Instance["markup"], text: string): string | null {
+  const html = /<(?:p|br|div|h[1-6]|ul|ol|li|table|tr|td|strong|em|b|i|a|span)\b[^>]*>/i.test(text);
+  if (markup === undefined) {
+    return `Разметка инстанса не задана в профиле — не проверить, подходит ли текст. Определить: redmine.ts detect-markup.`;
+  }
+  if (markup === "html" && !html) {
+    return "Разметка инстанса — html, а в тексте нет ни одного HTML-тега: абзацы и списки сольются в сплошной текст.";
+  }
+  if (markup !== "html" && html) {
+    return `Разметка инстанса — ${markup}, а текст написан в HTML: читатель увидит теги как есть.`;
+  }
+  return null;
+}
+
+export type WikiUpdateContext = {
+  instance: string;
+  project: { id: number; name: string; identifier: string; isPublic: boolean | null };
+  /** Название, под которым страница будет записана. */
+  title: string;
+  /** Как страницу назвал пользователь: если Redmine приведёт название к другому виду, это видно. */
+  requested: string;
+  url: string;
+  /** null — страницы нет, будет создана. */
+  current: WikiPage | null;
+  text: string;
+  comment: string | undefined;
+  markup: Instance["markup"];
+  audience: Audience;
+  audienceNote: string | null;
+  /** Сколько предупреждений напечатала проверка (запреты до предпросмотра не доходят). */
+  warnings: number;
+  rights: RightsCheck;
+};
+
+export function wikiUpdatePreview(ctx: WikiUpdateContext): string {
+  const cur = ctx.current;
+  const rows: string[][] = [
+    ["Проект", projectTitle(ctx.project)],
+    [
+      "Страница",
+      cur
+        ? `${cur.title}${cur.parent ? ` (родитель: ${cur.parent.title})` : ""}`
+        : `НЕТ — будет создана новая страница «${ctx.title}» (верхнего уровня, без родителя)`,
+    ],
+  ];
+  if (wikiTitle(ctx.requested) !== ctx.requested || (cur && cur.title !== wikiTitle(ctx.requested))) {
+    rows.push([
+      "Название",
+      cur && cur.title !== wikiTitle(ctx.requested)
+        ? `«${ctx.requested}» найдена под названием «${cur.title}» (переименована или другой регистр) — правится она`
+        : `«${ctx.requested}» → «${ctx.title}»: так его хранит Redmine (пробелы → «_», первая буква заглавная)`,
+    ]);
+  }
+  rows.push(["Адрес", ctx.url]);
+  if (cur) {
+    const who = cur.author ? `, автор ${cur.author.name}` : "";
+    const note = cur.comments?.trim() ? ` («${clip(cur.comments, 80)}»)` : "";
+    rows.push(["Сейчас", `версия ${cur.version} от ${stamp(cur.updated_on)}${who}${note}`]);
+    rows.push(["Станет", `версия ${cur.version + 1}`]);
+  } else {
+    rows.push(["Станет", "версия 1"]);
+  }
+  rows.push([
+    "Комментарий",
+    ctx.comment?.trim()
+      ? `«${ctx.comment.trim()}» — виден в истории страницы`
+      : 'не задан (--comment "что изменено" — виден в истории страницы)',
+  ]);
+  rows.push(["Разметка", ctx.markup ? `${ctx.markup} (из профиля инстанса)` : "не задана в профиле"]);
+  rows.push(["Доступ", describeWikiAccess(ctx.project.isPublic)]);
+  rows.push([
+    "Проверка",
+    `аудитория «${ctx.audience === "client" ? "заказчик" : "внутренняя"}» — ` +
+      (ctx.warnings === 0 ? "замечаний нет" : `предупреждений ${ctx.warnings} (напечатаны выше)`),
+  ]);
+  rows.push(["Права", rightsText(ctx.rights, "«Редактирование wiki-страниц»")]);
+
+  const notes = [markupWarning(ctx.markup, ctx.text), ctx.audienceNote].filter((x): x is string => Boolean(x));
+  const body = ctx.text.replace(/\s+$/, "");
+  const diff = cur ? textDiff(cur.text, ctx.text) : null;
+  const identifier = ctx.project.identifier;
+
+  const tail = cur
+    ? [
+        `Redmine хранит все версии страницы: версия ${cur.version} останется в истории (wiki-history), откат возможен —`,
+        `в интерфейсе «История» → версия ${cur.version} → «Откатить к данной версии» либо wiki-update с её текстом:`,
+        `  redmine.ts wiki ${identifier} ${cur.title} --version ${cur.version} --out <файл>`,
+        `Защита от одновременной правки: запись уйдёт с отметкой версии ${cur.version}. Если страницу изменят раньше,`,
+        "Redmine откажет (409) и ничего не перезапишет.",
+      ]
+    : [
+        "С первой записи Redmine ведёт историю версий страницы. Удалить созданную страницу можно в интерфейсе",
+        "(право «Удаление wiki-страниц»).",
+      ];
+
+  return (
+    `${cur ? "ПРАВКА СТРАНИЦЫ WIKI" : "НОВАЯ СТРАНИЦА WIKI"} · инстанс ${ctx.instance}\n${table(rows)}\n` +
+    (notes.length > 0 ? `${RULE}\n${notes.join("\n")}\n` : "") +
+    (diff ? `${RULE}\nИЗМЕНЕНИЯ ОТНОСИТЕЛЬНО ВЕРСИИ ${cur!.version}: ${diffSummary(diff)}\n${formatDiff(diff)}\n` : "") +
+    `${RULE}\n${cur ? "НОВЫЙ ТЕКСТ ЦЕЛИКОМ (заменит текущий; так уйдёт в Redmine)" : "ТЕКСТ НОВОЙ СТРАНИЦЫ ЦЕЛИКОМ (так уйдёт в Redmine)"}` +
+    `:\n${RULE}\n${body}\n${RULE}\n${tail.join("\n")}`
+  );
+}
+
+/**
+ * Страница должна быть той, что видел пользователь в предпросмотре: иначе его «да» относится
+ * к другому сравнению. null — всё сходится.
+ */
+export function wikiBaseMismatch(base: number, current: WikiPage | null, command: string): string | null {
+  const now = current?.version ?? 0;
+  if (base === now) return null;
+  const again = `  Запустите ${command} без --yes, покажите пользователю новый предпросмотр и повторите с --base-version ${now}.`;
+  if (base === 0) {
+    return (
+      `Когда показывался предпросмотр, страницы не было, а теперь она есть: версия ${now}` +
+      `${current?.author ? `, автор ${current.author.name}` : ""}, ${stamp(current?.updated_on)}. Ничего не отправлено.\n${again}`
+    );
+  }
+  if (current === null) {
+    return `Страницу удалили после предпросмотра (он был по версии ${base}). Ничего не отправлено.\n${again}`;
+  }
+  return (
+    `Страницу изменили после предпросмотра: он был по версии ${base}, сейчас версия ${now}` +
+    `${current.author ? ` (${current.author.name}, ${stamp(current.updated_on)})` : ""}.\n` +
+    `  Ничего не отправлено — чужая правка цела.\n${again}`
+  );
+}
+
+export type WikiWriteCheck = { ok: boolean; text: string };
+
+/** Сверка после записи: версия выросла ровно на одну, текст на странице — отправленный. */
+export function checkWikiWrite(
+  after: WikiPage | null,
+  expected: { text: string; comment: string | undefined; previousVersion: number | null },
+): WikiWriteCheck {
+  if (!after) return { ok: false, text: "РАСХОЖДЕНИЕ: Redmine ответил успехом, но страница не читается. Проверьте её в интерфейсе." };
+  const want = (expected.previousVersion ?? 0) + 1;
+  const problems: string[] = [];
+  if (after.version !== want) {
+    if (expected.previousVersion === null) {
+      problems.push(
+        `страница уже существовала: текст записан поверх как версия ${after.version}; ` +
+          "прежний текст — в истории (wiki-history), откат возможен",
+      );
+    } else if (after.version === expected.previousVersion) {
+      problems.push(`новой версии нет — осталась версия ${after.version}`);
+    } else {
+      problems.push(`ожидалась версия ${want}, сейчас ${after.version}: страницу правили параллельно — проверьте wiki-history`);
+    }
+  }
+  if (normalizeWikiText(after.text) !== normalizeWikiText(expected.text)) problems.push("текст на странице отличается от отправленного");
+  const note = expected.comment?.trim();
+  if (note && (after.comments ?? "").trim() !== note) problems.push("комментарий к версии не совпадает с отправленным");
+  if (problems.length > 0) return { ok: false, text: `РАСХОЖДЕНИЕ: ${problems.join("; ")}.` };
+  return {
+    ok: true,
+    text:
+      expected.previousVersion === null
+        ? `Сверка: страница создана, версия ${after.version}; текст совпадает с отправленным.`
+        : `Сверка: версия ${expected.previousVersion} → ${after.version}; текст совпадает с отправленным.`,
+  };
+}
+
+// ── отказы ──
+
+export type WikiAction = "list" | "read" | "version" | "update";
+
+/** Отказ Redmine по wiki — словами: какого права не хватает и что делать. null — объяснить нечем. */
+export function explainWikiRejection(
+  status: number,
+  details: string[],
+  ctx: { action: WikiAction; project: string; page?: string; version?: number },
+): string | null {
+  const page = ctx.page ? `«${ctx.page}»` : "";
+  if (status === 409 && ctx.action === "update") {
+    return (
+      `Страница ${page} не записана: её изменили после того, как скилл её прочитал` +
+      `${ctx.version ? ` (запись шла с отметкой версии ${ctx.version})` : ""}.\n` +
+      "  Ничего не перезаписано — чужая правка цела. Перечитайте страницу (redmine.ts wiki <проект> <страница>),\n" +
+      "  перенесите изменения поверх свежего текста и заново покажите предпросмотр."
+    );
+  }
+  if (status === 422 && ctx.action === "update") {
+    const flat = details.join("; ").toLowerCase();
+    const reason = /comment|коммент/.test(flat)
+      ? `комментарий к версии длиннее ${WIKI_COMMENT_MAX} знаков`
+      : /title|заголов|назван/.test(flat)
+        ? "недопустимое или занятое название: нельзя , . / ? ; | : и пробелы, не длиннее 255 знаков"
+        : /parent|родител/.test(flat)
+          ? "недопустимая родительская страница"
+          : /text|текст/.test(flat)
+            ? "текст страницы пуст — пустую страницу Redmine не сохраняет"
+            : "данные не прошли проверку";
+    return `Redmine не сохранил страницу ${page}: ${reason}.\n  Ответ Redmine: ${details.join("; ") || "без пояснения"}.`;
+  }
+  if (status === 403) {
+    if (ctx.action === "update") {
+      return (
+        `Страница ${page} не записана: у владельца ключа нет права менять её в проекте ${ctx.project}.\n` +
+        "  Нужно право «Редактирование wiki-страниц»; защищённую страницу меняет только роль с правом «Блокирование wiki-страниц».\n" +
+        "  В закрытом проекте wiki только для чтения — сначала reopen-project. Права входят в роль проекта: выдаёт их\n" +
+        "  администратор Redmine или менеджер проекта. Обходного пути нет."
+      );
+    }
+    if (ctx.action === "version") {
+      return (
+        `Прежние версии страницы ${page} закрыты от владельца ключа: нужно право «Просмотр истории Wiki» в проекте ${ctx.project}.\n` +
+        "  Текущая версия читается и без него: redmine.ts wiki <проект> <страница>."
+      );
+    }
+    return (
+      `Wiki проекта ${ctx.project} закрыта от владельца ключа: в проекте выключен модуль «Wiki»\n` +
+      "  либо у роли нет права «Просмотр Wiki».\n" +
+      "  Модуль включается в настройках проекта («Модули»), право выдаёт администратор или менеджер проекта."
+    );
+  }
+  if (status === 404) {
+    if (ctx.action === "list") {
+      return `У проекта ${ctx.project} нет wiki: модуль «Wiki» не включён (настройки проекта → «Модули»).`;
+    }
+    if (ctx.action === "version") {
+      return (
+        `Версии ${ctx.version ?? "?"} у страницы ${page} нет: номер больше текущего или версию удалили.\n` +
+        "  Версии: redmine.ts wiki-history <проект> <страница>."
+      );
+    }
+    if (ctx.action === "read") return `Страницы ${page} в wiki проекта ${ctx.project} нет. Список страниц: redmine.ts wiki <проект>.`;
+    return (
+      `Redmine ответил «не найдено» при записи страницы ${page}: wiki проекта ${ctx.project} выключена или проект недоступен.\n` +
+      "  Ничего не записано."
+    );
+  }
+  return null;
+}
+
+async function withWikiErrors<T>(
+  ctx: { action: WikiAction; project: string; page?: string; version?: number },
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (error instanceof ApiError) {
+      const explained = explainWikiRejection(error.status, error.details, ctx);
+      if (explained) throw new UserError(explained);
+    }
+    throw error;
+  }
+}
+
+// ── чтение ──
+
+/** Страницы wiki деревом «родитель → дочерние»; страница с невидимым родителем — в корне. */
+export function wikiTree(pages: WikiPageRef[]): { page: WikiPageRef; depth: number }[] {
+  const titles = new Set(pages.map((p) => p.title));
+  const children = new Map<string, WikiPageRef[]>();
+  const roots: WikiPageRef[] = [];
+  for (const p of pages) {
+    const parent = p.parent?.title;
+    if (parent && parent !== p.title && titles.has(parent)) children.set(parent, [...(children.get(parent) ?? []), p]);
+    else roots.push(p);
+  }
+  const byTitle = (a: WikiPageRef, b: WikiPageRef): number => a.title.localeCompare(b.title, "ru");
+  const out: { page: WikiPageRef; depth: number }[] = [];
+  const seen = new Set<string>();
+  const walk = (p: WikiPageRef, depth: number): void => {
+    if (seen.has(p.title)) return;
+    seen.add(p.title);
+    out.push({ page: p, depth });
+    [...(children.get(p.title) ?? [])].sort(byTitle).forEach((c) => walk(c, depth + 1));
+  };
+  [...roots].sort(byTitle).forEach((p) => walk(p, 0));
+  // Страницы, замкнутые в цикл родителей, иначе потерялись бы.
+  for (const p of pages) walk(p, 0);
+  return out;
+}
+
+async function loadWikiIndex(rm: Resolved, project: ProjectRef): Promise<WikiPageRef[]> {
+  return withWikiErrors({ action: "list", project: projectTitle(project) }, async () =>
+    (await request<{ wiki_pages?: WikiPageRef[] }>(rm, "GET", `projects/${project.identifier}/wiki/index.json`)).wiki_pages ?? [],
+  );
+}
+
+/** Страница или её версия; null — такой страницы (версии) нет. Остальные отказы — объяснением. */
+async function loadWikiPage(rm: Resolved, project: ProjectRef, title: string, version?: number): Promise<WikiPage | null> {
+  try {
+    return (await request<{ wiki_page: WikiPage }>(rm, "GET", wikiPath(project.identifier, title, version))).wiki_page;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    if (error instanceof ApiError) {
+      const explained = explainWikiRejection(error.status, error.details, {
+        action: version === undefined ? "read" : "version",
+        project: projectTitle(project),
+        page: title,
+        version,
+      });
+      if (explained) throw new UserError(explained);
+    }
+    throw error;
+  }
+}
+
+/** Страницы нет: сначала проверяем, есть ли wiki вообще, затем подсказываем похожие названия. */
+async function wikiPageMissing(rm: Resolved, project: ProjectRef, title: string, version?: number): Promise<never> {
+  const pages = await loadWikiIndex(rm, project);
+  const exists = pages.some((p) => p.title.toLowerCase() === title.toLowerCase());
+  if (version !== undefined && exists) {
+    throw new UserError(explainWikiRejection(404, [], { action: "version", project: projectTitle(project), page: title, version })!);
+  }
+  const loose = (value: string): string => value.toLowerCase().replace(/_/g, " ");
+  const needle = loose(title);
+  const similar = pages
+    .filter((p) => loose(p.title).includes(needle) || needle.includes(loose(p.title)))
+    .map((p) => p.title);
+  throw new UserError(
+    explainWikiRejection(404, [], { action: "read", project: projectTitle(project), page: title })! +
+      (similar.length > 0 ? `\n  Похожие: ${similar.slice(0, 8).join(", ")}.` : ""),
+  );
+}
+
+async function readTextFile(path: string, what: string): Promise<string> {
+  const file = Bun.file(path);
+  if (!(await file.exists())) throw new UserError(`${what}: файл не найден — ${path}.`);
+  // Блокнот Windows пишет метку порядка байтов: в тексте страницы ей не место.
+  return (await file.text()).replace(/^\uFEFF/, "");
+}
+
+async function cmdWiki(rm: Resolved, args: Args): Promise<void> {
+  const input = readWikiRead(args);
+  const project = await findProjectAnyStatus(rm, input.project);
+  const title = projectTitle(project);
+  const access = project.is_public === true ? "публичный" : "закрытый";
+  const brief = { id: project.id, identifier: project.identifier, name: project.name };
+
+  if (!input.page) {
+    const pages = await loadWikiIndex(rm, project);
+    const rows = wikiTree(pages).map(({ page, depth }) => [
+      `${"  ".repeat(depth)}${depth > 0 ? "└ " : ""}${page.title}`,
+      String(page.version),
+      stamp(page.updated_on),
+    ]);
+    emit({ instance: rm.name, project: brief, pages }, () =>
+      `WIKI ПРОЕКТА ${title} · инстанс ${rm.name} · проект ${access}\n${wikiPageUrl(rm.base, project.identifier)}\n` +
+      (rows.length === 0
+        ? `Страниц нет. Создать: redmine.ts wiki-update ${project.identifier} <Название> --text-file <файл>`
+        : `${table([["СТРАНИЦА", "ВЕРСИЯ", "ИЗМЕНЕНА"], ...rows])}\n\nВсего ${rows.length}. ` +
+          `Текст: redmine.ts wiki ${project.identifier} <страница> · версии: wiki-history ${project.identifier} <страница>`),
+    );
+    return;
+  }
+
+  const wanted = wikiTitle(input.page);
+  const page =
+    (await loadWikiPage(rm, project, wanted, input.version)) ?? (await wikiPageMissing(rm, project, wanted, input.version));
+  const url = wikiPageUrl(rm.base, project.identifier, page.title);
+  const lines = normalizeWikiText(page.text).split("\n").length;
+  const rows: string[][] = [
+    ["Версия", `${page.version}${input.version === undefined ? " (текущая)" : ""}`],
+    ["Автор версии", page.author?.name ?? "—"],
+    ["Изменена", stamp(page.updated_on)],
+    ["Создана", stamp(page.created_on)],
+    ["Родитель", page.parent?.title ?? "нет (страница верхнего уровня)"],
+    ["Комментарий", page.comments?.trim() ? page.comments.trim() : "—"],
+    ["Объём", `${thousands(wikiChars(page.text))} знаков, ${lines} строк; разметка ${rm.markup ?? "не задана в профиле"}`],
+  ];
+  let saved: string | null = null;
+  if (input.out) {
+    saved = resolve(input.out);
+    await Bun.write(saved, page.text);
+  }
+  const head =
+    `СТРАНИЦА WIKI «${page.title}» · проект ${title} · инстанс ${rm.name} · проект ${access}\n${url}\n${table(rows)}`;
+  const hints =
+    `Версии: redmine.ts wiki-history ${project.identifier} ${page.title} · правка: redmine.ts wiki-update ` +
+    `${project.identifier} ${page.title} --text-file <файл>`;
+  emit({ instance: rm.name, project: brief, page, url, savedTo: saved }, () =>
+    saved
+      ? `${head}\n\nТекст записан в ${saved} (${thousands(wikiChars(page.text))} знаков).\n${hints}`
+      : `${head}\n${RULE}\n${page.text.replace(/\s+$/, "")}\n${RULE}\n${hints}`,
+  );
+}
+
+export type WikiVersionRow = { version: number; page: WikiPage | null; state: "ok" | "forbidden" | "missing" };
+
+/** Строки истории: у каждой версии — размер и изменение относительно предыдущей из показанных. */
+export function wikiHistoryRows(list: WikiVersionRow[]): string[][] {
+  const sorted = [...list].sort((a, b) => b.version - a.version);
+  return sorted.map((row, index) => {
+    if (!row.page) return [String(row.version), "—", "—", "—", row.state === "missing" ? "(версия удалена)" : "(закрыта правами)"];
+    const older = sorted.slice(index + 1).find((r) => r.page !== null)?.page ?? null;
+    const size = wikiChars(row.page.text);
+    const delta = older ? size - wikiChars(older.text) : null;
+    return [
+      String(row.version),
+      stamp(row.page.updated_on),
+      row.page.author?.name ?? "—",
+      `${thousands(size)}${delta === null ? "" : ` (${delta >= 0 ? "+" : "−"}${thousands(Math.abs(delta))})`}`,
+      row.page.comments?.trim() ? clip(row.page.comments, 60) : "—",
+    ];
+  });
+}
+
+async function cmdWikiHistory(rm: Resolved, args: Args): Promise<void> {
+  const input = readWikiHistory(args);
+  const project = await findProjectAnyStatus(rm, input.project);
+  const title = projectTitle(project);
+  const wanted = wikiTitle(input.page);
+  const current = (await loadWikiPage(rm, project, wanted)) ?? (await wikiPageMissing(rm, project, wanted));
+
+  // Отдельного списка версий в REST API Redmine нет: история собирается запросом каждой версии.
+  const fetchVersion = async (version: number): Promise<WikiVersionRow> => {
+    try {
+      const page = (await request<{ wiki_page: WikiPage }>(rm, "GET", wikiPath(project.identifier, current.title, version))).wiki_page;
+      return { version, page, state: "ok" };
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 403) return { version, page: null, state: "forbidden" };
+      if (error instanceof ApiError && error.status === 404) return { version, page: null, state: "missing" };
+      throw error;
+    }
+  };
+  const oldest = Math.max(1, current.version - input.limit + 1);
+  const numbers: number[] = [];
+  for (let v = current.version - 1; v >= oldest; v--) numbers.push(v);
+  const first = numbers.length > 0 ? await fetchVersion(numbers[0]!) : null;
+  const forbidden = first?.state === "forbidden";
+  const rest = forbidden ? [] : await mapLimit(numbers.slice(1), 4, fetchVersion);
+  const rows: WikiVersionRow[] = [
+    { version: current.version, page: current, state: "ok" },
+    ...(first && !forbidden ? [first] : []),
+    ...rest,
+  ];
+  const url = wikiPageUrl(rm.base, project.identifier, current.title);
+  const versions = rows.map((r) => ({
+    version: r.version,
+    state: r.state,
+    author: r.page?.author ?? null,
+    updated_on: r.page?.updated_on ?? null,
+    comments: r.page?.comments ?? null,
+    chars: r.page ? wikiChars(r.page.text) : null,
+  }));
+  emit({ instance: rm.name, project: project.identifier, page: current.title, versions }, () =>
+    `ИСТОРИЯ СТРАНИЦЫ WIKI «${current.title}» · проект ${title} · инстанс ${rm.name}\n${url}/history\n` +
+    table([["ВЕРСИЯ", "ДАТА", "АВТОР", "ЗНАКОВ", "КОММЕНТАРИЙ"], ...wikiHistoryRows(rows)]) +
+    "\n\n" +
+    (forbidden
+      ? explainWikiRejection(403, [], { action: "version", project: title, page: current.title })! + "\n"
+      : `Показаны версии ${current.version}…${oldest} из ${current.version}` +
+        (oldest > 1 ? ` (более ранние — --limit ${current.version})` : "") +
+        ". Отдельного списка версий в REST API Redmine нет: история собрана запросом каждой версии.\n") +
+    `Текст версии: redmine.ts wiki ${project.identifier} ${current.title} --version N [--out файл]. ` +
+    "Откат — wiki-update с этим текстом или «Откатить к данной версии» в интерфейсе.",
+  );
+}
+
+// ── запись ──
+
+async function cmdWikiUpdate(rm: Resolved, args: Args): Promise<void> {
+  const input = readWikiUpdate(args);
+  const text = normalizeLineBreaks(await readTextFile(input.textFile, "Текст страницы"));
+  if (!text.trim()) throw new UserError(`Файл ${input.textFile} пуст: Redmine пустую страницу не сохраняет.`);
+
+  const found = await findProjectAnyStatus(rm, input.project);
+  // Публичность и статус — со свежей карточки: от них зависят строгость проверки и сама возможность записи.
+  const project = await freshProject(rm, found.id);
+  const title = projectTitle(project);
+  if (project.status === PROJECT_STATUS.closed) {
+    throw new UserError(
+      `Проект ${title} закрыт: его wiki доступна только для чтения, записать страницу нельзя.\n` +
+        `  Сначала открыть проект: redmine.ts reopen-project ${project.identifier} --instance ${rm.name}`,
+    );
+  }
+  if (project.enabled_modules && !project.enabled_modules.some((m) => m.name === "wiki")) {
+    throw new UserError(explainWikiRejection(404, [], { action: "list", project: title })!);
+  }
+  await loadWikiIndex(rm, project);
+
+  const requested = input.page;
+  const wanted = wikiTitle(requested);
+  const current = await loadWikiPage(rm, project, wanted);
+  const pageTitle = current?.title ?? wanted;
+  if (current && normalizeWikiText(current.text) === normalizeWikiText(text)) {
+    throw new UserError(
+      `Текст в ${input.textFile} совпадает с текущей версией ${current.version} страницы «${current.title}» — Redmine новую версию ` +
+        "не создаст. Менять нечего.",
+    );
+  }
+
+  const { audience, note } = wikiAudience(project.is_public ?? null, str(args, "audience"));
+  const findings = checkOutgoing({ "текст страницы wiki": text, "комментарий к версии": input.comment }, args, audience);
+  const req = wikiUpdateRequest(project.identifier, pageTitle, text, input.comment, current?.version ?? null);
+  const rights = await keyRights(rm, project, "edit_wiki_pages", false);
+
+  const preview = wikiUpdatePreview({
+    instance: rm.name,
+    project: { id: project.id, name: project.name, identifier: project.identifier, isPublic: project.is_public ?? null },
+    title: pageTitle,
+    requested,
+    url: wikiPageUrl(rm.base, project.identifier, pageTitle),
+    current,
+    text,
+    comment: input.comment,
+    markup: rm.markup,
+    audience,
+    audienceNote: note,
+    warnings: findings.length,
+    rights,
+  });
+  const base = current?.version ?? 0;
+  if (!requireConfirmation(args, preview, `та же команда с флагами --yes --base-version ${base}`)) return;
+
+  if (input.baseVersion === undefined) {
+    throw new UserError(
+      `Для записи нужен --base-version из предпросмотра: он называет версию страницы, которую видел пользователь (сейчас ${base}).\n` +
+        "  Без него правка могла бы лечь поверх чужой, которой пользователь не видел. Ничего не отправлено.",
+    );
+  }
+  const mismatch = wikiBaseMismatch(input.baseVersion, current, "wiki-update");
+  if (mismatch) throw new UserError(mismatch);
+
+  await withWikiErrors({ action: "update", project: title, page: pageTitle, version: current?.version }, () =>
+    request(rm, req.method, req.path, undefined, req.body),
+  );
+  const after = await loadWikiPage(rm, project, pageTitle);
+  const check = checkWikiWrite(after, { text, comment: input.comment, previousVersion: current?.version ?? null });
+  const url = wikiPageUrl(rm.base, project.identifier, after?.title ?? pageTitle);
+  emit({ instance: rm.name, project: project.identifier, page: after?.title ?? pageTitle, version: after?.version ?? null, check }, () =>
+    `${current ? "Страница обновлена" : "Страница создана"}: «${after?.title ?? pageTitle}» в проекте ${title}\n${url}\n${check.text}` +
+    (current ? `\nПрежняя версия ${current.version} — в истории: redmine.ts wiki-history ${project.identifier} ${pageTitle}` : ""),
+  );
+  if (!check.ok) process.exitCode = 1;
+}
+
+/** Переводы строк Windows приводятся к «\n»: сравнение и сверка после записи не должны спотыкаться о «\r». */
+function normalizeLineBreaks(text: string): string {
+  return text.replace(/\r\n?/g, "\n");
+}
+
+/** Объём текста в знаках — одинаково в `wiki`, истории и сравнении: страницы из браузера хранятся с «\r\n». */
+function wikiChars(text: string): number {
+  return normalizeLineBreaks(text).length;
 }
 
 // ─────────────────────────── участники проекта ─────────────────────────
@@ -5468,9 +6785,9 @@ function cmdHelp(): void {
 Общие флаги: --instance <имя|хост>  --all-instances (для inbox/due)  --json  --no-cache
 
 ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: команды log, batch, comment, create-issue, create-tree,
-update-issue, edit, create-project, update-project, archive-project, relate, unrelate,
-add-member, update-member, remove-member без --yes печатают полный предпросмотр
-и ничего не отправляют.
+update-issue, edit, create-project, update-project, archive-project, close-project,
+reopen-project, relate, unrelate, add-member, update-member, remove-member, wiki-update
+без --yes печатают полный предпросмотр и ничего не отправляют.
 Любой уходящий текст проверяется на компрометацию (секреты, ПДн, внутренние адреса,
 самооговор). Запрет снимается только флагом --override-guard.
   scan --text "..."|--file f [--audience client|internal]   проверить текст отдельно
@@ -5493,6 +6810,19 @@ add-member, update-member, remove-member без --yes печатают полн�
                  [--module <имя> ...] [--field "<имя|id>=<значение>" ...] [--yes]
   archive-project <identifier|id> --yes | unarchive-project <identifier|id> --yes
         только для администратора Redmine; обычному ключу инстанс ответит отказом
+  close-project <проект> [--yes] | reopen-project <проект> [--yes]
+        закрыть (только чтение: задачи не создаются и не меняются, время не списывается) или открыть
+        обратно; касается и подпроектов; нужно право «Закрывать / открывать проекты»; Redmine 5.0+
+
+Wiki проекта
+  wiki <проект>                     страницы деревом: версия и дата изменения
+  wiki <проект> <страница> [--version N] [--out файл]
+        текст страницы как есть (разметка инстанса), версия, автор, дата; --out — в файл для правки
+  wiki-history <проект> <страница> [--limit 20]
+        версии страницы: дата, автор, объём, комментарий (собирается запросом каждой версии)
+  wiki-update <проект> <страница> --text-file f [--comment "…"] [--audience internal] [--yes --base-version N]
+        заменить текст или создать страницу; предпросмотр — доступ, сравнение с текущей версией и текст
+        целиком; --base-version из предпросмотра защищает от записи поверх чужой правки
 
 Участники проекта
   members <проект>                  участники: пользователь или группа, роли, номер членства
@@ -5617,6 +6947,11 @@ async function main(): Promise<void> {
     "update-project": cmdUpdateProject,
     "archive-project": cmdArchiveProject,
     "unarchive-project": cmdArchiveProject,
+    "close-project": cmdProjectStatus,
+    "reopen-project": cmdProjectStatus,
+    wiki: cmdWiki,
+    "wiki-history": cmdWikiHistory,
+    "wiki-update": cmdWikiUpdate,
     members: cmdMembers,
     roles: cmdRoles,
     "add-member": cmdAddMember,

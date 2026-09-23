@@ -56,7 +56,45 @@ import {
   type MemberProject,
   type Principal,
 } from "./redmine.ts";
-import { planBaseDir, planTextPath } from "./redmine.ts";
+import { planBaseDir, planTextPath, safeCurrentUser } from "./redmine.ts";
+import {
+  wikiTitle,
+  wikiPath,
+  wikiPageUrl,
+  readWikiRead,
+  readWikiHistory,
+  readWikiUpdate,
+  wikiUpdateRequest,
+  normalizeWikiText,
+  diffUnits,
+  textDiff,
+  diffSummary,
+  formatDiff,
+  markupWarning,
+  wikiAudience,
+  describeWikiAccess,
+  wikiUpdatePreview,
+  wikiBaseMismatch,
+  checkWikiWrite,
+  explainWikiRejection,
+  wikiTree,
+  wikiHistoryRows,
+  readProjectStatusArgs,
+  projectStatusRequest,
+  projectStatusPreview,
+  projectStatusUiPath,
+  explainProjectStatusRejection,
+  checkProjectStatus,
+  projectDescendants,
+  describeProjectStatus,
+  rightsFromRoles,
+  rightsText,
+  CLOSE_PERMISSION,
+  PROJECT_STATUS,
+  type WikiPage,
+  type WikiUpdateContext,
+  type ProjectStatusContext,
+} from "./redmine.ts";
 import { posix, win32 } from "node:path";
 
 let passed = 0;
@@ -1180,6 +1218,355 @@ check(
   }).includes("Открытые задачи"),
   false,
 );
+
+// ── wiki: название и адрес страницы ───────────────────────────────────
+// Название приводится к виду Redmine (Wiki.titleize) до запроса: иначе предпросмотр обещал бы одну страницу, а запись шла в другую.
+check("wiki: пробелы → подчёркивания", wikiTitle("Как подать заявку"), "Как_подать_заявку");
+check("wiki: первая буква заглавная", wikiTitle("как_подать"), "Как_подать");
+check("wiki: знаки , . / ? ; | : удаляются", wikiTitle("Итоги: 2026/09, v1.2?"), "Итоги_202609_v12");
+check(
+  "wiki: название из адреса страницы",
+  wikiTitle("https://redmine.example.ru/projects/x/wiki/%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%BA%D0%B0"),
+  "Поддержка",
+);
+checkThrows("wiki: пустое название", () => wikiTitle(" ./ "));
+check("wiki: путь страницы кодируется", wikiPath("public_information", "Как_подать"), `projects/public_information/wiki/${encodeURIComponent("Как_подать")}.json`);
+check("wiki: путь версии", wikiPath("p", "Wiki", 3), "projects/p/wiki/Wiki/3.json");
+check("wiki: адрес для человека читаемый", wikiPageUrl("https://r.example/", "p", "Как_подать"), "https://r.example/projects/p/wiki/Как_подать");
+check("wiki: адрес списка страниц", wikiPageUrl("https://r.example/", "p"), "https://r.example/projects/p/wiki");
+
+// ── wiki: разбор аргументов ───────────────────────────────────────────
+check("wiki: только проект", readWikiRead(parseArgs(["wiki", "public_information"])), { project: "public_information" });
+check(
+  "wiki: страница, версия, файл",
+  readWikiRead(parseArgs(["wiki", "p", "Поддержка", "--version", "5", "--out", "a.html"])),
+  { project: "p", page: "Поддержка", version: 5, out: "a.html" },
+);
+check("wiki: проект флагом, страница словом", readWikiRead(parseArgs(["wiki", "--project", "p", "Поддержка"])).page, "Поддержка");
+checkThrows("wiki: версия без страницы", () => readWikiRead(parseArgs(["wiki", "p", "--version", "2"])));
+checkThrows("wiki: версия не число", () => readWikiRead(parseArgs(["wiki", "p", "X", "--version", "два"])));
+checkThrows("wiki: версия 0", () => readWikiRead(parseArgs(["wiki", "p", "X", "--version", "0"])));
+checkThrows("wiki: название из нескольких слов без кавычек", () => readWikiRead(parseArgs(["wiki", "p", "Как", "подать"])));
+check("wiki-history: по умолчанию 20 версий", readWikiHistory(parseArgs(["wiki-history", "p", "X"])).limit, 20);
+check("wiki-history: -n", readWikiHistory(parseArgs(["wiki-history", "p", "X", "-n", "5"])).limit, 5);
+checkThrows("wiki-history: без страницы", () => readWikiHistory(parseArgs(["wiki-history", "p"])));
+check(
+  "wiki-update: разбор",
+  readWikiUpdate(
+    parseArgs(["wiki-update", "p", "X", "--text-file", "a.html", "--comment", "Порядок подачи", "--yes", "--base-version", "7"]),
+  ),
+  { project: "p", page: "X", textFile: "a.html", comment: "Порядок подачи", baseVersion: 7 },
+);
+check(
+  "wiki-update: --base-version 0 — страницы не было",
+  readWikiUpdate(parseArgs(["wiki-update", "p", "X", "--text-file", "a", "--base-version", "0"])).baseVersion,
+  0,
+);
+checkThrows("wiki-update: без файла", () => readWikiUpdate(parseArgs(["wiki-update", "p", "X"])));
+checkThrows("wiki-update: текст строкой не принимается", () => readWikiUpdate(parseArgs(["wiki-update", "p", "X", "--text", "<p>x</p>"])));
+checkThrows(
+  "wiki-update: --base-version не число",
+  () => readWikiUpdate(parseArgs(["wiki-update", "p", "X", "--text-file", "a", "--base-version", "последняя"])),
+);
+checkThrows("wiki-update: без страницы", () => readWikiUpdate(parseArgs(["wiki-update", "p", "--text-file", "a"])));
+
+// ── wiki: запрос записи ───────────────────────────────────────────────
+const putPage = wikiUpdateRequest("public_information", "Как_подать", "<p>Текст</p>", "  Порядок подачи  ", 7);
+check("wiki-update: метод и путь", [putPage.method, putPage.path], ["PUT", wikiPath("public_information", "Как_подать")]);
+check("wiki-update: тело — текст, комментарий, версия", putPage.body, {
+  wiki_page: { text: "<p>Текст</p>", comments: "Порядок подачи", version: 7 },
+});
+check("wiki-update: новая страница — без версии", wikiUpdateRequest("p", "Новая", "<p>x</p>", undefined, null).body, {
+  wiki_page: { text: "<p>x</p>" },
+});
+checkThrows("wiki-update: пустой текст", () => wikiUpdateRequest("p", "X", "  \n ", undefined, 1));
+checkThrows("wiki-update: комментарий длиннее 1024 знаков", () => wikiUpdateRequest("p", "X", "<p>x</p>", "я".repeat(1025), 1));
+checkThrows("wiki-update: версия 0 у существующей страницы", () => wikiUpdateRequest("p", "X", "<p>x</p>", undefined, 0));
+
+// ── сравнение текстов ─────────────────────────────────────────────────
+const wikiBefore = "<h1>Заявка</h1>\n<p>Старый абзац</p>\n<p>Общий абзац</p>\n";
+const wikiAfter = "<h1>Заявка</h1>\n<p>Новый абзац</p>\n<p>Общий абзац</p>\n<p>Добавлено</p>\n";
+const wikiDiff = textDiff(wikiBefore, wikiAfter);
+check("сравнение: строк убрано и добавлено", [wikiDiff.removedLines, wikiDiff.addedLines], [1, 2]);
+check(
+  "сравнение: знаков убрано и добавлено",
+  [wikiDiff.removedChars, wikiDiff.addedChars],
+  ["<p>Старый абзац</p>".length, "<p>Новый абзац</p>".length + "<p>Добавлено</p>".length],
+);
+check("сравнение: объём до и после", [wikiDiff.beforeChars, wikiDiff.afterChars], [wikiBefore.length, wikiAfter.length]);
+check("сравнение: \\r\\n правкой не считается", textDiff("a\r\nb", "a\nb").removedLines, 0);
+check("сравнение: хвостовые пробелы не важны", normalizeWikiText("a\r\nb \n\n"), "a\nb");
+check("сравнение: одинаковые тексты", formatDiff(textDiff("x\ny", "x\ny")), "(строки совпадают)");
+// Страница, сохранённая визуальным редактором, бывает одной строкой: без разреза правка абзаца выглядела бы заменой всего.
+check("сравнение: длинная строка HTML режется по абзацам", diffUnits(`<p>${"а".repeat(200)}</p><p>${"б".repeat(200)}</p>`).length, 2);
+const wikiDiffText = formatDiff(wikiDiff);
+check("сравнение: убранная строка со знаком «-»", wikiDiffText.includes("- <p>Старый абзац</p>"), true);
+check("сравнение: добавленная строка со знаком «+»", wikiDiffText.includes("+ <p>Добавлено</p>"), true);
+const fifty = Array.from({ length: 50 }, (_, i) => `строка ${i}`).join("\n");
+check(
+  "сравнение: неизменное свёрнуто",
+  formatDiff(textDiff(fifty, fifty.replace("строка 25", "строка двадцать пять"))).includes("… без изменений: 24 строки"),
+  true,
+);
+check("сравнение: сводка словами", diffSummary(wikiDiff).startsWith("убрано строк 1"), true);
+check(
+  "сравнение: длинное сравнение обрезается, текст — нет",
+  formatDiff(textDiff("", Array.from({ length: 200 }, (_, i) => `n${i}`).join("\n")), 10).includes("новый текст целиком ниже"),
+  true,
+);
+
+// ── разметка, аудитория, доступ ───────────────────────────────────────
+check("разметка: html без тегов — предупреждение", markupWarning("html", "Просто текст") !== null, true);
+check("разметка: html с тегами — без замечаний", markupWarning("html", "<p>Текст</p>"), null);
+check("разметка: textile с HTML — предупреждение", (markupWarning("textile", "<p>Текст</p>") ?? "").includes("теги"), true);
+check("разметка: не задана — подсказка detect-markup", (markupWarning(undefined, "<p>x</p>") ?? "").includes("detect-markup"), true);
+check("аудитория: публичный проект — строгая проверка", wikiAudience(true, "internal").audience, "client");
+check("аудитория: публичный — сказано, что internal не применён", (wikiAudience(true, "internal").note ?? "").includes("не применён"), true);
+check("аудитория: закрытый проект — по флагу", wikiAudience(false, "internal").audience, "internal");
+check("аудитория: по умолчанию — заказчик", wikiAudience(false, undefined), { audience: "client", note: null });
+check("доступ: публичный — видят все с учётной записью", describeWikiAccess(true).includes("все пользователи с учётной записью"), true);
+
+// ── предпросмотр правки страницы ──────────────────────────────────────
+const pageV7: WikiPage = {
+  title: "Как_подать",
+  parent: { title: "Поддержка" },
+  version: 7,
+  text: wikiBefore,
+  author: { id: 5, name: "Светлана Кудрина" },
+  comments: "",
+  created_on: "2021-10-29T15:41:41Z",
+  updated_on: "2026-09-01T09:00:00Z",
+};
+const wikiCtx: WikiUpdateContext = {
+  instance: "ru",
+  project: { id: 3078, name: "Общая информация", identifier: "public_information", isPublic: true },
+  title: "Как_подать",
+  requested: "Как_подать",
+  url: "https://r.example/projects/public_information/wiki/Как_подать",
+  current: pageV7,
+  text: wikiAfter,
+  comment: "Новый порядок",
+  markup: "html",
+  audience: "client",
+  audienceNote: null,
+  warnings: 0,
+  rights: { state: "yes", roles: ["Менеджер"] },
+};
+const wikiPreviewText = wikiUpdatePreview(wikiCtx);
+check("предпросмотр wiki: проект", wikiPreviewText.includes("«Общая информация» (public_information, id=3078)"), true);
+check(
+  "предпросмотр wiki: текущая версия и автор",
+  lineOf(wikiPreviewText, "Сейчас").includes("версия 7") && lineOf(wikiPreviewText, "Сейчас").includes("Светлана Кудрина"),
+  true,
+);
+check("предпросмотр wiki: станет версия 8", lineOf(wikiPreviewText, "Станет").includes("версия 8"), true);
+check("предпросмотр wiki: публичный проект назван", lineOf(wikiPreviewText, "Доступ").includes("ПУБЛИЧНЫЙ"), true);
+check("предпросмотр wiki: новый текст целиком", wikiPreviewText.includes(wikiAfter.trimEnd()), true);
+check("предпросмотр wiki: сравнение с текущей", wikiPreviewText.includes("ИЗМЕНЕНИЯ ОТНОСИТЕЛЬНО ВЕРСИИ 7: убрано строк 1"), true);
+check("предпросмотр wiki: откат возможен", wikiPreviewText.includes("Откатить к данной версии"), true);
+check("предпросмотр wiki: защита от одновременной правки", wikiPreviewText.includes("Redmine откажет (409)"), true);
+check("предпросмотр wiki: комментарий к версии", lineOf(wikiPreviewText, "Комментарий").includes("Новый порядок"), true);
+check("предпросмотр wiki: права", lineOf(wikiPreviewText, "Права").includes("«Менеджер»"), true);
+const newPageText = wikiUpdatePreview({
+  ...wikiCtx,
+  current: null,
+  title: "Новая_страница",
+  requested: "новая страница",
+  project: { ...wikiCtx.project, isPublic: false },
+});
+check("предпросмотр wiki: новая страница названа", newPageText.includes("будет создана новая страница «Новая_страница»"), true);
+check(
+  "предпросмотр wiki: название приведено к виду Redmine",
+  lineOf(newPageText, "Название").includes("«новая страница» → «Новая_страница»"),
+  true,
+);
+check("предпросмотр wiki: у новой страницы нет сравнения", newPageText.includes("ИЗМЕНЕНИЯ"), false);
+check("предпросмотр wiki: закрытый проект", lineOf(newPageText, "Доступ").includes("участники проекта"), true);
+check(
+  "предпросмотр wiki: страница найдена в другом регистре",
+  lineOf(wikiUpdatePreview({ ...wikiCtx, requested: "как_ПОДАТЬ" }), "Название").includes("найдена под названием «Как_подать»"),
+  true,
+);
+check("предпросмотр wiki: предупреждение о разметке", wikiUpdatePreview({ ...wikiCtx, text: "без тегов" }).includes("нет ни одного HTML-тега"), true);
+
+// ── версия страницы между предпросмотром и записью ────────────────────
+check("версия: совпадает — можно писать", wikiBaseMismatch(7, pageV7, "wiki-update"), null);
+check("версия: новой страницы всё ещё нет — можно писать", wikiBaseMismatch(0, null, "wiki-update"), null);
+check("версия: страницу изменили", (wikiBaseMismatch(6, pageV7, "wiki-update") ?? "").includes("сейчас версия 7"), true);
+check("версия: подсказка с новой версией", (wikiBaseMismatch(6, pageV7, "wiki-update") ?? "").includes("--base-version 7"), true);
+check("версия: страницу успели создать", (wikiBaseMismatch(0, pageV7, "wiki-update") ?? "").includes("страницы не было"), true);
+check("версия: страницу удалили", (wikiBaseMismatch(7, null, "wiki-update") ?? "").includes("удалили"), true);
+
+// ── сверка после записи страницы ──────────────────────────────────────
+const writtenPage: WikiPage = { ...pageV7, version: 8, text: wikiAfter.replace(/\n/g, "\r\n"), comments: "Новый порядок" };
+check(
+  "сверка wiki: версия выросла, текст и комментарий совпали",
+  checkWikiWrite(writtenPage, { text: wikiAfter, comment: "Новый порядок", previousVersion: 7 }).ok,
+  true,
+);
+check(
+  "сверка wiki: новой версии нет",
+  checkWikiWrite(pageV7, { text: wikiAfter, comment: undefined, previousVersion: 7 }).text.includes("новой версии нет"),
+  true,
+);
+check(
+  "сверка wiki: текст другой",
+  checkWikiWrite({ ...writtenPage, text: "<p>иное</p>" }, { text: wikiAfter, comment: undefined, previousVersion: 7 }).text.includes(
+    "текст на странице отличается",
+  ),
+  true,
+);
+check(
+  "сверка wiki: страница уже была — записано поверх",
+  checkWikiWrite({ ...writtenPage, version: 3 }, { text: wikiAfter, comment: undefined, previousVersion: null }).text.includes(
+    "страница уже существовала",
+  ),
+  true,
+);
+check(
+  "сверка wiki: страница создана",
+  checkWikiWrite({ ...writtenPage, version: 1 }, { text: wikiAfter, comment: undefined, previousVersion: null }).text.includes("страница создана"),
+  true,
+);
+check("сверка wiki: страница не читается", checkWikiWrite(null, { text: wikiAfter, comment: undefined, previousVersion: 7 }).ok, false);
+
+// ── отказы по wiki ────────────────────────────────────────────────────
+const wikiRefusal = { project: "«Общая информация» (public_information, id=3078)", page: "Как_подать", version: 7 };
+const wikiExplained = (status: number, details: string[], action: "list" | "read" | "version" | "update"): string =>
+  explainWikiRejection(status, details, { action, ...wikiRefusal }) ?? "";
+check("отказ wiki 409: чужая правка цела", wikiExplained(409, [], "update").includes("чужая правка цела"), true);
+check("отказ wiki 422: пустой текст", wikiExplained(422, ["Текст не может быть пустым"], "update").includes("текст страницы пуст"), true);
+check(
+  "отказ wiki 422: длинный комментарий",
+  wikiExplained(422, ["Комментарий слишком длинный (не может быть больше 1024 символа)"], "update").includes("длиннее 1024"),
+  true,
+);
+check("отказ wiki 403: запись — право редактирования", wikiExplained(403, [], "update").includes("«Редактирование wiki-страниц»"), true);
+check("отказ wiki 403: запись — защищённая страница", wikiExplained(403, [], "update").includes("«Блокирование wiki-страниц»"), true);
+check("отказ wiki 403: версии — право истории", wikiExplained(403, [], "version").includes("«Просмотр истории Wiki»"), true);
+check("отказ wiki 403: список — модуль или право", wikiExplained(403, [], "list").includes("модуль «Wiki»"), true);
+check("отказ wiki 404: нет wiki", wikiExplained(404, [], "list").includes("нет wiki"), true);
+check("отказ wiki 404: нет версии", wikiExplained(404, [], "version").includes("Версии 7"), true);
+check("отказ wiki: прочее не объясняется", explainWikiRejection(500, [], { action: "update", ...wikiRefusal }), null);
+
+// ── дерево страниц и история версий ───────────────────────────────────
+const wikiIndexFixture = [
+  { title: "Главная", version: 5 },
+  { title: "Как_подать", parent: { title: "Поддержка" }, version: 1 },
+  { title: "Поддержка", parent: { title: "Главная" }, version: 6 },
+  { title: "Сирота", parent: { title: "Удалённая" }, version: 1 },
+];
+check(
+  "дерево wiki: родитель → дочерние, страница без видимого родителя — в корне",
+  wikiTree(wikiIndexFixture).map((x) => `${x.depth}:${x.page.title}`),
+  ["0:Главная", "1:Поддержка", "2:Как_подать", "0:Сирота"],
+);
+const historyRows = wikiHistoryRows([
+  { version: 3, page: { ...pageV7, version: 3, text: "abcdef", comments: "правка" }, state: "ok" },
+  { version: 2, page: null, state: "missing" },
+  { version: 1, page: { ...pageV7, version: 1, text: "abcd", comments: "" }, state: "ok" },
+]);
+check("история wiki: изменение объёма к предыдущей видимой версии", historyRows[0]?.[3], "6 (+2)");
+check("история wiki: удалённая версия", historyRows[1]?.[4], "(версия удалена)");
+check("история wiki: у первой версии изменения нет", historyRows[2]?.[3], "4");
+
+// ── закрытие и открытие проекта ───────────────────────────────────────
+check("закрытие: разбор", readProjectStatusArgs(parseArgs(["close-project", "ai-testing", "--yes"])), { project: "ai-testing" });
+checkThrows("закрытие: без проекта", () => readProjectStatusArgs(parseArgs(["close-project"])));
+checkThrows("закрытие: название из двух слов без кавычек", () => readProjectStatusArgs(parseArgs(["close-project", "Lead", "agent"])));
+check("закрытие: запрос", projectStatusRequest(9, "close"), { method: "PUT", path: "projects/9/close.json" });
+check("открытие: запрос", projectStatusRequest(9, "reopen"), { method: "PUT", path: "projects/9/reopen.json" });
+checkThrows("закрытие: номер проекта должен быть положительным", () => projectStatusRequest(0, "close"));
+check("статусы проекта словами", [1, 5, 9].map((s) => describeProjectStatus(s)), ["открыт (действующий)", "закрыт — только чтение", "в архиве"]);
+check("статус «закрыт» — код 5", PROJECT_STATUS.closed, 5);
+
+// Redmine закрывает self_and_descendants: подпроект второго уровня закроется так же, как дочерний.
+const projectTreeFixture = [
+  { id: 1, name: "Корень" },
+  { id: 2, name: "Дочерний", parent: { id: 1 } },
+  { id: 3, name: "Внук", parent: { id: 2 } },
+  { id: 4, name: "Чужой" },
+  { id: 5, name: "Второй дочерний", parent: { id: 1 } },
+];
+check("подпроекты: всё дерево, а не только дети", projectDescendants(projectTreeFixture, 1).map((p) => p.id), [2, 5, 3]);
+check("подпроекты: у листа их нет", projectDescendants(projectTreeFixture, 3), []);
+
+const closer: RoleInfo = { id: 3, name: "Менеджер", permissions: ["close_project", "edit_wiki_pages"] };
+const editor: RoleInfo = { id: 4, name: "Исполнитель", permissions: ["edit_wiki_pages"] };
+const rights = (roles: RoleInfo[] | null, permission: string, isPublic: boolean, requiresMember: boolean, admin = false) =>
+  rightsFromRoles({ admin, roles, permission, isPublic, requiresMember });
+check("права: администратор", rights(null, "close_project", false, true, true).state, "admin");
+check("права: роль даёт право", rights([closer, editor], "close_project", false, true), { state: "yes", roles: ["Менеджер"] });
+check("права: роли права не дают", rights([editor], "close_project", false, true).state, "no");
+check("права: права роли не видны", rights([{ id: 7, name: "Особая", permissions: null }], "close_project", false, true).state, "unknown");
+check("права: не участник — закрыть нельзя", rights(null, "close_project", true, true).state, "no");
+check("права: не участник публичного — wiki решает роль «Не участник»", rights(null, "edit_wiki_pages", true, false).state, "unknown");
+check("права словами: отказ назван заранее", rightsText({ state: "no", roles: ["Исполнитель"] }, CLOSE_PERMISSION).includes("Redmine откажет"), true);
+
+const statusCtx: ProjectStatusContext = {
+  instance: "company",
+  action: "close",
+  project: { id: 1, name: "Корень", identifier: "koren", url: "https://r.example/projects/koren", status: 1 },
+  affected: [
+    { name: "Дочерний", identifier: "doch" },
+    { name: "Внук", identifier: "vnuk" },
+  ],
+  unchanged: [{ name: "Старый", identifier: "stary" }],
+  closedParent: null,
+  rights: { state: "yes", roles: ["Менеджер"] },
+};
+const closeText = projectStatusPreview(statusCtx);
+check("предпросмотр закрытия: подпроекты закроются", lineOf(closeText, "Подпроекты").includes("закроются вместе с ним (2)"), true);
+check("предпросмотр закрытия: уже закрытые останутся", lineOf(closeText, "Уже закрыты").includes("останутся закрытыми"), true);
+check("предпросмотр закрытия: только чтение", closeText.includes("только для чтения"), true);
+check("предпросмотр закрытия: задачи не создаются и не меняются", closeText.includes("задачи нельзя создавать, менять"), true);
+check("предпросмотр закрытия: время не списывается", closeText.includes("списывать время нельзя"), true);
+check("предпросмотр закрытия: невидимые подпроекты тоже", closeText.includes("невидимые владельцу ключа"), true);
+check("предпросмотр закрытия: как открыть обратно", closeText.includes("reopen-project koren --instance company"), true);
+check("предпросмотр закрытия: нужное право", closeText.includes(CLOSE_PERMISSION), true);
+check("предпросмотр закрытия: путь в интерфейсе", closeText.includes(projectStatusUiPath("close")), true);
+check(
+  "предпросмотр закрытия: без подпроектов",
+  lineOf(projectStatusPreview({ ...statusCtx, affected: [], unchanged: [] }), "Подпроекты").includes("нет"),
+  true,
+);
+const reopenText = projectStatusPreview({
+  ...statusCtx,
+  action: "reopen",
+  project: { ...statusCtx.project, status: 5 },
+  unchanged: [],
+  closedParent: { name: "Родитель", identifier: "rod" },
+});
+check("предпросмотр открытия: подпроекты откроются", lineOf(reopenText, "Подпроекты").includes("откроются вместе с ним (2)"), true);
+check("предпросмотр открытия: и закрытые отдельно раньше", reopenText.includes("отдельно раньше"), true);
+check("предпросмотр открытия: закрытый родитель останется закрытым", lineOf(reopenText, "Родитель").includes("останется закрытым"), true);
+
+check("отказ закрытия 403: право и роль", (explainProjectStatusRejection("close", 403, "«Корень»") ?? "").includes("«Менеджер»"), true);
+check("отказ закрытия 404: только интерфейс", (explainProjectStatusRejection("close", 404, "«Корень»") ?? "").includes("«Сделать закрытым»"), true);
+check("отказ закрытия 404: ничего не изменено", (explainProjectStatusRejection("close", 404, "«Корень»") ?? "").includes("Ничего не изменено"), true);
+check("отказ открытия 404: кнопка открытия", (explainProjectStatusRejection("reopen", 404, "«Корень»") ?? "").includes("«Сделать открытым»"), true);
+check("отказ закрытия: прочее не объясняется", explainProjectStatusRejection("close", 500, "«Корень»"), null);
+
+check("сверка закрытия: всё закрыто", checkProjectStatus("close", 5, [{ name: "Дочерний", status: 5 }]).ok, true);
+check("сверка закрытия: подпроект открыт — расхождение", checkProjectStatus("close", 5, [{ name: "Дочерний", status: 1 }]).text.includes("РАСХОЖДЕНИЕ"), true);
+check("сверка открытия: проект всё ещё закрыт", checkProjectStatus("reopen", 5, []).ok, false);
+check(
+  "сверка: не удалось перечитать — сказано, но не расхождение",
+  checkProjectStatus("close", 5, [{ name: "Дочерний", status: null }]),
+  { ok: true, text: "Сверка: статус проекта — закрыт — только чтение; подпроекты закрыты: 0 из 1 (не удалось перечитать: «Дочерний»)." },
+);
+
+// ── ключ API не уходит в вывод ────────────────────────────────────────
+{
+  // Ответ Redmine на users/current.json несёт ключ владельца: он не должен дожить до вывода.
+  const raw = JSON.parse(
+    '{"id":5,"login":"ivanov","firstname":"Иван","lastname":"Иванов","mail":"i@example.com","admin":false,"api_key":"0123456789abcdef0123456789abcdef01234567","last_login_on":"2026-09-23T10:00:00Z"}',
+  ) as Parameters<typeof safeCurrentUser>[0];
+  const safe = safeCurrentUser(raw);
+  check("whoami: ключа API нет в объекте пользователя", Object.keys(safe).includes("api_key"), false);
+  check("whoami: ключа API нет в выводе --json", JSON.stringify(safe).includes("0123456789abcdef"), false);
+  check("whoami: известные поля сохранены", safe, { id: 5, login: "ivanov", firstname: "Иван", lastname: "Иванов", mail: "i@example.com", admin: false });
+}
 
 // ── итог ──────────────────────────────────────────────────────────────
 console.log(`Проверок пройдено: ${passed}`);
