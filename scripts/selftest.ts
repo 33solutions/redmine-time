@@ -9,6 +9,7 @@ import { scanText, guard } from "./guard.ts";
 import { buildSessions, buildGroups, plural, draftDescription, type Commit } from "./harvest.ts";
 import { categorize, monthsSince } from "./redmine.ts";
 import { translit, slugIdentifier, identifierProblem } from "./redmine.ts";
+import { explainTimeEntryRejection } from "./redmine.ts";
 import { parseFieldSpec, assignProjectFields, type ProjectField } from "./redmine.ts";
 import { dayTotals, loadWarnings, reconcileHours } from "./redmine.ts";
 import {
@@ -1566,6 +1567,32 @@ check(
   check("whoami: ключа API нет в объекте пользователя", Object.keys(safe).includes("api_key"), false);
   check("whoami: ключа API нет в выводе --json", JSON.stringify(safe).includes("0123456789abcdef"), false);
   check("whoami: известные поля сохранены", safe, { id: 5, login: "ivanov", firstname: "Иван", lastname: "Иванов", mail: "i@example.com", admin: false });
+}
+
+// ── объяснение отказа 422 по записи времени ───────────────────────────
+{
+  const one = (line: string): string => explainTimeEntryRejection([line])[0] ?? "";
+  const has = (line: string, word: string): boolean => one(line).includes(word);
+
+  // Ярлык приходит на языке учётной записи Redmine, а не скилла: оба должны узнаваться.
+  check("422: Comment cannot be blank узнаётся", has("Comment cannot be blank", "--comment"), true);
+  check("422: Комментарий не может быть пустым узнаётся", has("Комментарий не может быть пустым", "--comment"), true);
+  check("422: Activity cannot be blank узнаётся", has("Activity cannot be blank", "--activity"), true);
+  check("422: Вид деятельности узнаётся", has("Вид деятельности не может быть пустым", "--activity"), true);
+  check("422: Date is invalid узнаётся", has("Date is invalid", "--date"), true);
+  check("422: Дата имеет неверное значение узнаётся", has("Дата имеет неверное значение", "--date"), true);
+
+  // Главное свойство: по вхождению подстроки не сопоставляем. Пользовательское поле
+  // «Часы по договору» этим CLI не отправляется вовсе, и совет «задайте --hours»
+  // отправил бы человека по кругу — при уже заданных часах.
+  check("422: пользовательское поле не выдаётся за --hours", explainTimeEntryRejection(["Часы по договору не может быть пустым"]).length, 0);
+  check("422: пользовательское поле не выдаётся за --comment", explainTimeEntryRejection(["Комментарий руководителя не может быть пустым"]).length, 0);
+  check("422: незнакомое сообщение остаётся без догадок", explainTimeEntryRejection(["Something else went wrong"]).length, 0);
+
+  // Одинаковые подсказки не дублируются, разные — сохраняются в порядке появления.
+  check("422: повтор одного поля даёт одну подсказку", explainTimeEntryRejection(["Comment cannot be blank", "Комментарий не может быть пустым"]).length, 1);
+  check("422: два поля дают две подсказки", explainTimeEntryRejection(["Activity cannot be blank", "Comment cannot be blank"]).length, 2);
+  check("422: пустой список отказов — пустой ответ", explainTimeEntryRejection([]).length, 0);
 }
 
 // ── итог ──────────────────────────────────────────────────────────────
