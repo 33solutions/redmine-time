@@ -22,6 +22,16 @@ type Instance = {
   projectAliases?: Record<string, string>;
   /** Разметка описаний и комментариев: textile (по умолчанию), markdown или html. */
   markup?: "textile" | "markdown" | "html";
+  /**
+   * Контур требует непустой комментарий к записи времени.
+   *
+   * В ядре Redmine комментарий необязателен, но инстанс может сделать его обязательным
+   * доработкой. Тогда пустой комментарий отвергается на сервере сообщением «Комментарий
+   * не может быть пустым», в котором не сказано, какой флаг чинить. Признак ставится
+   * по замеру самого контура, а не по общему соображению: у 33solutions.ru комментарий
+   * обязателен, у 33solutions.company — нет.
+   */
+  requireComment?: boolean;
 };
 
 type ConfigFile = {
@@ -84,6 +94,7 @@ async function readConfigFile(): Promise<ConfigFile | null> {
         : undefined,
       markup:
         value.markup === "textile" || value.markup === "markdown" || value.markup === "html" ? value.markup : undefined,
+      requireComment: value.requireComment === true,
     };
   }
   const repos: Record<string, RepoBinding> = {};
@@ -622,8 +633,26 @@ async function resolveAssignee(
   return matchByName(members, raw, "Исполнитель").id;
 }
 
+/**
+ * Номер задачи из флага командной строки.
+ *
+ * Number("abc") даёт NaN, JSON.stringify превращает NaN в null, а Redmine понимает null
+ * как «родителя нет» или «задача не указана» и отвечает 201. Опечатка в номере молча
+ * выдёргивала задачу из дерева или отвязывала часы от задачи, а команда рапортовала успех.
+ */
+function issueNumber(value: string, flag: string): number {
+  const raw = value.trim().replace(/^#/, "");
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new UserError(`${flag}: нужен номер задачи числом, получено "${value}".`);
+  }
+  return parsed;
+}
+
 async function resolveActivityId(rm: Resolved, value: string | undefined): Promise<number | undefined> {
-  const wanted = value ?? rm.defaultActivity;
+  // Пустая строка — не «значение не задано»: без обрезки --activity "" молча отбрасывал
+  // и аргумент, и умолчание из профиля, а поле просто не уходило в Redmine.
+  const wanted = (value ?? "").trim() || rm.defaultActivity;
   if (!wanted) return undefined;
   return matchByName(await activities(rm), wanted, "Вид деятельности").id;
 }
@@ -5140,7 +5169,7 @@ async function cmdCreateIssue(rm: Resolved, args: Args): Promise<void> {
   const estimated = str(args, "estimated");
   if (estimated) payload.estimated_hours = round2(parseHours(estimated));
   const parent = str(args, "parent");
-  if (parent) payload.parent_issue_id = Number(parent.replace("#", ""));
+  if (parent) payload.parent_issue_id = issueNumber(parent, "--parent");
   const done = num(args, "done");
   if (done !== undefined) payload.done_ratio = done;
 
@@ -5176,7 +5205,7 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   const subject = str(args, "subject");
   if (subject) patch.subject = subject;
   const parent = str(args, "parent");
-  if (parent) patch.parent_issue_id = Number(parent.replace("#", ""));
+  if (parent) patch.parent_issue_id = issueNumber(parent, "--parent");
   const estimated = str(args, "estimated");
   // «none» и «0» снимают оценку: Redmine очищает поле пустой строкой.
   if (estimated) {
@@ -6369,6 +6398,149 @@ async function buildEntryPayload(rm: Resolved, input: LogInput): Promise<Record<
   return te;
 }
 
+/**
+ * Поля записи времени, о которых Redmine может отказать, и что с этим делать.
+ *
+ * Сравнение идёт по ЦЕЛОМУ ярлыку поля с начала строки, а не по вхождению подстроки:
+ * контур, доработанный настолько, что комментарий стал обязательным, может иметь и
+ * обязательное пользовательское поле вида «Часы по договору». По подстроке такой отказ
+ * получил бы подсказку «укажите --hours» при уже указанных часах — то есть человека
+ * отправили бы по кругу. Пользовательских полей у записей времени этот CLI не отправляет
+ * вовсе, поэтому честный ответ на непонятое поле — показать текст службы как есть.
+ *
+ * Ярлык приходит на языке учётной записи Redmine, а не на языке скилла: отсюда два списка.
+ */
+const TIME_ENTRY_FIELDS: ReadonlyArray<{ readonly labels: readonly string[]; readonly hint: string }> = [
+  {
+    labels: ["comment", "comments", "комментарий"],
+    hint:
+      'комментарий к записи обязателен на этом контуре: задайте --comment "что сделано" или --comment-file <файл>. ' +
+      'Чтобы скилл предупреждал об этом до отправки, добавьте в профиль инстанса "requireComment": true',
+  },
+  {
+    labels: ["activity", "вид деятельности"],
+    hint: "вид деятельности не подставился: задайте --activity <имя> или defaultActivity в профиле инстанса (список: redmine.ts activities)",
+  },
+  {
+    labels: ["date", "spent on", "дата"],
+    hint: "дата не принята: задайте --date YYYY-MM-DD",
+  },
+  {
+    labels: ["hours", "часы"],
+    hint: "часы не приняты: задайте --hours (2, 2.5, 1h30, 90m)",
+  },
+  {
+    labels: ["issue", "задача"],
+    hint: "задача не принята: номер не существует, задача в другом проекте или у неё выключен учёт времени — проверьте --issue",
+  },
+  {
+    labels: ["project", "проект"],
+    hint: "проект не принят: чаще всего это не опечатка в --project, а выключенный у проекта модуль учёта времени",
+  },
+];
+
+/**
+ * Формулировки Redmine, по которым отделяется ярлык поля от самой претензии.
+ * Нужны именно для отделения: «Часы по договору не может быть пустым» начинается со слова
+ * «Часы», и сравнение по началу строки приняло бы пользовательское поле за наши часы.
+ */
+const TIME_ENTRY_MESSAGES: readonly string[] = [
+  "cannot be blank",
+  "can't be blank",
+  "is invalid",
+  "is not a valid date",
+  "не может быть пустым",
+  "не может быть пустой",
+  "имеет неверное значение",
+  "неверно",
+];
+
+/**
+ * Отказ 422 по записи времени человеческим языком. Догадок не строит: непонятое сообщение
+ * возвращается пустым списком, а исходный текст службы показывается вызывающей стороной.
+ *
+ * Ярлык поля вычисляется вычитанием известной претензии из конца строки и сравнивается
+ * ЦЕЛИКОМ. Совпадение по вхождению или по началу строки здесь недопустимо: оно уверенно
+ * называет флаг там, где поля у этого CLI нет вовсе.
+ */
+export function explainTimeEntryRejection(details: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const line of details) {
+    const low = line.trim().toLowerCase().replace(/\s+/g, " ");
+    const message = TIME_ENTRY_MESSAGES.find((m) => low.endsWith(" " + m));
+    if (message === undefined) continue;
+    const label = low.slice(0, low.length - message.length).trim();
+    const found = TIME_ENTRY_FIELDS.find((f) => f.labels.includes(label));
+    if (found && !out.includes(found.hint)) out.push(found.hint);
+  }
+  return out;
+}
+
+/**
+ * Обёртка вокруг записи времени. Ошибка службы не подменяется и не правится на месте
+ * в request(): туда подсказку класть нельзя — её текст попадёт в details, а их читает
+ * разбор отказов wiki, который ищет слово «комментарий» первой же веткой.
+ */
+async function withTimeEntryErrors<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 422) {
+      const hints = explainTimeEntryRejection(e.details);
+      if (hints.length > 0) {
+        throw new UserError(`${e.message}\n\nЧто это значит:\n${hints.map((x) => "  " + x).join("\n")}`);
+      }
+    }
+    throw e;
+  }
+}
+
+/**
+ * Комментарий к записи времени из трёх источников. Порядок объявлен здесь и повторён
+ * в справке: --comment-file важнее --comment, --comment важнее псевдонима --message.
+ *
+ * Соглашение остальных файловых флагов — отдавать текст дословно, потому что они питают
+ * многострочные тела описаний и страниц. Здесь оно нарушено намеренно: комментарий записи
+ * времени — одна строка, а Bun.file().text() сохраняет хвостовой перевод строки, и тот
+ * ушёл бы в Redmine, разъехавшись потом в таблицах отчётов. Не «чинить» обратно.
+ */
+async function commentArg(args: Args): Promise<string> {
+  const file = str(args, "comment-file");
+  if (file !== undefined) {
+    const text = (await readTextFile(file, "Комментарий")).trim();
+    if (text === "") {
+      throw new UserError(`Комментарий: файл ${file} пуст. Пустой файл — не то же самое, что отсутствие флага.`);
+    }
+    if (/[\r\n]/.test(text)) {
+      throw new UserError("Комментарий к записи времени — одна строка, а в файле их несколько.");
+    }
+    return text;
+  }
+  return str(args, "comment") ?? str(args, "message") ?? "";
+}
+
+/** Задан ли комментарий хоть одним из трёх способов — отдельно от того, что в нём. */
+function commentGiven(args: Args): boolean {
+  return args.flags.has("comment-file") || args.flags.has("comment") || args.flags.has("message");
+}
+
+/**
+ * Пустой комментарий там, где контур его требует.
+ *
+ * Отдельная оговорка про PowerShell: он молча выбрасывает пустой строковый аргумент,
+ * поэтому `--comment ""` доходит до скилла как флаг без значения. Человеку это надо
+ * сказать, иначе он видит «комментарий пуст» там, где только что его напечатал.
+ */
+function ensureComment(rm: Resolved, comment: string, where: string): void {
+  if (!rm.requireComment || comment.trim() !== "") return;
+  throw new UserError(
+    `${where}: на контуре ${rm.name} комментарий к записи времени обязателен.\n` +
+      '  Задайте --comment "что сделано" или --comment-file <файл>.\n' +
+      "  Если комментарий вы указывали: PowerShell выбрасывает пустое значение аргумента, " +
+      "а в кириллице ошибиться кодировкой проще всего — надёжнее --comment-file.",
+  );
+}
+
 async function postEntry(rm: Resolved, payload: Record<string, unknown>): Promise<TimeEntry> {
   const r = await request<{ time_entry: TimeEntry }>(rm, "POST", "time_entries.json", undefined, {
     time_entry: payload,
@@ -6393,7 +6565,7 @@ async function cmdLog(rm: Resolved, args: Args): Promise<void> {
     project: str(args, "project") ?? (issue === undefined ? rm.defaultProject : undefined),
     hours: parseHours(required(args, "hours")),
     date: parseDate(str(args, "date") ?? "today"),
-    comment: str(args, "comment") ?? str(args, "message") ?? "",
+    comment: await commentArg(args),
     activityId: await resolveActivityId(rm, str(args, "activity")),
   };
   const payload = await buildEntryPayload(rm, input);
@@ -6413,10 +6585,16 @@ async function cmdLog(rm: Resolved, args: Args): Promise<void> {
       ["Вид деятельности", activityName],
       ["Комментарий", String(payload.comments || "—")],
     ]) +
-    (warnings.length > 0 ? `\n\nПРОВЕРКА ПРАВДОПОДОБИЯ:\n${warnings.map((w) => `  ${w}`).join("\n")}` : "");
+    (warnings.length > 0 ? `\n\nПРОВЕРКА ПРАВДОПОДОБИЯ:\n${warnings.map((w) => `  ${w}`).join("\n")}` : "") +
+    // Возражение показывается в предпросмотре, а не бросается до него: --dry-run существует
+    // как раз для того, чтобы посмотреть разбор часов и даты, ничего не отправляя.
+    (rm.requireComment && input.comment.trim() === ""
+      ? "\n\nОТПРАВКА НЕ ПРОЙДЁТ: на этом контуре комментарий обязателен, а он пуст."
+      : "");
   if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
 
-  const entry = await postEntry(rm, payload);
+  ensureComment(rm, input.comment, "Списание часов");
+  const entry = await withTimeEntryErrors(() => postEntry(rm, payload));
   emit(entry, () => `Записано: ${describeEntry(rm, entry)}`);
 }
 
@@ -6455,6 +6633,20 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
     );
   }
 
+  // Пустые комментарии перечисляются все сразу и до предпросмотра: иначе человек правит
+  // файл на сорок записей по одной ошибке за прогон, а часть записей уже уйдёт в Redmine.
+  if (rm.requireComment) {
+    const blank = payloads
+      .map((p, i) => (String(p.comments ?? "").trim() === "" ? i + 1 : 0))
+      .filter((i) => i > 0);
+    if (blank.length > 0) {
+      throw new UserError(
+        `На контуре ${rm.name} комментарий к записи времени обязателен, а он пуст в записях: ${blank.join(", ")}. ` +
+          `Допишите поле "comment" и повторите — ни одна запись не отправлена.`,
+      );
+    }
+  }
+
   const total = payloads.reduce((sum, p) => sum + Number(p.hours), 0);
   checkOutgoing(
     Object.fromEntries(payloads.map((p, i) => [`запись ${i + 1}`, String(p.comments ?? "")])),
@@ -6490,7 +6682,7 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
   const failed: { index: number; error: string }[] = [];
   for (const [index, payload] of payloads.entries()) {
     try {
-      created.push(await postEntry(rm, payload));
+      created.push(await withTimeEntryErrors(() => postEntry(rm, payload)));
     } catch (e) {
       failed.push({ index, error: e instanceof Error ? e.message : String(e) });
     }
@@ -6747,12 +6939,17 @@ async function cmdEdit(rm: Resolved, args: Args): Promise<void> {
   if (hours) patch.hours = round2(parseHours(hours));
   const date = str(args, "date");
   if (date) patch.spent_on = parseDate(date);
-  const comment = str(args, "comment");
-  if (comment !== undefined) patch.comments = comment;
+  // Различие несущее: без --comment команда правит только часы или дату и комментарий
+  // не трогает, а --comment "" — это намеренная попытка стереть пояснение.
+  const comment = commentGiven(args) ? await commentArg(args) : undefined;
+  if (comment !== undefined) {
+    ensureComment(rm, comment, "Правка записи");
+    patch.comments = comment;
+  }
   const activity = str(args, "activity");
   if (activity) patch.activity_id = await resolveActivityId(rm, activity);
   const issue = str(args, "issue");
-  if (issue) patch.issue_id = Number(issue.replace("#", ""));
+  if (issue) patch.issue_id = issueNumber(issue, "--issue");
   if (Object.keys(patch).length === 0) {
     throw new UserError("Нечего менять: задайте --hours/--date/--comment/--activity/--issue.");
   }
@@ -6764,7 +6961,7 @@ async function cmdEdit(rm: Resolved, args: Args): Promise<void> {
     table(Object.entries(patch).map(([k, v]) => [k, String(v)]));
   if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
 
-  await request(rm, "PUT", `time_entries/${id}.json`, undefined, { time_entry: patch });
+  await withTimeEntryErrors(() => request(rm, "PUT", `time_entries/${id}.json`, undefined, { time_entry: patch }));
   const r = await request<{ time_entry: TimeEntry }>(rm, "GET", `time_entries/${id}.json`);
   emit(r.time_entry, () => `Обновлено: ${describeEntry(rm, r.time_entry)}`);
 }
@@ -6882,7 +7079,9 @@ Wiki проекта
   update-issue <id> [--status имя] [--done N] [--note текст] [--assignee me|id|имя] [--due дата] [--dry-run]
 
 Трудозатраты
-  log --issue N --hours 2.5 [--date today|YYYY-MM-DD|-1] [--comment "..."] [--activity имя] [--dry-run]
+  log --issue N --hours 2.5 [--date today|YYYY-MM-DD|-1] [--comment "..."|--comment-file f] [--activity имя] [--dry-run]
+        источники комментария по старшинству: --comment-file, затем --comment, затем --message;
+        на контуре с "requireComment": true пустой комментарий отклоняется до отправки
   batch [--file entries.json | stdin] [--dry-run]
         JSON-массив: [{"issue":1234,"hours":"1h30","date":"2026-09-21","comment":"...","activity":"Разработка"}]
   entries [--period week|last-week|month|last-month|YYYY-MM|A..B] [--from --to]
