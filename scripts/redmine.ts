@@ -10,6 +10,7 @@
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { guard, scanText, formatFindings, type Audience, type Finding } from "./guard.ts";
 import { harvestRepo, isGitRepo, repoName, draftDescription, plural, type RepoBinding } from "./harvest.ts";
+import { sessionFiles, readHumanMessages, buildBlocks, summarize, localDay, localTime } from "./sessions.ts";
 
 // ─────────────────────────────── конфиг ───────────────────────────────
 
@@ -5839,6 +5840,93 @@ async function cmdRepos(args: Args): Promise<void> {
   );
 }
 
+/**
+ * Присутствие по транскриптам сессий.
+ *
+ * Отдаёт замер, а не готовое списание: раскладывать блоки по задачам должен человек. Привязка
+ * сообщений к темам по датам и ключевым словам — настройка под один проект, а не метод, и в скилле
+ * ей не место: она уверенно разложит чужую работу по чужим темам.
+ */
+async function cmdSessions(args: Args): Promise<void> {
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
+  const gap = num(args, "gap") ?? 90;
+  const files = await sessionFiles(home);
+  if (files.length === 0) {
+    throw new UserError(`Транскрипты сессий не найдены: ${home}/.claude/projects/*/*.jsonl`);
+  }
+
+  const { messages, duplicates } = await readHumanMessages(files);
+  const periodArg = str(args, "period");
+  const [from, to] = periodArg ? parsePeriod(periodArg) : ["0000-00-00", "9999-99-99"];
+  const inRange = messages.filter((m) => {
+    const day = localDay(m.ts);
+    return day >= from && day <= to;
+  });
+  if (inRange.length === 0) {
+    throw new UserError(
+      `За ${periodArg ?? "всё время"} сообщений человека не нашлось. ` +
+        `Всего в транскриптах: ${messages.length}, срок хранения чистит старое.`,
+    );
+  }
+
+  const blocks = buildBlocks(inRange, gap);
+  const sum = summarize(blocks, duplicates);
+
+  const byDay = new Map<string, { hours: number; messages: number; blocks: number }>();
+  for (const b of blocks) {
+    const day = localDay(b.start);
+    const cur = byDay.get(day) ?? { hours: 0, messages: 0, blocks: 0 };
+    cur.hours += b.hours;
+    cur.messages += b.messages.length;
+    cur.blocks += 1;
+    byDay.set(day, cur);
+  }
+
+  emit({ summary: sum, blocks: bool(args, "blocks") ? blocks : undefined }, () => {
+    const head =
+      `ПРИСУТСТВИЕ ПО СЕССИЯМ · ${sum.from} — ${sum.to}\n` +
+      table([
+        ["Часов", h(sum.hours)],
+        ["Сообщений", String(sum.messages)],
+        ["Активных дней", String(sum.days.length)],
+        ["Блоков", `${sum.blocks} (порог перерыва ${gap} мин)`],
+        ["Из них без длительности", `${sum.emptyBlocks} — одно сообщение, присутствие не измеряется`],
+        ["Сессий", String(sum.sessions)],
+        ["Файлов прочитано", String(files.length)],
+        ["Повторов отброшено", String(sum.duplicates)],
+      ]);
+
+    const days = [...byDay.entries()].sort();
+    const daysTable = table([
+      ["ДЕНЬ", "ЧАСОВ", "СООБЩ.", "БЛОКОВ"],
+      ...days.map(([d, v]) => [d, h(v.hours), String(v.messages), String(v.blocks)]),
+    ]);
+
+    const blockRows = bool(args, "blocks")
+      ? "\n\nБЛОКИ\n" +
+        table([
+          ["ДЕНЬ", "НАЧАЛО", "КОНЕЦ", "ЧАСОВ", "СООБЩ.", "ПЕРВОЕ СООБЩЕНИЕ"],
+          ...blocks.map((b) => [
+            localDay(b.start),
+            localTime(b.start),
+            localTime(b.end),
+            h(b.hours),
+            String(b.messages.length),
+            clip(b.messages[0]!.text.replace(/\s+/g, " "), 52),
+          ]),
+        ])
+      : "";
+
+    return (
+      `${head}\n\nПО ДНЯМ\n${daysTable}${blockRows}\n\n` +
+      "ЧЕГО В ЭТИХ ЧИСЛАХ НЕТ: работы вне инструмента, звонков, машинного времени и всего, что старше\n" +
+      "срока хранения транскриптов — клиент чистит их сам, и отсутствие файлов не значит отсутствия работы.\n" +
+      "Это мера присутствия, а не трудозатрат: внутри отрезка человек мог отвлекаться.\n" +
+      "Раскладывать блоки по задачам — вручную: скилл этого намеренно не делает."
+    );
+  });
+}
+
 async function cmdHarvest(args: Args): Promise<void> {
   const path = resolve(str(args, "repo") ?? args.positional[0] ?? ".");
   if (!(await isGitRepo(path))) {
@@ -7044,6 +7132,9 @@ Wiki проекта
               [--activity <вид>] [--tracker <трекер>] | repos remove --key <ключ>
   harvest [--repo <путь>] [--period week] [--author me|all|<почта>] [--gap 90] [--min 0.5] [--out <каталог>]
         коммиты за период → куда списать часы и какие задачи завести (черновик, требует правки)
+  sessions [--period week|месяц|A..B] [--gap 90] [--blocks] [--messages]
+        присутствие по сообщениям человека в сессиях: для работы, не оставившей следа в git.
+        Это МЕРА ПРИСУТСТВИЯ: блок из одного сообщения даёт ноль, и такие блоки считаются отдельно
 
 Задачи
   issue <id> [--comments N]         карточка задачи с последними событиями
@@ -7132,6 +7223,10 @@ async function main(): Promise<void> {
   }
   if (args.cmd === "harvest") {
     await cmdHarvest(args);
+    return;
+  }
+  if (args.cmd === "sessions") {
+    await cmdSessions(args);
     return;
   }
 

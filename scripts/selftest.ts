@@ -10,6 +10,7 @@ import { buildSessions, buildGroups, plural, draftDescription, type Commit } fro
 import { categorize, monthsSince } from "./redmine.ts";
 import { translit, slugIdentifier, identifierProblem } from "./redmine.ts";
 import { explainTimeEntryRejection } from "./redmine.ts";
+import { isHumanRecord, cleanText, buildBlocks, summarize, type HumanMessage } from "./sessions.ts";
 import { parseFieldSpec, assignProjectFields, type ProjectField } from "./redmine.ts";
 import { dayTotals, loadWarnings, reconcileHours } from "./redmine.ts";
 import {
@@ -1567,6 +1568,56 @@ check(
   check("whoami: ключа API нет в объекте пользователя", Object.keys(safe).includes("api_key"), false);
   check("whoami: ключа API нет в выводе --json", JSON.stringify(safe).includes("0123456789abcdef"), false);
   check("whoami: известные поля сохранены", safe, { id: 5, login: "ivanov", firstname: "Иван", lastname: "Иванов", mail: "i@example.com", admin: false });
+}
+
+// ── замер присутствия по сессиям ──────────────────────────────────────
+{
+  const human = {
+    type: "user", promptSource: "sdk", isMeta: false, isSidechain: false,
+    entrypoint: "claude-desktop", timestamp: "2026-09-24T10:00:00.000Z", uuid: "a",
+    message: { role: "user", content: "сделай отчёт" },
+  };
+  check("сессии: обычная реплика человека принимается", isHumanRecord(human), true);
+
+  // Каждая проверка ниже отсекает конкретную ошибку, замеренную на живом каталоге.
+  check("сессии: результат инструмента отвергается", isHumanRecord({ ...human, message: { role: "user", content: [{ type: "tool_result", content: "ok" }] } }), false);
+  check("сессии: реплика подагента отвергается", isHumanRecord({ ...human, isSidechain: true }), false);
+  check("сессии: песочница local-agent отвергается", isHumanRecord({ ...human, entrypoint: "local-agent" }), false);
+  check("сессии: служебная вставка отвергается", isHumanRecord({ ...human, isMeta: true }), false);
+  check("сессии: системный источник отвергается", isHumanRecord({ ...human, promptSource: "system" }), false);
+  check("сессии: запись без времени отвергается", isHumanRecord({ ...human, timestamp: undefined }), false);
+  // turnOrigin появился только в 2.1.280: сравнение «=== human» выбросило бы две трети истории.
+  check("сессии: без turnOrigin принимается", isHumanRecord({ ...human, turnOrigin: undefined }), true);
+  check("сессии: turnOrigin human принимается", isHumanRecord({ ...human, turnOrigin: "human" }), true);
+  check("сессии: turnOrigin peer отвергается", isHumanRecord({ ...human, turnOrigin: "peer" }), false);
+
+  // Напоминание окружения приклеено к началу первой реплики сессии: выбрасывать запись нельзя.
+  check("сессии: напоминание вырезается, текст остаётся",
+    cleanText("<system-reminder>служебное</system-reminder>\nпоправь отчёт"), "поправь отчёт");
+  check("сессии: уведомление о фоновой задаче отбрасывается",
+    cleanText("<task-notification>\n<task-id>x</task-id>"), "");
+  check("сессии: письмо другой сессии отбрасывается",
+    cleanText("Another Claude session sent a message: привет"), "");
+  check("сессии: продолжение после сжатия отбрасывается",
+    cleanText("This session is being continued from a previous conversation that ran out of context."), "");
+  check("сессии: обёртка редактора вырезается",
+    cleanText("<ide_selection>кусок</ide_selection> что тут не так"), "что тут не так");
+  // Текст человека намеренно не причёсывается: на месте вырезанного блока остаётся пробел,
+  // а схлопывание пробелов поломало бы отступы в коде, который люди присылают целыми кусками.
+  check("сессии: вставка вырезается, свой текст остаётся",
+    cleanText("смотри <pasted_content id=\"1\">много текста</pasted_content> вот это").includes("смотри") &&
+      cleanText("смотри <pasted_content id=\"1\">много текста</pasted_content> вот это").includes("вот это") &&
+      !cleanText("смотри <pasted_content id=\"1\">много текста</pasted_content> вот это").includes("много текста"), true);
+
+  const msg = (ts: string): HumanMessage => ({ ts, text: "x", uuid: ts, session: "s", cwd: "" });
+  const blocks = buildBlocks([msg("2026-09-24T10:00:00Z"), msg("2026-09-24T10:30:00Z"), msg("2026-09-24T14:00:00Z")], 90);
+  check("сессии: перерыв больше порога начинает новый блок", blocks.length, 2);
+  check("сессии: длительность блока — от первого до последнего", blocks[0]!.hours, 0.5);
+  check("сессии: блок из одного сообщения даёт ноль", blocks[1]!.hours, 0);
+  const sum = summarize(blocks, 3);
+  check("сессии: блоки без длительности считаются отдельно", sum.emptyBlocks, 1);
+  check("сессии: часы складываются", sum.hours, 0.5);
+  check("сессии: повторы переносятся в сводку", sum.duplicates, 3);
 }
 
 // ── объяснение отказа 422 по записи времени ───────────────────────────
