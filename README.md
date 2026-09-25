@@ -56,9 +56,14 @@ Claude: Новое с прошлой проверки:
 
 Нужны [Claude Code](https://claude.com/claude-code) и [Bun](https://bun.sh) ≥ 1.2.
 
-```bash
-git clone https://github.com/33solutions/redmine-time.git ~/.claude/skills/redmine-time
 ```
+/plugin marketplace add 33solutions/claude-skills
+/plugin install redmine-time@33solutions
+```
+
+Витрина закрытая: нужен доступ к репозиторию скилла. Обновление — `/plugin update redmine-time@33solutions`.
+
+Разработка идёт клонированием в отдельный каталог; при таком способе пути внутри скилла остаются прежними.
 
 Скилл подхватывается автоматически при следующем запуске Claude Code. Для установки только в один проект клонируйте в `<проект>/.claude/skills/redmine-time`.
 
