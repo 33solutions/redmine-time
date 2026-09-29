@@ -203,6 +203,12 @@ bun $R wiki core Регламент --version 3             # прежняя в�
 bun $R wiki-history core Регламент                 # версии: дата, автор, объём, комментарий
 bun $R wiki-update core Регламент --text-file page.html --comment "Новый порядок"   # предпросмотр
 bun $R wiki-update core Регламент --text-file page.html --comment "Новый порядок" --yes --base-version 4
+bun $R wiki-delete core Старая_страница                                             # предпросмотр
+bun $R wiki-delete core Старая_страница --yes                                       # отдельное «да»
+
+bun $R versions core                                                                # вехи проекта
+bun $R create-version core --name "1.0 Релиз" --due 2026-12-31 --yes                # создание вехи
+bun $R update-issue 123 --version "1.0 Релиз" --yes                                 # привязать задачу
 
 # закрытие проекта
 bun $R close-project client-soprovozhdenie-unf    # предпросмотр: подпроекты, права, последствия
