@@ -2299,8 +2299,17 @@ export type WikiPageRef = {
   updated_on?: string;
 };
 
+/** Вложение страницы wiki: удаляется вместе со страницей, поэтому попадает в предпросмотр удаления. */
+export type WikiAttachment = { id: number; filename: string; filesize?: number };
+
 /** Страница или её версия: автор и комментарий — той версии, которую запросили. */
-export type WikiPage = WikiPageRef & { text: string; author?: IdName; comments?: string | null };
+export type WikiPage = WikiPageRef & {
+  text: string;
+  author?: IdName;
+  comments?: string | null;
+  /** Приходят только при include=attachments; undefined — не запрашивались. */
+  attachments?: WikiAttachment[];
+};
 
 /**
  * Название страницы так, как его сохранит Redmine (`Wiki.titleize`): пробелы → «_», без , . / ? ; | :
@@ -2781,9 +2790,144 @@ export function checkWikiWrite(
   };
 }
 
+// ── удаление страницы ──
+
+/**
+ * Удаление страницы отменить нельзя, поэтому согласие на него берётся отдельно — как у remove-member
+ * и delete. Та же формулировка стоит в конце предпросмотра.
+ */
+export const WIKI_DELETE_CONFIRMATION =
+  "Удаление страницы wiki — отдельное подтверждение. Согласие на другие операции его не покрывает:\n" +
+  "нужно явное «да» именно на это удаление, и только после него — повтор с --yes.\n" +
+  "Отменить удаление нечем: ни страницы, ни её прежних версий, ни вложений в Redmine не останется,\n" +
+  "и «Откатить к данной версии» будет уже не к чему применить.";
+
+export function readWikiDelete(args: Args): { project: string; page: string } {
+  const { project, page } = wikiTarget(args, true, "wiki-delete <проект> <страница> [--yes]");
+  return { project, page: page! };
+}
+
+export type WikiDeleteRequest = { method: "DELETE"; path: string };
+
+/**
+ * DELETE удаляет страницу со всеми её версиями и вложениями. Дочерние страницы Redmine при этом
+ * не удаляет: у них обнуляется родитель (`acts_as_tree :dependent => :nullify`), и они становятся
+ * страницами верхнего уровня. Предпросмотр обязан назвать их — иначе дерево wiki рассыпается молча.
+ */
+export function wikiDeleteRequest(project: string, title: string): WikiDeleteRequest {
+  if (!title.trim()) throw new UserError("Название страницы пусто: удалять нечего.");
+  return { method: "DELETE", path: wikiPath(project, title) };
+}
+
+export type WikiDeleteContext = {
+  instance: string;
+  project: { id: number; name: string; identifier: string; isPublic: boolean | null };
+  /** Как страницу назвал пользователь: если Redmine хранит её под другим названием, это видно. */
+  requested: string;
+  page: WikiPage;
+  url: string;
+  /** Число версий страницы: все они уйдут вместе с ней. */
+  versions: number;
+  /** Дочерние страницы: останутся, но станут страницами верхнего уровня. */
+  children: string[];
+  /** Вложения страницы; null — прочитать не удалось (страница запрашивалась без include). */
+  attachments: WikiAttachment[] | null;
+  rights: RightsCheck;
+};
+
+export function wikiDeletePreview(ctx: WikiDeleteContext): string {
+  const page = ctx.page;
+  const rows: string[][] = [
+    ["Проект", projectTitle(ctx.project)],
+    ["Страница", `${page.title}${page.parent ? ` (родитель: ${page.parent.title})` : " (верхнего уровня)"}`],
+  ];
+  if (page.title !== ctx.requested) {
+    rows.push(["Название", `«${ctx.requested}» → удаляется страница «${page.title}»: так её хранит Redmine`]);
+  }
+  rows.push(["Адрес", ctx.url]);
+  rows.push([
+    "Уйдёт целиком",
+    `версий ${ctx.versions} (текущая ${page.version} от ${stamp(page.updated_on)}` +
+      `${page.author ? `, автор ${page.author.name}` : ""}), ${thousands(wikiChars(page.text))} знаков текста`,
+  ]);
+  rows.push([
+    "Вложения",
+    ctx.attachments === null
+      ? "прочитать не удалось — если они есть, уйдут вместе со страницей"
+      : ctx.attachments.length === 0
+        ? "нет"
+        : `${ctx.attachments.length}: ${ctx.attachments.map((a) => a.filename).join(", ")} — уйдут вместе со страницей`,
+  ]);
+  rows.push([
+    "Дочерние страницы",
+    ctx.children.length === 0
+      ? "нет"
+      : `${ctx.children.length} — НЕ удаляются, станут страницами верхнего уровня: ${ctx.children.join(", ")}`,
+  ]);
+  rows.push(["Доступ", describeWikiAccess(ctx.project.isPublic)]);
+  rows.push(["Права", rightsText(ctx.rights, "«Удаление wiki-страниц»")]);
+
+  const notes = [
+    "Что произойдёт: страница, все её прежние версии и вложения удаляются безвозвратно — в истории не остаётся ничего,",
+    "откатить нечем. Ссылки на страницу с других страниц wiki станут ссылками на несуществующую страницу.",
+    ctx.children.length > 0
+      ? "Дерево wiki изменится: перечисленные дочерние страницы сохранятся, но потеряют родителя и уйдут на верхний\n" +
+        "уровень. После удаления они перечитываются из списка wiki: если инстанс поведёт себя иначе и удалит их — сверка скажет."
+      : "",
+    `Сохранить текст до удаления: redmine.ts wiki ${ctx.project.identifier} ${page.title} --out <файл>` +
+      (ctx.versions > 1 ? " (и так же каждую нужную версию: --version N --out <файл>)" : ""),
+  ].filter(Boolean);
+
+  return (
+    `УДАЛЕНИЕ СТРАНИЦЫ WIKI · инстанс ${ctx.instance}\n${table(rows)}\n${RULE}\n${notes.join("\n")}\n` +
+    `${RULE}\nТЕКСТ, КОТОРЫЙ БУДЕТ УДАЛЁН (версия ${page.version} целиком):\n${RULE}\n${page.text.replace(/\s+$/, "")}\n` +
+    `${RULE}\n${WIKI_DELETE_CONFIRMATION}`
+  );
+}
+
+/**
+ * Сверка после удаления: страница не читается, а дочерние страницы целы и перестали числиться
+ * за ней. `children` — как их видно в свежем списке wiki: заголовок, нынешний родитель и то,
+ * остались ли они вообще. Предпросмотр обещает, что дочерние страницы уцелеют, — это проверяется:
+ * если они исчезли, обещание оказалось неверным, и молчать об этом нельзя.
+ */
+export function checkWikiDeleted(
+  deleted: string,
+  after: WikiPage | null,
+  children: { title: string; parent: string | null; exists: boolean }[],
+): WikiWriteCheck {
+  const names = (list: { title: string }[]): string => list.map((c) => `«${c.title}»`).join(", ");
+  const problems: string[] = [];
+  if (after !== null) {
+    problems.push(`страница «${after.title}» по-прежнему читается (версия ${after.version})`);
+  }
+  const stuck = children.filter((c) => c.exists && c.parent === deleted);
+  if (stuck.length > 0) {
+    problems.push(`дочерние страницы всё ещё числятся за удалённой: ${names(stuck)}`);
+  }
+  const vanished = children.filter((c) => !c.exists);
+  if (vanished.length > 0) {
+    problems.push(
+      `дочерние страницы исчезли вместе с родителем, хотя предпросмотр обещал обратное: ${names(vanished)} — ` +
+        "проверьте wiki проекта в интерфейсе",
+    );
+  }
+  if (problems.length > 0) {
+    return { ok: false, text: `РАСХОЖДЕНИЕ: Redmine ответил успехом, но ${problems.join("; ")}.` };
+  }
+  return {
+    ok: true,
+    text:
+      `Сверка: страницы «${deleted}» в wiki больше нет.` +
+      (children.length > 0
+        ? ` Дочерние страницы (${children.length}) остались и стали страницами верхнего уровня: ${names(children)}.`
+        : ""),
+  };
+}
+
 // ── отказы ──
 
-export type WikiAction = "list" | "read" | "version" | "update";
+export type WikiAction = "list" | "read" | "version" | "update" | "delete";
 
 /** Отказ Redmine по wiki — словами: какого права не хватает и что делать. null — объяснить нечем. */
 export function explainWikiRejection(
@@ -2822,6 +2966,14 @@ export function explainWikiRejection(
         "  администратор Redmine или менеджер проекта. Обходного пути нет."
       );
     }
+    if (ctx.action === "delete") {
+      return (
+        `Страница ${page} не удалена: у владельца ключа нет права удалять страницы wiki в проекте ${ctx.project}.\n` +
+        "  Нужно право «Удаление wiki-страниц» — отдельное от «Редактирование wiki-страниц»: править страницу можно,\n" +
+        "  а удалять нельзя. Право входит в роль проекта, выдаёт его администратор Redmine или менеджер проекта.\n" +
+        "  Страница не изменилась. Обходного пути нет: в интерфейсе — страница wiki → «Удалить»."
+      );
+    }
     if (ctx.action === "version") {
       return (
         `Прежние версии страницы ${page} закрыты от владельца ключа: нужно право «Просмотр истории Wiki» в проекте ${ctx.project}.\n` +
@@ -2845,6 +2997,12 @@ export function explainWikiRejection(
       );
     }
     if (ctx.action === "read") return `Страницы ${page} в wiki проекта ${ctx.project} нет. Список страниц: redmine.ts wiki <проект>.`;
+    if (ctx.action === "delete") {
+      return (
+        `Страница ${page} не удалена: Redmine отвечает «не найдено» — её уже нет либо wiki проекта ${ctx.project} выключена.\n` +
+        "  Ничего не удалено. Список страниц: redmine.ts wiki <проект>."
+      );
+    }
     return (
       `Redmine ответил «не найдено» при записи страницы ${page}: wiki проекта ${ctx.project} выключена или проект недоступен.\n` +
       "  Ничего не записано."
@@ -2901,10 +3059,20 @@ async function loadWikiIndex(rm: Resolved, project: ProjectRef): Promise<WikiPag
   );
 }
 
-/** Страница или её версия; null — такой страницы (версии) нет. Остальные отказы — объяснением. */
-async function loadWikiPage(rm: Resolved, project: ProjectRef, title: string, version?: number): Promise<WikiPage | null> {
+/**
+ * Страница или её версия; null — такой страницы (версии) нет. Остальные отказы — объяснением.
+ * `include` — довесок Redmine к карточке страницы («attachments»): нужен предпросмотру удаления.
+ */
+async function loadWikiPage(
+  rm: Resolved,
+  project: ProjectRef,
+  title: string,
+  version?: number,
+  include?: string,
+): Promise<WikiPage | null> {
   try {
-    return (await request<{ wiki_page: WikiPage }>(rm, "GET", wikiPath(project.identifier, title, version))).wiki_page;
+    const query = include === undefined ? undefined : { include };
+    return (await request<{ wiki_page: WikiPage }>(rm, "GET", wikiPath(project.identifier, title, version), query)).wiki_page;
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) return null;
     if (error instanceof ApiError) {
@@ -3150,6 +3318,66 @@ async function cmdWikiUpdate(rm: Resolved, args: Args): Promise<void> {
   if (!check.ok) process.exitCode = 1;
 }
 
+async function cmdWikiDelete(rm: Resolved, args: Args): Promise<void> {
+  const input = readWikiDelete(args);
+  const found = await findProjectAnyStatus(rm, input.project);
+  // Статус и публичность — со свежей карточки: от них зависят и строгость предпросмотра, и сама возможность удаления.
+  const project = await freshProject(rm, found.id);
+  const title = projectTitle(project);
+  if (project.status === PROJECT_STATUS.closed) {
+    throw new UserError(
+      `Проект ${title} закрыт: его wiki доступна только для чтения, удалить страницу нельзя.\n` +
+        `  Сначала открыть проект: redmine.ts reopen-project ${project.identifier} --instance ${rm.name}`,
+    );
+  }
+  if (project.enabled_modules && !project.enabled_modules.some((m) => m.name === "wiki")) {
+    throw new UserError(explainWikiRejection(404, [], { action: "list", project: title })!);
+  }
+
+  const pages = await loadWikiIndex(rm, project);
+  const wanted = wikiTitle(input.page);
+  // include=attachments: вложения уходят вместе со страницей, и предпросмотр обязан их назвать.
+  const page = (await loadWikiPage(rm, project, wanted, undefined, "attachments")) ?? (await wikiPageMissing(rm, project, wanted));
+  const children = pages.filter((p) => p.parent?.title === page.title).map((p) => p.title).sort((a, b) => a.localeCompare(b, "ru"));
+  const rights = await keyRights(rm, project, "delete_wiki_pages", false);
+  const url = wikiPageUrl(rm.base, project.identifier, page.title);
+
+  const preview = wikiDeletePreview({
+    instance: rm.name,
+    project: { id: project.id, name: project.name, identifier: project.identifier, isPublic: project.is_public ?? null },
+    requested: input.page.trim(),
+    page,
+    url,
+    versions: page.version,
+    children,
+    attachments: page.attachments ?? null,
+    rights,
+  });
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes — только после отдельного «да» на удаление")) {
+    return;
+  }
+
+  const req = wikiDeleteRequest(project.identifier, page.title);
+  await withWikiErrors({ action: "delete", project: title, page: page.title }, () => request(rm, req.method, req.path));
+
+  const after = await loadWikiPage(rm, project, page.title);
+  // Дочерние страницы перечитываются из свежего списка: Redmine обнуляет им родителя, а не удаляет их.
+  const indexAfter = children.length > 0 ? await loadWikiIndex(rm, project) : [];
+  const check = checkWikiDeleted(
+    page.title,
+    after,
+    children.map((t) => {
+      const still = indexAfter.find((p) => p.title === t);
+      return { title: t, parent: still?.parent?.title ?? null, exists: still !== undefined };
+    }),
+  );
+  emit({ instance: rm.name, project: project.identifier, page: page.title, deleted: after === null, children, check }, () =>
+    `Страница wiki удалена: «${page.title}» из проекта ${title}\n${check.text}\n` +
+      `Список страниц: redmine.ts wiki ${project.identifier}`,
+  );
+  if (!check.ok) process.exitCode = 1;
+}
+
 /** Переводы строк Windows приводятся к «\n»: сравнение и сверка после записи не должны спотыкаться о «\r». */
 function normalizeLineBreaks(text: string): string {
   return text.replace(/\r\n?/g, "\n");
@@ -3158,6 +3386,717 @@ function normalizeLineBreaks(text: string): string {
 /** Объём текста в знаках — одинаково в `wiki`, истории и сравнении: страницы из браузера хранятся с «\r\n». */
 function wikiChars(text: string): number {
   return normalizeLineBreaks(text).length;
+}
+
+// ─────────────────────── вехи (версии) проекта ─────────────────────────
+
+/**
+ * Веха проекта. В настройках Redmine она называется «Версия», на странице «Дорожная карта» —
+ * вехой: задачи привязываются к ней полем «Версия» (`fixed_version_id`), и по ним считается
+ * готовность вехи. Вехи живут внутри проекта, отдельного справочника вех у инстанса нет.
+ */
+export type Version = {
+  id: number;
+  project?: IdName;
+  name: string;
+  description?: string | null;
+  /** open | locked | closed; у старых инстансов поле может не прийти. */
+  status?: string;
+  /** В JSON REST API срок вехи называется due_date (в базе — effective_date). */
+  due_date?: string | null;
+  /** none | descendants | hierarchy | tree | system. */
+  sharing?: string;
+  wiki_page_title?: string | null;
+  created_on?: string;
+  updated_on?: string;
+};
+
+export type VersionStatus = "open" | "locked" | "closed";
+export type VersionSharing = "none" | "descendants" | "hierarchy" | "tree" | "system";
+
+/** Название права так, как его показывает русский интерфейс Redmine («Роли и права»). */
+export const MANAGE_VERSIONS_PERMISSION = "«Управление версиями»";
+
+/** Статус вехи одним словом — для таблиц. */
+export function versionStatusName(status: string | undefined): string {
+  switch (status) {
+    case "open":
+      return "открыта";
+    case "locked":
+      return "заблокирована";
+    case "closed":
+      return "закрыта";
+    default:
+      return status === undefined ? "не указан" : status;
+  }
+}
+
+/** Статус вехи с последствиями: по нему видно, можно ли привязывать к вехе задачи. */
+export function describeVersionStatus(status: string | undefined): string {
+  switch (status) {
+    case "open":
+      return "открыта — задачи к ней привязываются, веха видна в дорожной карте";
+    case "locked":
+      return "заблокирована — новые задачи к ней не привязать, уже привязанные остаются";
+    case "closed":
+      return "закрыта — веха завершена, привязка новых задач закрыта";
+    default:
+      return status === undefined ? "не указан" : `неизвестный статус «${status}»`;
+  }
+}
+
+/** Разделение вехи: кто, кроме самого проекта, может привязывать к ней задачи. */
+export function describeVersionSharing(sharing: string | undefined): string {
+  switch (sharing) {
+    case "none":
+      return "не разделяется — только задачи этого проекта";
+    case "descendants":
+      return "с подпроектами — задачи проекта и его подпроектов";
+    case "hierarchy":
+      return "с иерархией — задачи проекта, его подпроектов и родителей";
+    case "tree":
+      return "с деревом проектов — задачи всего дерева от корневого проекта";
+    case "system":
+      return "со всеми проектами инстанса";
+    default:
+      return sharing === undefined ? "не указано" : `неизвестное значение «${sharing}»`;
+  }
+}
+
+export function versionStatus(raw: string | undefined): VersionStatus {
+  const value = (raw ?? "").trim().toLowerCase();
+  if (!value) return "open";
+  const known: Record<string, VersionStatus> = {
+    open: "open",
+    открыта: "open",
+    открыт: "open",
+    locked: "locked",
+    заблокирована: "locked",
+    заблокирован: "locked",
+    closed: "closed",
+    закрыта: "closed",
+    закрыт: "closed",
+  };
+  const found = known[value];
+  if (!found) {
+    throw new UserError(
+      `Флаг --status у вехи принимает open, locked или closed (или «открыта», «заблокирована», «закрыта»), получено "${raw}".`,
+    );
+  }
+  return found;
+}
+
+export function versionSharing(raw: string | undefined): VersionSharing {
+  const value = (raw ?? "").trim().toLowerCase();
+  if (!value) return "none";
+  const known: Record<string, VersionSharing> = {
+    none: "none",
+    нет: "none",
+    descendants: "descendants",
+    подпроекты: "descendants",
+    hierarchy: "hierarchy",
+    иерархия: "hierarchy",
+    tree: "tree",
+    дерево: "tree",
+    system: "system",
+    все: "system",
+  };
+  const found = known[value];
+  if (!found) {
+    throw new UserError(
+      `Флаг --sharing принимает none, descendants, hierarchy, tree или system, получено "${raw}". ` +
+        "Что означает каждое — redmine.ts versions <проект>.",
+    );
+  }
+  return found;
+}
+
+// ── разбор аргументов ──
+
+export function readVersions(args: Args): { project: string } {
+  const fromPositional = args.positional[0];
+  const project = (fromPositional ?? str(args, "project"))?.trim();
+  if (!project) throw new UserError("Укажите проект: redmine.ts versions <identifier|id|название>.");
+  noExtraWords(args, fromPositional === undefined ? 0 : 1, 'versions "Название проекта"');
+  return { project };
+}
+
+export type CreateVersionInput = {
+  project: string;
+  name: string;
+  due: string | undefined;
+  description: string | undefined;
+  descriptionFile: string | undefined;
+  status: VersionStatus;
+  sharing: VersionSharing;
+};
+
+const CREATE_VERSION_USAGE =
+  'create-version <проект> --name "…" [--due дата] [--description "…"|--description-file f] ' +
+  "[--status open|locked|closed] [--sharing none|descendants|hierarchy|tree|system]";
+
+export function readCreateVersion(args: Args): CreateVersionInput {
+  const fromPositional = args.positional[0];
+  const project = (fromPositional ?? str(args, "project"))?.trim();
+  if (!project) throw new UserError(`Укажите проект: redmine.ts ${CREATE_VERSION_USAGE}.`);
+  noExtraWords(args, fromPositional === undefined ? 0 : 1, '--name "1.0 Обмен с 1С"');
+
+  const name = str(args, "name")?.trim();
+  if (!name) throw new UserError(`Укажите имя вехи: redmine.ts ${CREATE_VERSION_USAGE}.`);
+
+  const dueRaw = str(args, "due");
+  if (args.flags.has("due") && dueRaw === undefined) {
+    throw new UserError("Флаг --due ожидает дату: --due 2026-12-31 (или 31.12.2026, today, +30).");
+  }
+  const description = str(args, "description");
+  if (args.flags.has("description") && description === undefined) {
+    throw new UserError('Флаг --description ожидает текст: --description "что входит в веху".');
+  }
+  const descriptionFile = str(args, "description-file");
+  if (args.flags.has("description-file") && descriptionFile === undefined) {
+    throw new UserError("Флаг --description-file ожидает путь к файлу с текстом описания.");
+  }
+  if (description !== undefined && descriptionFile !== undefined) {
+    throw new UserError("--description и --description-file вместе не принимаются: оставьте один источник текста.");
+  }
+  const statusRaw = str(args, "status");
+  if (args.flags.has("status") && statusRaw === undefined) {
+    throw new UserError("Флаг --status ожидает значение: open, locked или closed.");
+  }
+  const sharingRaw = str(args, "sharing");
+  if (args.flags.has("sharing") && sharingRaw === undefined) {
+    throw new UserError("Флаг --sharing ожидает значение: none, descendants, hierarchy, tree или system.");
+  }
+
+  return {
+    project,
+    name,
+    due: dueRaw === undefined ? undefined : parseDate(dueRaw),
+    description,
+    descriptionFile,
+    status: versionStatus(statusRaw),
+    sharing: versionSharing(sharingRaw),
+  };
+}
+
+// ── запрос ──
+
+/** Столбцы `versions.name` и `versions.description` в базе Redmine — строки на 255 знаков. */
+const VERSION_NAME_MAX = 255;
+const VERSION_DESCRIPTION_MAX = 255;
+
+/**
+ * Длина имени, начиная с которой инстанс может отказать: в модели Version Redmine стоит своя
+ * проверка, более строгая, чем столбец базы. Точное значение зависит от версии Redmine, поэтому
+ * здесь это предупреждение предпросмотра, а не запрет: запрещать по непроверенному числу нельзя.
+ */
+export const VERSION_NAME_SOFT = 60;
+
+export type VersionRequest = {
+  method: "POST";
+  path: string;
+  body: {
+    version: { name: string; status: VersionStatus; sharing: VersionSharing; due_date?: string; description?: string };
+  };
+};
+
+/**
+ * POST /projects/:id/versions.json. Имя вехи уникально внутри проекта: двойник Redmine отвергает
+ * с 422, поэтому команда сверяется со списком вех до отправки.
+ */
+export function createVersionRequest(
+  project: string | number,
+  input: { name: string; due: string | undefined; description: string | undefined; status: VersionStatus; sharing: VersionSharing },
+): VersionRequest {
+  const name = input.name.trim();
+  if (!name) throw new UserError("Имя вехи пусто: Redmine веху без имени не создаёт.");
+  if (name.length > VERSION_NAME_MAX) {
+    throw new UserError(`Имя вехи длиннее ${VERSION_NAME_MAX} знаков (${name.length}): Redmine его не примет.`);
+  }
+  const version: VersionRequest["body"]["version"] = { name, status: input.status, sharing: input.sharing };
+  if (input.due !== undefined) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(input.due)) {
+      throw new UserError(`Срок вехи должен быть датой вида ГГГГ-ММ-ДД, получено "${input.due}".`);
+    }
+    version.due_date = input.due;
+  }
+  const note = input.description?.trim();
+  if (note) {
+    if (note.length > VERSION_DESCRIPTION_MAX) {
+      throw new UserError(
+        `Описание вехи длиннее ${VERSION_DESCRIPTION_MAX} знаков (${note.length}): Redmine его не примет. ` +
+          "Подробности — в задачах вехи или на странице wiki.",
+      );
+    }
+    version.description = note;
+  }
+  return { method: "POST", path: `projects/${encodeURIComponent(String(project))}/versions.json`, body: { version } };
+}
+
+// ── привязка задачи к вехе ──
+
+/** Веха по номеру, точному имени или части имени. Неоднозначность и промах — ошибка со списком. */
+export function matchVersion(list: Version[], needle: string): Version {
+  const raw = needle.trim();
+  const known = list.length > 0 ? ` Есть: ${list.map((v) => `«${v.name}» (id=${v.id})`).join(", ")}.` : "";
+  if (/^\d+$/.test(raw)) {
+    const byId = list.find((v) => v.id === Number(raw));
+    if (byId) return byId;
+    throw new UserError(
+      `Вехи с номером ${raw} у проекта задачи нет — привязать к ней нельзя.${known}\n` +
+        "  Список: redmine.ts versions <проект>.",
+    );
+  }
+  const low = raw.toLowerCase();
+  const exact = list.find((v) => v.name.trim().toLowerCase() === low);
+  if (exact) return exact;
+  const partial = list.filter((v) => v.name.toLowerCase().includes(low));
+  if (partial.length === 1) return partial[0]!;
+  if (partial.length > 1) {
+    throw new UserError(`Веха "${needle}" неоднозначна: ${partial.map((v) => `«${v.name}» (id=${v.id})`).join(", ")}.`);
+  }
+  throw new UserError(
+    `Веха "${needle}" у проекта задачи не найдена.${known}\n` +
+      (list.length === 0
+        ? '  Вех у проекта нет: заведите — redmine.ts create-version <проект> --name "…".'
+        : "  Список: redmine.ts versions <проект>."),
+  );
+}
+
+/** «none» снимает веху с задачи: очищается поле пустой строкой — так же, как оценка в update-issue. */
+export function versionClears(raw: string): boolean {
+  return /^(none|нет|снять|убрать|—)$/i.test(raw.trim());
+}
+
+/**
+ * Сверка после привязки: Redmine молча оставляет поле как было, если веха проекту не принадлежит
+ * или заблокирована, и отвечает при этом успехом. Верить можно только перечитанной задаче.
+ */
+export function checkIssueVersion(after: { id: number; name: string } | null | undefined, wanted: number | ""): string {
+  if (wanted === "") {
+    return after
+      ? `РАСХОЖДЕНИЕ: веху снять не удалось — на задаче осталась «${after.name}» (id=${after.id}).`
+      : "Сверка: веха с задачи снята.";
+  }
+  if (!after) {
+    return `РАСХОЖДЕНИЕ: Redmine ответил успехом, но вехи на задаче нет (отправлялась id=${wanted}). ` +
+      "Проверьте, что веха принадлежит проекту задачи и не закрыта.";
+  }
+  if (after.id !== wanted) {
+    return `РАСХОЖДЕНИЕ: на задаче веха «${after.name}» (id=${after.id}), отправлялась id=${wanted}.`;
+  }
+  return `Сверка: задача привязана к вехе «${after.name}» (id=${after.id}).`;
+}
+
+/** Значение `fixed_version_id` для update-issue и то, как оно выглядит в предпросмотре. */
+export function versionPatchValue(raw: string, list: Version[]): { id: number | ""; label: string } {
+  if (versionClears(raw)) return { id: "", label: "снять — задача останется без вехи" };
+  const found = matchVersion(list, raw);
+  const status = found.status === undefined || found.status === "open" ? "" : `, ${versionStatusName(found.status)}`;
+  return {
+    id: found.id,
+    label: `«${found.name}» (id=${found.id}, срок ${found.due_date ?? "не задан"}${status})`,
+  };
+}
+
+// ── список ──
+
+/** Число задач вехи; null — прочитать не удалось. */
+export type VersionCount = { total: number; open: number } | null;
+
+/** Вехи по сроку: сначала с ближайшим сроком, вехи без срока — в конце, дальше по имени. */
+export function sortVersions(list: Version[]): Version[] {
+  return [...list].sort((a, b) => {
+    const da = a.due_date ?? "";
+    const db = b.due_date ?? "";
+    if (da !== db) {
+      if (!da) return 1;
+      if (!db) return -1;
+      return da < db ? -1 : 1;
+    }
+    return a.name.localeCompare(b.name, "ru");
+  });
+}
+
+/**
+ * Срок вехи относительно дня. Сравнение — по строкам ГГГГ-ММ-ДД через UTC: местный часовой пояс
+ * не должен сдвигать сутки, иначе веха «сегодня» показывалась бы просроченной.
+ */
+export function versionDueHint(due: string | null | undefined, today: string): string {
+  if (!due) return "не задан";
+  const days = Math.round((Date.parse(`${due}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+  if (!Number.isFinite(days)) return due;
+  if (days === 0) return `${due} (сегодня)`;
+  if (days < 0) return `${due} (просрочен на ${plural(-days, ["день", "дня", "дней"])})`;
+  return `${due} (через ${plural(days, ["день", "дня", "дней"])})`;
+}
+
+export function versionCountText(count: VersionCount): string {
+  if (count === null) return "не прочитано";
+  if (count.total === 0) return "нет";
+  return `${count.total} (открыто ${count.open})`;
+}
+
+export function versionRows(list: Version[], counts: Map<number, VersionCount>, today: string): string[][] {
+  return sortVersions(list).map((v) => [
+    v.name,
+    versionStatusName(v.status),
+    versionDueHint(v.due_date, today),
+    versionCountText(counts.get(v.id) ?? null),
+    (v.description ?? "").trim() ? clip(v.description!, 40) : "—",
+  ]);
+}
+
+// ── предпросмотр создания ──
+
+export type CreateVersionContext = {
+  instance: string;
+  project: { id: number; name: string; identifier: string; isPublic: boolean | null };
+  url: string;
+  name: string;
+  due: string | undefined;
+  description: string | undefined;
+  status: VersionStatus;
+  sharing: VersionSharing;
+  /** Вехи, которые в проекте уже есть: по ним видно, не заводится ли двойник. */
+  existing: Version[];
+  /** Аудитория проверки текста: имя вехи видно ровно тем, кому виден проект. */
+  audience: Audience;
+  /** Сколько предупреждений напечатала проверка текста (запреты до предпросмотра не доходят). */
+  warnings: number;
+  rights: RightsCheck;
+};
+
+export function createVersionPreview(ctx: CreateVersionContext): string {
+  const rows: string[][] = [
+    ["Проект", projectTitle(ctx.project)],
+    ["Веха", `«${ctx.name}» — новая, номер выдаст Redmine`],
+    ["Срок", ctx.due ?? 'не задан (--due 2026-12-31 — по нему веха встаёт в дорожную карту)'],
+    ["Статус", describeVersionStatus(ctx.status)],
+    ["Разделение", describeVersionSharing(ctx.sharing)],
+    [
+      "Описание",
+      ctx.description?.trim() ? `«${ctx.description.trim()}»` : 'не задано (--description "что входит в веху")',
+    ],
+    ["Дорожная карта", ctx.url],
+    [
+      "Уже в проекте",
+      ctx.existing.length === 0
+        ? "вех нет — эта будет первой"
+        : `${plural(ctx.existing.length, ["веха", "вехи", "вех"])}: ` +
+          sortVersions(ctx.existing)
+            .map((v) => `«${v.name}» (${versionStatusName(v.status)}, срок ${v.due_date ?? "не задан"})`)
+            .join(", "),
+    ],
+    [
+      "Проверка",
+      `аудитория «${ctx.audience === "client" ? "заказчик" : "внутренняя"}» — ` +
+        (ctx.warnings === 0 ? "замечаний нет" : `предупреждений ${ctx.warnings} (напечатаны выше)`),
+    ],
+    ["Права", rightsText(ctx.rights, MANAGE_VERSIONS_PERMISSION)],
+  ];
+
+  const similar = ctx.existing.filter(
+    (v) => v.name.trim().toLowerCase() === ctx.name.trim().toLowerCase() || v.name.trim().includes(ctx.name.trim()),
+  );
+  const notes = [
+    "Что даёт веха: задачи привязываются к ней полем «Версия», на странице «Дорожная карта» по ним считается",
+    "готовность, а в отчётах по задачам появляется разрез по вехам. Имя вехи уникально внутри проекта.",
+    ctx.name.length > VERSION_NAME_SOFT
+      ? `Имя длиной ${ctx.name.length} знаков: у модели Version в Redmine своя проверка длины, более строгая, чем ` +
+        `столбец базы, — инстанс может отказать (422). Короткое имя надёжнее, подробности — в описание.`
+      : "",
+    similar.length > 0
+      ? `Похожие вехи уже есть: ${similar.map((v) => `«${v.name}»`).join(", ")} — проверьте, что это не двойник.`
+      : "",
+    ctx.project.isPublic === true
+      ? "Проект публичный: имя и описание вехи видны всем пользователям инстанса на странице «Дорожная карта»."
+      : "Проект закрытый: веху видят участники проекта.",
+    "Переименовать, передвинуть срок или удалить веху через этот скилл нельзя — только в интерфейсе:",
+    `настройки проекта → «Версии». Привязать задачу: redmine.ts update-issue <id> --version "${ctx.name}".`,
+  ].filter(Boolean);
+
+  return (
+    `НОВАЯ ВЕХА ПРОЕКТА · инстанс ${ctx.instance}\n${table(rows)}\n${RULE}\n${notes.join("\n")}\n${RULE}\n` +
+    `Нужно право ${MANAGE_VERSIONS_PERMISSION} в этом проекте (обычно у роли «Менеджер») или администратор Redmine.`
+  );
+}
+
+// ── отказы и сверка ──
+
+export type VersionAction = "list" | "create";
+
+/** Отказ Redmine по вехам — словами. null — объяснить нечем. */
+export function explainVersionRejection(
+  status: number,
+  details: string[],
+  ctx: { action: VersionAction; project: string; name?: string },
+): string | null {
+  const name = ctx.name ? `«${ctx.name}»` : "";
+  if (status === 403) {
+    if (ctx.action === "create") {
+      return (
+        `Веха ${name} не создана: у владельца ключа нет права ${MANAGE_VERSIONS_PERMISSION} в проекте ${ctx.project}.\n` +
+        "  Право входит в роль проекта — обычно «Менеджер»; выдаёт его администратор Redmine или менеджер проекта.\n" +
+        "  Ничего не создано. В интерфейсе это делается так: настройки проекта → «Версии» → «Новая версия»."
+      );
+    }
+    return (
+      `Вехи проекта ${ctx.project} закрыты от владельца ключа: список версий отдаётся по праву «Просмотр задач».\n` +
+      "  Право выдаёт администратор Redmine или менеджер проекта."
+    );
+  }
+  if (status === 404) {
+    return ctx.action === "create"
+      ? `Веха ${name} не создана: Redmine ответил «не найдено» — проект ${ctx.project} недоступен или REST API отключён.\n  Ничего не создано.`
+      : `Вехи проекта ${ctx.project} не прочитаны: проект недоступен или REST API отключён в настройках Redmine.`;
+  }
+  if (status === 422 && ctx.action === "create") {
+    const flat = details.join("; ").toLowerCase();
+    const reason = /taken|уже существует|занят/.test(flat)
+      ? "веха с таким именем в проекте уже есть — имя уникально внутри проекта"
+      : /name|имя|назван/.test(flat)
+        ? "имя не прошло проверку: пустое, слишком длинное или уже занято в этом проекте"
+        : /date|дата|срок/.test(flat)
+          ? "срок вехи не похож на дату — нужен вид ГГГГ-ММ-ДД"
+          : /description|описан/.test(flat)
+            ? `описание длиннее ${VERSION_DESCRIPTION_MAX} знаков`
+            : /sharing|разделен/.test(flat)
+              ? "недопустимое разделение вехи: инстанс не принял значение --sharing"
+              : "данные не прошли проверку";
+    return `Redmine не создал веху ${name}: ${reason}.\n  Ответ Redmine: ${details.join("; ") || "без пояснения"}.`;
+  }
+  return null;
+}
+
+export type VersionWriteCheck = { ok: boolean; text: string };
+
+/** Сверка после создания: веха перечитана с инстанса, и её поля — те, что отправлялись. */
+export function checkVersionCreated(
+  after: Version | null,
+  expected: { name: string; due: string | undefined; description: string | undefined; status: VersionStatus; sharing: VersionSharing },
+): VersionWriteCheck {
+  if (!after) {
+    return {
+      ok: false,
+      text: "РАСХОЖДЕНИЕ: Redmine ответил успехом, но веха не читается. Проверьте её в настройках проекта → «Версии».",
+    };
+  }
+  const problems: string[] = [];
+  if (after.name.trim() !== expected.name.trim()) {
+    problems.push(`имя на инстансе «${after.name}», отправлялось «${expected.name.trim()}»`);
+  }
+  const wantDue = expected.due ?? null;
+  if ((after.due_date ?? null) !== wantDue) {
+    problems.push(`срок «${after.due_date ?? "не задан"}», отправлялся «${wantDue ?? "не задан"}»`);
+  }
+  const wantNote = expected.description?.trim() ?? "";
+  if ((after.description ?? "").trim() !== wantNote) problems.push("описание отличается от отправленного");
+  if (after.status !== undefined && after.status !== expected.status) {
+    problems.push(`статус «${versionStatusName(after.status)}», отправлялся «${versionStatusName(expected.status)}»`);
+  }
+  if (after.sharing !== undefined && after.sharing !== expected.sharing) {
+    problems.push(`разделение «${after.sharing}», отправлялось «${expected.sharing}»`);
+  }
+  if (problems.length > 0) return { ok: false, text: `РАСХОЖДЕНИЕ: ${problems.join("; ")}.` };
+  return {
+    ok: true,
+    text: `Сверка: веха «${after.name}» создана (id=${after.id}), все отправленные поля совпадают с перечитанными.`,
+  };
+}
+
+// ── запросы к инстансу ──
+
+async function withVersionErrors<T>(
+  ctx: { action: VersionAction; project: string; name?: string },
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (error instanceof ApiError) {
+      const explained = explainVersionRejection(error.status, error.details, ctx);
+      if (explained) throw new UserError(explained);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Вехи проекта. Redmine отдаёт здесь `shared_versions` — вместе с вехами, разделёнными из
+ * родительских проектов, поэтому список годится и для привязки задачи. Без кэша: вехи заводит
+ * эта же команда, а суточный кэш врал бы сразу после создания.
+ *
+ * Идентификатор необязателен: из карточки задачи проект приходит только номером и названием.
+ */
+async function loadVersions(rm: Resolved, project: { id: number; name: string; identifier?: string }): Promise<Version[]> {
+  const key = project.identifier ?? project.id;
+  const title =
+    project.identifier === undefined
+      ? `«${project.name}» (id=${project.id})`
+      : projectTitle({ id: project.id, name: project.name, identifier: project.identifier });
+  return withVersionErrors({ action: "list", project: title }, async () =>
+    (await request<{ versions?: Version[] }>(rm, "GET", `projects/${key}/versions.json`)).versions ?? [],
+  );
+}
+
+async function loadVersion(rm: Resolved, id: number): Promise<Version | null> {
+  try {
+    return (await request<{ version: Version }>(rm, "GET", `versions/${id}.json`)).version;
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 403 || error.status === 404)) return null;
+    throw error;
+  }
+}
+
+/**
+ * Сколько задач проекта привязано к вехе. Отдельного счётчика в API нет: считается по total_count
+ * выборки задач с фильтром по вехе.
+ *
+ * Выборка намеренно ограничена проектом. Redmine молча выбрасывает фильтр, которого нет среди
+ * доступных запросу, и тогда total_count — это число всех видимых задач инстанса: цифра выглядела бы
+ * правдоподобно и была бы неверной на порядки. Ограничение проектом держит её в рамках проекта.
+ * Обратная сторона названа в выводе: у вехи, разделённой с другими проектами, их задачи не считаются.
+ */
+async function versionIssueCount(rm: Resolved, projectKey: string | number, versionId: number): Promise<VersionCount> {
+  const ask = async (statusFilter: string): Promise<number> => {
+    const r = await request<{ total_count?: number }>(rm, "GET", "issues.json", {
+      project_id: projectKey,
+      fixed_version_id: versionId,
+      status_id: statusFilter,
+      limit: 1,
+    });
+    return typeof r.total_count === "number" ? r.total_count : 0;
+  };
+  try {
+    const total = await ask("*");
+    return { total, open: total === 0 ? 0 : await ask("open") };
+  } catch (error) {
+    if (error instanceof ApiError) return null;
+    throw error;
+  }
+}
+
+// ── команды ──
+
+async function cmdVersions(rm: Resolved, args: Args): Promise<void> {
+  const input = readVersions(args);
+  const project = await findProjectAnyStatus(rm, input.project);
+  const title = projectTitle(project);
+  const list = await loadVersions(rm, project);
+  const counted = await mapLimit(
+    list,
+    4,
+    async (v) => [v.id, await versionIssueCount(rm, project.identifier, v.id)] as const,
+  );
+  const counts = new Map<number, VersionCount>(counted);
+  const today = fmtDate(new Date());
+  const url = `${projectUrl(rm, project.identifier)}/roadmap`;
+  const rows = versionRows(list, counts, today);
+  const foreign = sortVersions(list).filter((v) => v.project !== undefined && v.project.id !== project.id);
+  const shared = sortVersions(list).filter((v) => v.sharing !== undefined && v.sharing !== "none");
+
+  emit(
+    {
+      instance: rm.name,
+      project: { id: project.id, identifier: project.identifier, name: project.name },
+      versions: sortVersions(list).map((v) => ({ ...v, issues: counts.get(v.id) ?? null })),
+    },
+    () =>
+      `ВЕХИ ПРОЕКТА ${title} · инстанс ${rm.name}\n${url}\n` +
+      (rows.length === 0
+        ? `Вех нет. Создать: redmine.ts create-version ${project.identifier} --name "1.0 Название" --due 2026-12-31`
+        : `${table([["ВЕХА", "СТАТУС", "СРОК", "ЗАДАЧ", "ОПИСАНИЕ"], ...rows])}\n\n` +
+          `Всего ${plural(rows.length, ["веха", "вехи", "вех"])}. Считались задачи этого проекта, видимые владельцу ключа: ` +
+          "у разделённой вехи задачи других проектов в счёт не вошли.\n" +
+          (foreign.length > 0
+            ? `Разделены из других проектов (в этом проекте не правятся): ` +
+              `${foreign.map((v) => `«${v.name}» из ${v.project?.name ?? "?"}`).join(", ")}.\n`
+            : "") +
+          (shared.length > 0
+            ? `Разделение: ${shared.map((v) => `«${v.name}» — ${describeVersionSharing(v.sharing)}`).join("; ")}.\n`
+            : "") +
+          `Привязать задачу: redmine.ts update-issue <id> --version "<имя вехи>" · снять: --version none\n` +
+          `Новая веха: redmine.ts create-version ${project.identifier} --name "…" --due ГГГГ-ММ-ДД`),
+  );
+}
+
+async function cmdCreateVersion(rm: Resolved, args: Args): Promise<void> {
+  const input = readCreateVersion(args);
+  const description = input.descriptionFile
+    ? normalizeLineBreaks(await readTextFile(input.descriptionFile, "Описание вехи")).trim()
+    : input.description;
+
+  const found = await findProjectAnyStatus(rm, input.project);
+  // Статус и публичность — со свежей карточки: в закрытом проекте запись не пройдёт, а от публичности зависит проверка.
+  const project = await freshProject(rm, found.id);
+  const title = projectTitle(project);
+  if (project.status !== PROJECT_STATUS.active) {
+    throw new UserError(
+      `Проект ${title}: статус «${describeProjectStatus(project.status)}» — веху можно создать только в действующем проекте.` +
+        (project.status === PROJECT_STATUS.closed
+          ? `\n  Сначала открыть проект: redmine.ts reopen-project ${project.identifier} --instance ${rm.name}`
+          : ""),
+    );
+  }
+
+  const existing = await loadVersions(rm, project);
+  // Имя вехи уникально внутри проекта: двойник Redmine отвергнет с 422 — говорим об этом до отправки.
+  // Сверяемся только со своими вехами: в списке есть и разделённые из родительских проектов, а на них
+  // проверка уникальности Redmine не распространяется — запрет по ним был бы ложным.
+  const clash = existing.find(
+    (v) => (v.project === undefined || v.project.id === project.id) && v.name.trim() === input.name.trim(),
+  );
+  if (clash) {
+    throw new UserError(
+      `Веха «${clash.name}» (id=${clash.id}) в проекте ${title} уже есть: имя вехи уникально внутри проекта, ` +
+        "Redmine второй такой не создаст.\n" +
+        `  Список вех: redmine.ts versions ${project.identifier}. Привязать задачу к существующей: ` +
+        `redmine.ts update-issue <id> --version "${clash.name}".`,
+    );
+  }
+
+  // Имя и описание вехи видит каждый, кому виден проект. В публичном проекте это все пользователи
+  // инстанса, поэтому --audience internal там не действует — так же, как у страницы wiki.
+  const { audience } = wikiAudience(project.is_public ?? null, str(args, "audience"));
+  const findings = checkOutgoing({ "имя вехи": input.name, "описание вехи": description }, args, audience);
+  const req = createVersionRequest(project.identifier, { ...input, description });
+  const rights = await keyRights(rm, project, "manage_versions", true);
+
+  const preview = createVersionPreview({
+    instance: rm.name,
+    project: { id: project.id, name: project.name, identifier: project.identifier, isPublic: project.is_public ?? null },
+    url: `${projectUrl(rm, project.identifier)}/roadmap`,
+    name: input.name,
+    due: input.due,
+    description,
+    status: input.status,
+    sharing: input.sharing,
+    existing,
+    audience,
+    warnings: findings.length,
+    rights,
+  });
+  if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
+
+  const created = await withVersionErrors({ action: "create", project: title, name: input.name }, async () =>
+    (await request<{ version: Version }>(rm, req.method, req.path, undefined, req.body)).version,
+  );
+  // Сверка идёт по перечитанной вехе, а не по ответу на запись: инстанс мог поправить поля своими правилами.
+  const after = (await loadVersion(rm, created.id)) ?? created;
+  const check = checkVersionCreated(after, {
+    name: input.name,
+    due: input.due,
+    description,
+    status: input.status,
+    sharing: input.sharing,
+  });
+  emit({ instance: rm.name, project: project.identifier, version: after, check }, () =>
+    `Веха создана: «${after.name}» (id=${after.id}) в проекте ${title}\n` +
+      `${projectUrl(rm, project.identifier)}/roadmap\n${check.text}\n` +
+      `Привязать задачу: redmine.ts update-issue <id> --version "${after.name}" --yes`,
+  );
+  if (!check.ok) process.exitCode = 1;
 }
 
 // ─────────────────────────── участники проекта ─────────────────────────
@@ -5212,25 +6151,43 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   if (estimated) {
     patch.estimated_hours = /^(none|нет|0)$/i.test(estimated.trim()) ? "" : round2(parseHours(estimated));
   }
+  // Карточка задачи нужна и исполнителю по имени, и вехе по имени — читается один раз на обоих.
+  let issueMemo: Issue | null = null;
+  const issueCard = async (): Promise<Issue> =>
+    (issueMemo ??= (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`)).issue);
+
   const assignee = str(args, "assignee");
   if (assignee) {
     // Проект задачи нужен, чтобы разрешить имя исполнителя по участникам.
-    const project = /^(me|\d+)$/.test(assignee.trim())
-      ? undefined
-      : (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`)).issue.project.id;
+    const project = /^(me|\d+)$/.test(assignee.trim()) ? undefined : (await issueCard()).project.id;
     patch.assigned_to_id = await resolveAssignee(rm, assignee, project);
+  }
+  // Понятные значения полей для предпросмотра: голый fixed_version_id человеку ничего не говорит.
+  const labels: Record<string, string> = {};
+  const version = str(args, "version");
+  if (args.flags.has("version") && version === undefined) {
+    throw new UserError('Флаг --version ожидает имя вехи, её номер или «none»: --version "1.0 Обмен с 1С".');
+  }
+  if (version !== undefined) {
+    // Список вех нужен только для поиска по имени: снятие вехи обходится без запроса.
+    const list = versionClears(version) ? [] : await loadVersions(rm, (await issueCard()).project);
+    const picked = versionPatchValue(version, list);
+    patch.fixed_version_id = picked.id;
+    labels.fixed_version_id = picked.label;
   }
   const due = str(args, "due");
   if (due) patch.due_date = parseDate(due);
   if (Object.keys(patch).length === 0) {
-    throw new UserError("Нечего менять: задайте --status/--done/--note/--description/--subject/--assignee/--due/--parent/--estimated.");
+    throw new UserError(
+      "Нечего менять: задайте --status/--done/--note/--description/--subject/--assignee/--due/--parent/--estimated/--version.",
+    );
   }
 
   checkOutgoing({ комментарий: note, описание: description, тема: subject }, args);
 
   const rows = Object.entries(patch)
     .filter(([k]) => k !== "notes" && k !== "description")
-    .map(([k, v]) => [k, clip(String(v), 70)]);
+    .map(([k, v]) => [k, labels[k] ?? clip(String(v), 70)]);
   const preview =
     `ИЗМЕНЕНИЕ #${id} · инстанс ${rm.name}\n${issueUrl(rm, id)}\n` +
     (rows.length ? table(rows) : "(только текст)") +
@@ -5243,7 +6200,14 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   await request(rm, "PUT", `issues/${id}.json`, undefined, { issue: patch });
   const r = await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`);
   const i = r.issue;
-  emit(i, () => `#${i.id} обновлена: статус ${i.status.name}, готовность ${i.done_ratio}%\n${issueUrl(rm, i.id)}`);
+  // Веху Redmine может не принять молча (чужая вехе задача, закрытая веха) — сверяем по перечитанной задаче.
+  const versionCheck =
+    patch.fixed_version_id === undefined ? null : checkIssueVersion(i.fixed_version, patch.fixed_version_id as number | "");
+  emit(i, () =>
+    `#${i.id} обновлена: статус ${i.status.name}, готовность ${i.done_ratio}%\n${issueUrl(rm, i.id)}` +
+      (versionCheck ? `\n${versionCheck}` : ""),
+  );
+  if (versionCheck?.startsWith("РАСХОЖДЕНИЕ")) process.exitCode = 1;
 }
 
 // ─────────────────── разбор зависших задач и закрытие ─────────────────
@@ -7071,8 +8035,8 @@ function cmdHelp(): void {
 
 ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: команды log, batch, comment, create-issue, create-tree,
 update-issue, edit, create-project, update-project, archive-project, close-project,
-reopen-project, relate, unrelate, add-member, update-member, remove-member, wiki-update
-без --yes печатают полный предпросмотр и ничего не отправляют.
+reopen-project, relate, unrelate, add-member, update-member, remove-member, wiki-update,
+wiki-delete, create-version без --yes печатают полный предпросмотр и ничего не отправляют.
 Любой уходящий текст проверяется на компрометацию (секреты, ПДн, внутренние адреса,
 самооговор). Запрет снимается только флагом --override-guard.
   scan --text "..."|--file f [--audience client|internal]   проверить текст отдельно
@@ -7108,6 +8072,22 @@ Wiki проекта
   wiki-update <проект> <страница> --text-file f [--comment "…"] [--audience internal] [--yes --base-version N]
         заменить текст или создать страницу; предпросмотр — доступ, сравнение с текущей версией и текст
         целиком; --base-version из предпросмотра защищает от записи поверх чужой правки
+  wiki-delete <проект> <страница> [--yes]
+        удалить страницу со всеми версиями и вложениями — отменить нечем, согласие берётся отдельное.
+        Дочерние страницы Redmine НЕ удаляет: они теряют родителя и уходят на верхний уровень.
+        Нужно право «Удаление wiki-страниц» — оно отдельное от «Редактирование wiki-страниц».
+        Предпросмотр печатает текст целиком: сохранить его до удаления — wiki <проект> <страница> --out f
+
+Вехи (версии) проекта
+  versions <проект>                 вехи проекта: имя, статус, срок, число задач, описание
+        задачи считаются по выборке, видимой владельцу ключа; разделённые вехи родительских
+        проектов показываются здесь же — в этом проекте они не правятся
+  create-version <проект> --name "…" [--due дата] [--description "…"|--description-file f]
+                 [--status open|locked|closed] [--sharing none|descendants|hierarchy|tree|system] [--yes]
+        имя вехи уникально внутри проекта — двойник команда останавливает до отправки;
+        нужно право «Управление версиями» (обычно у роли «Менеджер»);
+        переименование, сдвиг срока и удаление вехи — только в интерфейсе: настройки проекта → «Версии»
+        привязать задачу к вехе: update-issue <id> --version "<имя>" · снять: --version none
 
 Участники проекта
   members <проект>                  участники: пользователь или группа, роли, номер членства
@@ -7167,7 +8147,14 @@ Wiki проекта
         готовая строка со ссылкой на задачу — для вставки в текст на другом инстансе
   detect-markup [--project X]       какая разметка принята на инстансе (textile/markdown/html)
   comment <id> --text "..."|--text-file f [--private] [--dry-run]
-  update-issue <id> [--status имя] [--done N] [--note текст] [--assignee me|id|имя] [--due дата] [--dry-run]
+  update-issue <id> [--status имя] [--done N] [--note текст|--note-file f] [--assignee me|id|имя] [--due дата]
+               [--subject "..."] [--description "..."|--description-file f] [--parent N|none] [--estimated 8]
+               [--version <имя|id|none>] [--dry-run]
+        тему, описание, родителя и оценку команда меняет давно — в справке их не было,
+        и приходилось искать флаги в коде;
+        --version привязывает задачу к вехе проекта (поле «Версия»), --version none снимает её;
+        имя вехи ищется среди вех проекта задачи — список: redmine.ts versions <проект>;
+        после записи веха перечитывается: Redmine отвечает успехом и на веху, которую не принял
 
 Трудозатраты
   log --issue N --hours 2.5 [--date today|YYYY-MM-DD|-1] [--comment "..."|--comment-file f] [--activity имя] [--dry-run]
@@ -7175,6 +8162,12 @@ Wiki проекта
         на контуре с "requireComment": true пустой комментарий отклоняется до отправки
   batch [--file entries.json | stdin] [--dry-run]
         JSON-массив: [{"issue":1234,"hours":"1h30","date":"2026-09-21","comment":"...","activity":"Разработка"}]
+  pending list | add | approve <id> | drop <id>       очередь неодобренных трудозатрат
+        часы, присланные соседними сессиями, кладутся сюда и в Redmine сами не уходят
+        add --from "<сессия>" [--issue N] [--hours H] [--date D] [--comment "..."] [--method "чем замерено"]
+        approve <id> [--issue N] [--hours H] [--comment "..."] --yes   списывает и убирает из очереди
+        drop <id> [--why "..."]                                        убирает, ничего не списывая
+        промежутки параллельных сессий перекрываются: складывать их часы нельзя, раскладывает человек
   entries [--period week|last-week|month|last-month|YYYY-MM|A..B] [--from --to]
           [--user me|id|all] [--project X] [--issue N] [--group issue|date|project|activity|user]
   gaps [--period ...] [--target 8] [--weekends]      дни с недобором часов
@@ -7191,6 +8184,130 @@ Wiki проекта
 }
 
 // ─────────────────────────────── точка входа ──────────────────────────
+
+/**
+ * Очередь неодобренных трудозатрат.
+ *
+ * Часы, присланные соседними сессиями, в Redmine сами не уходят: они ложатся сюда и ждут
+ * решения человека. Причина не в недоверии к сессиям, а в том, что промежутки параллельных
+ * сессий перекрываются — одни и те же минуты, списанные из двух мест, попадут в счёт дважды.
+ * Разложить их по задачам может только человек, и до его слова цифра остаётся черновиком.
+ */
+type PendingEntry = {
+  id: string;
+  added: string;
+  from: string;
+  instance?: string;
+  issue?: number;
+  hours?: number;
+  date?: string;
+  comment?: string;
+  /** Чем замерено: окно по коммитам с порогом, присутствие в сессии, артефакты. */
+  method?: string;
+};
+
+const PENDING_FILE = `${HOME}/.redmine/pending.json`;
+
+async function pendingRead(): Promise<PendingEntry[]> {
+  try {
+    const raw = await Bun.file(PENDING_FILE).text();
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as PendingEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function pendingWrite(rows: PendingEntry[]): Promise<void> {
+  await Bun.write(PENDING_FILE, JSON.stringify(rows, null, 2) + "\n");
+}
+
+async function cmdPending(rm: Resolved, args: Args): Promise<void> {
+  const sub = (args.positional[0] ?? "list").toLowerCase();
+  const rows = await pendingRead();
+
+  if (sub === "list") {
+    if (rows.length === 0) {
+      console.log("Очередь пуста: неодобренных трудозатрат нет.");
+      return;
+    }
+    console.log(`Ждут вашего решения: ${rows.length}\n`);
+    for (const r of rows) {
+      const target = r.issue === undefined ? "задача не названа" : `#${r.issue}`;
+      const hours = r.hours === undefined ? "часы не названы" : `${r.hours.toFixed(2)}ч`;
+      console.log(`${r.id}  ${r.date ?? "дата не названа"}  ${hours}  ${target}  ← ${r.from}`);
+      if (r.comment) console.log(`     ${r.comment}`);
+      if (r.method) console.log(`     замер: ${r.method}`);
+      else console.log(`     замер: НЕ НАЗВАН — спросить, прежде чем списывать`);
+    }
+    console.log(`\nОдобрить: pending approve <id> --yes   ·   убрать: pending drop <id>`);
+    console.log(`Складывать часы разных сессий нельзя: их промежутки перекрываются.`);
+    return;
+  }
+
+  if (sub === "add") {
+    const from = str(args, "from");
+    if (!from) throw new UserError("Нужен --from: какая сессия прислала часы.");
+    const next = rows.reduce((max, r) => Math.max(max, Number(r.id.replace(/\D/g, "")) || 0), 0) + 1;
+    const entry: PendingEntry = {
+      id: `p${next}`,
+      added: new Date().toISOString(),
+      from,
+      instance: str(args, "instance") ?? rm.name,
+      issue: num(args, "issue"),
+      hours: num(args, "hours"),
+      date: str(args, "date"),
+      comment: str(args, "comment"),
+      method: str(args, "method"),
+    };
+    rows.push(entry);
+    await pendingWrite(rows);
+    console.log(`Записано в очередь: ${entry.id}. В Redmine ничего не ушло.`);
+    if (!entry.method) console.log("Способ замера не назван — спросите сессию, прежде чем одобрять.");
+    return;
+  }
+
+  const id = args.positional[1];
+  if (!id) throw new UserError(`Нужен номер записи: pending ${sub} <id>. Список — pending list.`);
+  const index = rows.findIndex((r) => r.id === id);
+  if (index === -1) throw new UserError(`Записи ${id} в очереди нет.`);
+  const entry = rows[index]!;
+
+  if (sub === "drop") {
+    rows.splice(index, 1);
+    await pendingWrite(rows);
+    const why = str(args, "why");
+    console.log(`Убрано из очереди: ${id}${why ? ` — ${why}` : ""}. В Redmine ничего не списано.`);
+    return;
+  }
+
+  if (sub === "approve") {
+    const issue = num(args, "issue") ?? entry.issue;
+    const hours = num(args, "hours") ?? entry.hours;
+    if (issue === undefined) throw new UserError(`У ${id} не названа задача. Одобряйте с --issue N.`);
+    if (hours === undefined) throw new UserError(`У ${id} не названы часы. Одобряйте с --hours H.`);
+    const comment = str(args, "comment") ?? entry.comment;
+    const forward: Args = {
+      cmd: "log",
+      positional: [],
+      flags: new Map(args.flags),
+      repeated: new Map(args.repeated),
+    };
+    forward.flags.set("issue", String(issue));
+    forward.flags.set("hours", String(hours));
+    if (entry.date && !forward.flags.has("date")) forward.flags.set("date", entry.date);
+    if (comment) forward.flags.set("comment", comment);
+    await cmdLog(rm, forward);
+    if (bool(args, "yes")) {
+      rows.splice(index, 1);
+      await pendingWrite(rows);
+      console.log(`Запись ${id} убрана из очереди.`);
+    }
+    return;
+  }
+
+  throw new UserError(`Не знаю подкоманду «${sub}». Есть: list, add, approve, drop.`);
+}
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
@@ -7246,6 +8363,9 @@ async function main(): Promise<void> {
     wiki: cmdWiki,
     "wiki-history": cmdWikiHistory,
     "wiki-update": cmdWikiUpdate,
+    "wiki-delete": cmdWikiDelete,
+    versions: cmdVersions,
+    "create-version": cmdCreateVersion,
     members: cmdMembers,
     roles: cmdRoles,
     "add-member": cmdAddMember,
@@ -7268,6 +8388,7 @@ async function main(): Promise<void> {
     "detect-markup": cmdDetectMarkup,
     comment: cmdComment,
     log: cmdLog,
+    pending: cmdPending,
     batch: cmdBatch,
     entries: cmdEntries,
     report: cmdEntries,

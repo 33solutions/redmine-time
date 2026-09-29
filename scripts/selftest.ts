@@ -10,7 +10,7 @@ import { buildSessions, buildGroups, plural, draftDescription, type Commit } fro
 import { categorize, monthsSince } from "./redmine.ts";
 import { translit, slugIdentifier, identifierProblem } from "./redmine.ts";
 import { explainTimeEntryRejection } from "./redmine.ts";
-import { isHumanRecord, cleanText, buildBlocks, summarize, type HumanMessage } from "./sessions.ts";
+import { isHumanRecord, isQueuedHumanRecord, recordText, cleanText, buildBlocks, summarize, type HumanMessage } from "./sessions.ts";
 import { parseFieldSpec, assignProjectFields, type ProjectField } from "./redmine.ts";
 import { dayTotals, loadWarnings, reconcileHours } from "./redmine.ts";
 import {
@@ -96,6 +96,38 @@ import {
   type WikiPage,
   type WikiUpdateContext,
   type ProjectStatusContext,
+} from "./redmine.ts";
+import {
+  readWikiDelete,
+  wikiDeleteRequest,
+  wikiDeletePreview,
+  checkWikiDeleted,
+  WIKI_DELETE_CONFIRMATION,
+  readVersions,
+  readCreateVersion,
+  createVersionRequest,
+  createVersionPreview,
+  versionStatus,
+  versionSharing,
+  versionStatusName,
+  describeVersionStatus,
+  describeVersionSharing,
+  matchVersion,
+  versionClears,
+  versionPatchValue,
+  checkIssueVersion,
+  sortVersions,
+  versionDueHint,
+  versionCountText,
+  versionRows,
+  explainVersionRejection,
+  checkVersionCreated,
+  MANAGE_VERSIONS_PERMISSION,
+  VERSION_NAME_SOFT,
+  type Version,
+  type VersionCount,
+  type WikiDeleteContext,
+  type CreateVersionContext,
 } from "./redmine.ts";
 import { posix, win32 } from "node:path";
 
@@ -1558,6 +1590,399 @@ check(
   { ok: true, text: "Сверка: статус проекта — закрыт — только чтение; подпроекты закрыты: 0 из 1 (не удалось перечитать: «Дочерний»)." },
 );
 
+// ── удаление страницы wiki ────────────────────────────────────────────
+check("wiki-delete: разбор", readWikiDelete(parseArgs(["wiki-delete", "p", "Сверка_документа", "--yes"])), {
+  project: "p",
+  page: "Сверка_документа",
+});
+check(
+  "wiki-delete: проект флагом, страница словом",
+  readWikiDelete(parseArgs(["wiki-delete", "--project", "p", "Сверка"])).page,
+  "Сверка",
+);
+checkThrows("wiki-delete: без страницы", () => readWikiDelete(parseArgs(["wiki-delete", "p"])));
+checkThrows("wiki-delete: без проекта", () => readWikiDelete(parseArgs(["wiki-delete"])));
+checkThrows("wiki-delete: название из двух слов без кавычек", () => readWikiDelete(parseArgs(["wiki-delete", "p", "Как", "подать"])));
+
+const deleteReq = wikiDeleteRequest("oneclick33", "Сверка_документа_с_кодом_28092026");
+check("wiki-delete: метод DELETE и путь страницы", [deleteReq.method, deleteReq.path], [
+  "DELETE",
+  wikiPath("oneclick33", "Сверка_документа_с_кодом_28092026"),
+]);
+check("wiki-delete: удаление идёт без тела запроса", Object.keys(deleteReq), ["method", "path"]);
+checkThrows("wiki-delete: пустое название", () => wikiDeleteRequest("p", "   "));
+
+// Точки Redmine из названия выбрасывает молча: «…28.09.2026» хранится как «…28092026».
+check("wiki-delete: точки из названия Redmine выбрасывает", wikiTitle("Сверка_документа_с_кодом_28.09.2026"), "Сверка_документа_с_кодом_28092026");
+
+const deletePage: WikiPage = {
+  title: "Сверка_документа_с_кодом_28092026",
+  version: 3,
+  text: "<p>Испорченный заголовок</p>",
+  author: { id: 5, name: "Светлана Кудрина" },
+  comments: "",
+  updated_on: "2026-09-28T09:00:00Z",
+  attachments: [{ id: 41, filename: "сверка.xlsx", filesize: 2048 }],
+};
+const deleteCtx: WikiDeleteContext = {
+  instance: "company",
+  project: { id: 42, name: "OneClick33", identifier: "oneclick33", isPublic: false },
+  requested: "Сверка_документа_с_кодом_28.09.2026",
+  page: deletePage,
+  url: "https://r.example/projects/oneclick33/wiki/Сверка_документа_с_кодом_28092026",
+  versions: 3,
+  children: ["Приложение_А", "Приложение_Б"],
+  attachments: deletePage.attachments ?? null,
+  rights: { state: "yes", roles: ["Менеджер"] },
+};
+const deleteText = wikiDeletePreview(deleteCtx);
+check("предпросмотр удаления: все версии уйдут", lineOf(deleteText, "Уйдёт целиком").includes("версий 3"), true);
+check("предпросмотр удаления: вложения названы", lineOf(deleteText, "Вложения").includes("сверка.xlsx"), true);
+check(
+  "предпросмотр удаления: дочерние не удаляются, а поднимаются на верхний уровень",
+  lineOf(deleteText, "Дочерние страницы").includes("НЕ удаляются, станут страницами верхнего уровня"),
+  true,
+);
+check("предпросмотр удаления: приведённое название видно", lineOf(deleteText, "Название").includes("так её хранит Redmine"), true);
+check("предпросмотр удаления: текст страницы целиком", deleteText.includes("<p>Испорченный заголовок</p>"), true);
+check("предпросмотр удаления: как сохранить текст до удаления", deleteText.includes("--out <файл>"), true);
+check("предпросмотр удаления: отдельное подтверждение", deleteText.includes(WIKI_DELETE_CONFIRMATION), true);
+check("предпросмотр удаления: откатить нечем", deleteText.includes("откатить нечем"), true);
+check("предпросмотр удаления: нужное право", deleteText.includes("«Удаление wiki-страниц»"), true);
+check(
+  "предпросмотр удаления: без дочерних и вложений",
+  lineOf(wikiDeletePreview({ ...deleteCtx, children: [], attachments: [] }), "Дочерние страницы").includes("нет"),
+  true,
+);
+check(
+  "предпросмотр удаления: вложения не прочитались — сказано прямо",
+  lineOf(wikiDeletePreview({ ...deleteCtx, attachments: null }), "Вложения").includes("прочитать не удалось"),
+  true,
+);
+
+check(
+  "сверка удаления: страницы нет, дочерние поднялись",
+  checkWikiDeleted("Сверка", null, [{ title: "Приложение_А", parent: null, exists: true }]),
+  {
+    ok: true,
+    text: "Сверка: страницы «Сверка» в wiki больше нет. Дочерние страницы (1) остались и стали страницами верхнего уровня: «Приложение_А».",
+  },
+);
+check("сверка удаления: без дочерних", checkWikiDeleted("Сверка", null, []), {
+  ok: true,
+  text: "Сверка: страницы «Сверка» в wiki больше нет.",
+});
+check(
+  "сверка удаления: страница на месте — расхождение",
+  checkWikiDeleted("Сверка", { ...deletePage, title: "Сверка" }, []).ok,
+  false,
+);
+check(
+  "сверка удаления: дочерняя всё ещё за удалённой — расхождение",
+  checkWikiDeleted("Сверка", null, [{ title: "Приложение_А", parent: "Сверка", exists: true }]).text.includes("РАСХОЖДЕНИЕ"),
+  true,
+);
+// Предпросмотр обещает, что дочерние страницы уцелеют: если они исчезли, обещание было неверным.
+check(
+  "сверка удаления: дочерняя исчезла вместе с родителем — расхождение",
+  checkWikiDeleted("Сверка", null, [{ title: "Приложение_А", parent: null, exists: false }]).text.includes("исчезли вместе с родителем"),
+  true,
+);
+
+const delete403 = explainWikiRejection(403, [], { action: "delete", project: "«OneClick33»", page: "Сверка" }) ?? "";
+check("отказ удаления 403: нужно право удаления", delete403.includes("«Удаление wiki-страниц»"), true);
+check("отказ удаления 403: право отдельное от правки", delete403.includes("отдельное от «Редактирование wiki-страниц»"), true);
+check("отказ удаления 403: страница не изменилась", delete403.includes("Страница не изменилась"), true);
+check(
+  "отказ удаления 404: ничего не удалено",
+  (explainWikiRejection(404, [], { action: "delete", project: "«OneClick33»", page: "Сверка" }) ?? "").includes("Ничего не удалено"),
+  true,
+);
+check(
+  "отказ правки 403 не подменён удалением",
+  (explainWikiRejection(403, [], { action: "update", project: "«P»", page: "X" }) ?? "").includes("«Редактирование wiki-страниц»"),
+  true,
+);
+
+// ── вехи (версии) проекта ─────────────────────────────────────────────
+check("versions: разбор", readVersions(parseArgs(["versions", "oneclick33"])), { project: "oneclick33" });
+check("versions: проект флагом", readVersions(parseArgs(["versions", "--project", "oneclick33"])), { project: "oneclick33" });
+checkThrows("versions: без проекта", () => readVersions(parseArgs(["versions"])));
+checkThrows("versions: название из двух слов без кавычек", () => readVersions(parseArgs(["versions", "Lead", "agent"])));
+
+check(
+  "create-version: полный разбор",
+  readCreateVersion(
+    parseArgs([
+      "create-version", "oneclick33",
+      "--name", "1. Обмен с 1С",
+      "--due", "2026-12-31",
+      "--description", "Двусторонний обмен номенклатурой",
+      "--status", "locked",
+      "--sharing", "descendants",
+      "--yes",
+    ]),
+  ),
+  {
+    project: "oneclick33",
+    name: "1. Обмен с 1С",
+    due: "2026-12-31",
+    description: "Двусторонний обмен номенклатурой",
+    status: "locked",
+    sharing: "descendants",
+  },
+);
+check("create-version: по умолчанию веха открыта и не разделяется", readCreateVersion(parseArgs(["create-version", "p", "--name", "1.0"])), {
+  project: "p",
+  name: "1.0",
+  status: "open",
+  sharing: "none",
+});
+check(
+  "create-version: срок из DD.MM.YYYY приводится к ISO",
+  readCreateVersion(parseArgs(["create-version", "p", "--name", "1.0", "--due", "31.12.2026"])).due,
+  "2026-12-31",
+);
+check(
+  "create-version: описание файлом",
+  readCreateVersion(parseArgs(["create-version", "p", "--name", "1.0", "--description-file", "veha.md"])).descriptionFile,
+  "veha.md",
+);
+checkThrows("create-version: без имени", () => readCreateVersion(parseArgs(["create-version", "p"])));
+checkThrows("create-version: имя пустой строкой", () => readCreateVersion(parseArgs(["create-version", "p", "--name", "   "])));
+checkThrows("create-version: без проекта", () => readCreateVersion(parseArgs(["create-version", "--name", "1.0"])));
+checkThrows(
+  "create-version: --description и --description-file вместе",
+  () => readCreateVersion(parseArgs(["create-version", "p", "--name", "1.0", "--description", "х", "--description-file", "f"])),
+);
+checkThrows("create-version: --due без значения", () => readCreateVersion(parseArgs(["create-version", "p", "--name", "1.0", "--due"])));
+checkThrows("create-version: --status без значения", () => readCreateVersion(parseArgs(["create-version", "p", "--name", "1.0", "--status"])));
+checkThrows("create-version: неизвестный статус", () => readCreateVersion(parseArgs(["create-version", "p", "--name", "1.0", "--status", "черновик"])));
+checkThrows("create-version: неизвестное разделение", () => readCreateVersion(parseArgs(["create-version", "p", "--name", "1.0", "--sharing", "всем"])));
+checkThrows("create-version: лишние слова", () => readCreateVersion(parseArgs(["create-version", "Lead", "agent", "--name", "1.0"])));
+
+check("статус вехи: русский синоним", [versionStatus("Закрыта"), versionStatus("заблокирована")], ["closed", "locked"]);
+check("статус вехи: по умолчанию открыта", versionStatus(undefined), "open");
+check("разделение вехи: русский синоним", [versionSharing("дерево"), versionSharing("подпроекты")], ["tree", "descendants"]);
+check("статус вехи словами", versionStatusName("locked"), "заблокирована");
+check("статус вехи с последствиями", describeVersionStatus("locked").includes("новые задачи к ней не привязать"), true);
+check("разделение вехи словами", describeVersionSharing("hierarchy").includes("родител"), true);
+check("статус вехи: неизвестное значение не выдумывается", versionStatusName("frozen"), "frozen");
+
+// ── вехи: тело запроса ────────────────────────────────────────────────
+const versionReq = createVersionRequest("oneclick33", {
+  name: "  1. Обмен с 1С  ",
+  due: "2026-12-31",
+  description: "  Двусторонний обмен  ",
+  status: "open",
+  sharing: "none",
+});
+check("create-version: метод и путь", [versionReq.method, versionReq.path], ["POST", "projects/oneclick33/versions.json"]);
+check("create-version: тело запроса", versionReq.body, {
+  version: { name: "1. Обмен с 1С", status: "open", sharing: "none", due_date: "2026-12-31", description: "Двусторонний обмен" },
+});
+check(
+  "create-version: без срока и описания их нет в теле",
+  createVersionRequest(7, { name: "1.0", due: undefined, description: undefined, status: "open", sharing: "none" }).body,
+  { version: { name: "1.0", status: "open", sharing: "none" } },
+);
+check(
+  "create-version: описание из одних пробелов не уходит",
+  createVersionRequest("p", { name: "1.0", due: undefined, description: "   ", status: "open", sharing: "none" }).body.version,
+  { name: "1.0", status: "open", sharing: "none" },
+);
+checkThrows(
+  "create-version: пустое имя",
+  () => createVersionRequest("p", { name: "  ", due: undefined, description: undefined, status: "open", sharing: "none" }),
+);
+checkThrows(
+  "create-version: имя длиннее 255 знаков",
+  () => createVersionRequest("p", { name: "в".repeat(256), due: undefined, description: undefined, status: "open", sharing: "none" }),
+);
+checkThrows(
+  "create-version: описание длиннее 255 знаков",
+  () => createVersionRequest("p", { name: "1.0", due: undefined, description: "я".repeat(256), status: "open", sharing: "none" }),
+);
+checkThrows(
+  "create-version: срок не датой",
+  () => createVersionRequest("p", { name: "1.0", due: "31.12.2026", description: undefined, status: "open", sharing: "none" }),
+);
+
+// ── вехи: поиск и привязка задачи ─────────────────────────────────────
+const versionsFixture: Version[] = [
+  { id: 11, name: "1. Обмен с 1С", status: "open", due_date: "2026-10-31", description: "Номенклатура и цены", sharing: "none" },
+  { id: 12, name: "2. Личный кабинет", status: "open", due_date: null, description: null, sharing: "descendants" },
+  { id: 13, name: "3. Обмен заказами", status: "locked", due_date: "2026-09-20", sharing: "none" },
+];
+check("веха: по номеру", matchVersion(versionsFixture, "12").name, "2. Личный кабинет");
+check("веха: по точному имени", matchVersion(versionsFixture, "1. Обмен с 1С").id, 11);
+check("веха: по части имени", matchVersion(versionsFixture, "Личный").id, 12);
+check("веха: регистр не важен", matchVersion(versionsFixture, "3. обмен заказами").id, 13);
+checkThrows("веха: часть имени подходит двум", () => matchVersion(versionsFixture, "Обмен"));
+checkThrows("веха: имени нет", () => matchVersion(versionsFixture, "Витрина"));
+// Чужой номер не подставляется молча: иначе Redmine получил бы веху другого проекта.
+checkThrows("веха: неизвестный номер не подставляется", () => matchVersion(versionsFixture, "99"));
+checkThrows("веха: у проекта вех нет", () => matchVersion([], "1.0"));
+
+check("веха: none снимает", [versionClears("none"), versionClears("нет"), versionClears("снять")], [true, true, true]);
+check("веха: имя вехи за снятие не принимается", versionClears("1. Обмен с 1С"), false);
+check("привязка: none даёт пустую строку", versionPatchValue("none", versionsFixture), {
+  id: "",
+  label: "снять — задача останется без вехи",
+});
+check("привязка: имя даёт номер вехи", versionPatchValue("Личный", versionsFixture).id, 12);
+check("привязка: в предпросмотре видно срок", versionPatchValue("1. Обмен", versionsFixture).label.includes("срок 2026-10-31"), true);
+check("привязка: срок не задан — так и сказано", versionPatchValue("Личный", versionsFixture).label.includes("срок не задан"), true);
+check("привязка: заблокированная веха названа заблокированной", versionPatchValue("13", versionsFixture).label.includes("заблокирована"), true);
+
+check("сверка привязки: веха та же", checkIssueVersion({ id: 11, name: "1. Обмен с 1С" }, 11).startsWith("Сверка:"), true);
+check("сверка привязки: веха снята", checkIssueVersion(null, ""), "Сверка: веха с задачи снята.");
+check("сверка привязки: снять не удалось", checkIssueVersion({ id: 11, name: "1. Обмен" }, "").includes("РАСХОЖДЕНИЕ"), true);
+// Redmine отвечает успехом и на веху, которую не принял: без сверки привязка терялась бы молча.
+check("сверка привязки: вехи нет — расхождение", checkIssueVersion(undefined, 11).includes("РАСХОЖДЕНИЕ"), true);
+check("сверка привязки: веха другая — расхождение", checkIssueVersion({ id: 12, name: "2. ЛК" }, 11).includes("РАСХОЖДЕНИЕ"), true);
+
+// ── вехи: список ──────────────────────────────────────────────────────
+check("вехи: сортировка по сроку, без срока — в конец", sortVersions(versionsFixture).map((v) => v.id), [13, 11, 12]);
+check("срок вехи: сегодня", versionDueHint("2026-09-29", "2026-09-29"), "2026-09-29 (сегодня)");
+check("срок вехи: просрочен", versionDueHint("2026-09-20", "2026-09-29"), "2026-09-20 (просрочен на 9 дней)");
+check("срок вехи: впереди", versionDueHint("2026-10-01", "2026-09-29"), "2026-10-01 (через 2 дня)");
+check("срок вехи: не задан", versionDueHint(null, "2026-09-29"), "не задан");
+check("задачи вехи: нет", versionCountText({ total: 0, open: 0 }), "нет");
+check("задачи вехи: сколько всего и сколько открыто", versionCountText({ total: 9, open: 4 }), "9 (открыто 4)");
+check("задачи вехи: не прочитано — не ноль", versionCountText(null), "не прочитано");
+
+const versionCounts = new Map<number, VersionCount>([
+  [11, { total: 9, open: 4 }],
+  [12, null],
+]);
+const vRows = versionRows(versionsFixture, versionCounts, "2026-09-29");
+check("список вех: первая строка — с ближайшим сроком", vRows[0]?.[0], "3. Обмен заказами");
+check("список вех: статус и просроченный срок", [vRows[0]?.[1], vRows[0]?.[2]], ["заблокирована", "2026-09-20 (просрочен на 9 дней)"]);
+check("список вех: задачи и описание", [vRows[1]?.[3], vRows[1]?.[4]], ["9 (открыто 4)", "Номенклатура и цены"]);
+check("список вех: неизвестное число задач и пустое описание", [vRows[2]?.[3], vRows[2]?.[4]], ["не прочитано", "—"]);
+
+// ── вехи: предпросмотр создания ───────────────────────────────────────
+const versionCtx: CreateVersionContext = {
+  instance: "company",
+  project: { id: 42, name: "OneClick33", identifier: "oneclick33", isPublic: false },
+  url: "https://r.example/projects/oneclick33/roadmap",
+  name: "4. Витрина каталога",
+  due: "2026-11-30",
+  description: "Каталог и корзина на витрине",
+  status: "open",
+  sharing: "none",
+  existing: versionsFixture,
+  audience: "client",
+  warnings: 0,
+  rights: { state: "yes", roles: ["Менеджер"] },
+};
+const versionText = createVersionPreview(versionCtx);
+check("предпросмотр вехи: имя и что номер выдаст Redmine", lineOf(versionText, "Веха").includes("номер выдаст Redmine"), true);
+check("предпросмотр вехи: срок", lineOf(versionText, "Срок").includes("2026-11-30"), true);
+check("предпросмотр вехи: статус с последствиями", lineOf(versionText, "Статус").includes("задачи к ней привязываются"), true);
+check("предпросмотр вехи: разделение", lineOf(versionText, "Разделение").includes("только задачи этого проекта"), true);
+check("предпросмотр вехи: уже заведённые вехи перечислены", lineOf(versionText, "Уже в проекте").includes("«1. Обмен с 1С»"), true);
+check("предпросмотр вехи: нужное право", versionText.includes(MANAGE_VERSIONS_PERMISSION), true);
+check("предпросмотр вехи: имя уникально внутри проекта", versionText.includes("уникально внутри проекта"), true);
+check("предпросмотр вехи: как привязать задачу", versionText.includes('update-issue <id> --version "4. Витрина каталога"'), true);
+check("предпросмотр вехи: правка и удаление только в интерфейсе", versionText.includes("настройки проекта → «Версии»"), true);
+check("предпросмотр вехи: закрытый проект — кто увидит", versionText.includes("Проект закрытый"), true);
+check(
+  "предпросмотр вехи: публичный проект — видно всем",
+  createVersionPreview({ ...versionCtx, project: { ...versionCtx.project, isPublic: true } }).includes("видны всем пользователям"),
+  true,
+);
+check(
+  "предпросмотр вехи: первая веха проекта",
+  lineOf(createVersionPreview({ ...versionCtx, existing: [] }), "Уже в проекте").includes("вех нет"),
+  true,
+);
+check(
+  "предпросмотр вехи: похожая веха названа двойником",
+  createVersionPreview({ ...versionCtx, name: "1. Обмен с 1С" }).includes("не двойник"),
+  true,
+);
+check(
+  "предпросмотр вехи: длинное имя — предупреждение, а не запрет",
+  createVersionPreview({ ...versionCtx, name: "в".repeat(VERSION_NAME_SOFT + 1) }).includes("инстанс может отказать"),
+  true,
+);
+check(
+  "предпросмотр вехи: предупреждения проверки текста посчитаны",
+  lineOf(createVersionPreview({ ...versionCtx, warnings: 2 }), "Проверка").includes("предупреждений 2"),
+  true,
+);
+check(
+  "предпросмотр вехи: внутренняя аудитория названа",
+  lineOf(createVersionPreview({ ...versionCtx, audience: "internal" }), "Проверка").includes("внутренняя"),
+  true,
+);
+check("предпросмотр вехи: без срока сказано, зачем он", lineOf(createVersionPreview({ ...versionCtx, due: undefined }), "Срок").includes("не задан"), true);
+
+// ── вехи: отказы и сверка ─────────────────────────────────────────────
+const v403 = explainVersionRejection(403, [], { action: "create", project: "«OneClick33»", name: "4. Витрина" }) ?? "";
+check("отказ вехи 403: нужное право", v403.includes(MANAGE_VERSIONS_PERMISSION), true);
+check("отказ вехи 403: ничего не создано", v403.includes("Ничего не создано"), true);
+check("отказ вехи 403: путь в интерфейсе", v403.includes("«Новая версия»"), true);
+check(
+  "отказ списка вех 403: право просмотра задач",
+  (explainVersionRejection(403, [], { action: "list", project: "«P»" }) ?? "").includes("«Просмотр задач»"),
+  true,
+);
+check(
+  "отказ вехи 422: имя занято",
+  (explainVersionRejection(422, ["Name has already been taken"], { action: "create", project: "«P»", name: "1.0" }) ?? "").includes("уже есть"),
+  true,
+);
+check(
+  "отказ вехи 422: срок не дата",
+  (explainVersionRejection(422, ["Date is invalid"], { action: "create", project: "«P»" }) ?? "").includes("ГГГГ-ММ-ДД"),
+  true,
+);
+check(
+  "отказ вехи 422: ответ Redmine приведён как есть",
+  (explainVersionRejection(422, ["Something odd"], { action: "create", project: "«P»" }) ?? "").includes("Something odd"),
+  true,
+);
+check(
+  "отказ вехи 404: проект недоступен",
+  (explainVersionRejection(404, [], { action: "create", project: "«P»", name: "1.0" }) ?? "").includes("Ничего не создано"),
+  true,
+);
+check("отказ вехи: прочее не объясняется", explainVersionRejection(500, [], { action: "create", project: "«P»" }), null);
+
+const wanted = { name: "4. Витрина каталога", due: "2026-11-30", description: "Каталог", status: "open", sharing: "none" } as const;
+const createdVersion: Version = {
+  id: 14,
+  name: "4. Витрина каталога",
+  due_date: "2026-11-30",
+  description: "Каталог",
+  status: "open",
+  sharing: "none",
+};
+check("сверка вехи: поля совпали", checkVersionCreated(createdVersion, { ...wanted }).ok, true);
+check("сверка вехи: веха не читается", checkVersionCreated(null, { ...wanted }).ok, false);
+check(
+  "сверка вехи: срок на инстансе другой",
+  checkVersionCreated({ ...createdVersion, due_date: "2026-12-01" }, { ...wanted }).text.includes("срок «2026-12-01»"),
+  true,
+);
+check(
+  "сверка вехи: срок пропал",
+  checkVersionCreated({ ...createdVersion, due_date: null }, { ...wanted }).text.includes("отправлялся «2026-11-30»"),
+  true,
+);
+check("сверка вехи: имя другое", checkVersionCreated({ ...createdVersion, name: "4 Витрина" }, { ...wanted }).ok, false);
+check(
+  "сверка вехи: статус другой",
+  checkVersionCreated({ ...createdVersion, status: "locked" }, { ...wanted }).text.includes("статус «заблокирована»"),
+  true,
+);
+check("сверка вехи: описание другое", checkVersionCreated({ ...createdVersion, description: "Иное" }, { ...wanted }).ok, false);
+// Старый инстанс может не отдать статус и разделение: отсутствие поля — не расхождение.
+check("сверка вехи: инстанс не отдал статус — не расхождение", checkVersionCreated({ id: 14, name: "4. Витрина каталога", due_date: "2026-11-30", description: "Каталог" }, { ...wanted }).ok, true);
+
 // ── ключ API не уходит в вывод ────────────────────────────────────────
 {
   // Ответ Redmine на users/current.json несёт ключ владельца: он не должен дожить до вывода.
@@ -1590,6 +2015,33 @@ check(
   check("сессии: без turnOrigin принимается", isHumanRecord({ ...human, turnOrigin: undefined }), true);
   check("сессии: turnOrigin human принимается", isHumanRecord({ ...human, turnOrigin: "human" }), true);
   check("сессии: turnOrigin peer отвергается", isHumanRecord({ ...human, turnOrigin: "peer" }), false);
+
+  // Отложенное сообщение: человек набрал его, пока ассистент работал. Приходит записью
+  // типа attachment и вторым разом обычной записью НЕ появляется — замерено на живом
+  // транскрипте: 150 таких текстов, совпадений с обычными записями ноль. Без этой ветки
+  // не считалось 38% сообщений человека, а часы при пороге 30 минут занижались на треть.
+  const queued = {
+    type: "attachment", isSidechain: false, entrypoint: "claude-vscode",
+    timestamp: "2026-09-24T10:05:00.000Z", uuid: "q1",
+    attachment: {
+      type: "queued_command", origin: { kind: "human" },
+      prompt: [{ type: "text", text: "MAF не используем тут" }],
+    },
+  };
+  check("сессии: отложенное сообщение человека принимается", isQueuedHumanRecord(queued), true);
+  check("сессии: отложенное — текст достаётся из attachment",
+    cleanText(recordText(queued as never)), "MAF не используем тут");
+  // Извещения среды разработки приходят тем же типом, но помечены не человеком.
+  check("сессии: отложенное не от человека отвергается",
+    isQueuedHumanRecord({ ...queued, attachment: { ...queued.attachment, origin: { kind: "ide" } } }), false);
+  check("сессии: отложенное подагента отвергается", isQueuedHumanRecord({ ...queued, isSidechain: true }), false);
+  check("сессии: отложенное из песочницы отвергается", isQueuedHumanRecord({ ...queued, entrypoint: "local-agent" }), false);
+  check("сессии: отложенное без времени отвергается", isQueuedHumanRecord({ ...queued, timestamp: undefined }), false);
+  // Строгая проверка обычной записи не должна принимать отложенную: у той нет promptSource.
+  check("сессии: обычная проверка отложенное не принимает", isHumanRecord(queued), false);
+  // Одни служебные вставки — текст пуст, значит запись не попадёт в счёт даже пройдя проверку.
+  check("сессии: отложенное из одних вставок IDE даёт пустой текст",
+    cleanText(recordText({ attachment: { prompt: [{ type: "text", text: "<ide_opened_file>a.ts</ide_opened_file>" }] } } as never)), "");
 
   // Напоминание окружения приклеено к началу первой реплики сессии: выбрасывать запись нельзя.
   check("сессии: напоминание вырезается, текст остаётся",

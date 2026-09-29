@@ -103,6 +103,7 @@ type Record_ = {
   sessionId?: unknown;
   cwd?: unknown;
   message?: { role?: string; content?: unknown };
+  attachment?: { type?: string; prompt?: unknown; origin?: { kind?: string } };
 };
 
 /** Проверка по полям. Необходима, но недостаточна: текст проверяется отдельно. */
@@ -123,8 +124,34 @@ export function isHumanRecord(record: unknown): record is Record_ {
   return !content.some((p) => typeof p === "object" && p !== null && (p as { type?: string }).type === "tool_result");
 }
 
-export function recordText(record: { message?: { content?: unknown } }): string {
-  const content = record.message?.content;
+/**
+ * Сообщение, набранное человеком, ПОКА ассистент работал. Оно приходит записью типа
+ * "attachment" с вложением queued_command и не появляется вторым разом обычной записью:
+ * подаётся внутри идущего хода. Поэтому без этой проверки такие сообщения не считались
+ * вовсе — на одном транскрипте 150 из 400 с лишним.
+ *
+ * Считаем только помеченные origin.kind = "human". Остальные queued_command — служебные
+ * извещения среды разработки (какой файл открыт, что выделено); текст у них отсеется и
+ * в cleanText, но отбрасывать их здесь дешевле и честнее по смыслу.
+ *
+ * Поля promptSource и turnOrigin у таких записей отсутствуют, поэтому строгая проверка
+ * обычной записи для них не годится и ослаблять её нельзя — нужна отдельная.
+ */
+export function isQueuedHumanRecord(record: unknown): record is Record_ {
+  if (typeof record !== "object" || record === null) return false;
+  const r = record as Record_;
+  if (r.type !== "attachment") return false;
+  if (r.isSidechain === true) return false;
+  if (r.attachment?.type !== "queued_command") return false;
+  if (r.attachment?.origin?.kind !== "human") return false;
+  if (typeof r.entrypoint !== "string" || !ENTRYPOINTS.has(r.entrypoint)) return false;
+  if (typeof r.timestamp !== "string" || !r.timestamp) return false;
+  return Array.isArray(r.attachment?.prompt);
+}
+
+export function recordText(record: { message?: { content?: unknown }; attachment?: { prompt?: unknown } }): string {
+  // У отложенного сообщения текст лежит в attachment.prompt тем же набором частей {type,text}.
+  const content = record.message?.content ?? record.attachment?.prompt;
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
@@ -172,7 +199,7 @@ export async function readHumanMessages(files: string[]): Promise<{ messages: Hu
       } catch {
         continue; // Битая строка — пропускаем молча: одна запись картины не меняет.
       }
-      if (!isHumanRecord(record)) continue;
+      if (!isHumanRecord(record) && !isQueuedHumanRecord(record)) continue;
       const r = record as Record_;
       const uuid = String(r.uuid ?? "");
       if (uuid && seen.has(uuid)) {
