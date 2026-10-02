@@ -7,7 +7,9 @@
  * Вывод: человекочитаемый текст, либо --json для машинного разбора.
  */
 
-import { dirname, isAbsolute, join, resolve } from "node:path";
+// rm — под другим именем: в этом файле rm везде означает профиль инстанса.
+import { mkdir, readdir, readFile, rm as removePath, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { guard, scanText, formatFindings, type Audience, type Finding } from "./guard.ts";
 import { harvestRepo, isGitRepo, repoName, draftDescription, plural, type RepoBinding } from "./harvest.ts";
 import { sessionFiles, readHumanMessages, buildBlocks, summarize, localDay, localTime } from "./sessions.ts";
@@ -229,25 +231,31 @@ async function request<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    let details: string[] = [];
-    try {
-      const parsed: unknown = JSON.parse(text);
-      if (isRecord(parsed) && Array.isArray(parsed.errors)) details = parsed.errors.map(String);
-    } catch {
-      if (text.trim()) details = [text.slice(0, 300).replace(/\s+/g, " ")];
-    }
-    if (res.status === 401) details.unshift("неверный или просроченный API-ключ");
-    if (res.status === 403) details.unshift("недостаточно прав у владельца ключа");
-    if (res.status === 404) details.unshift("объект не найден или REST API отключён в настройках Redmine");
-    throw new ApiError(res.status, details, url.toString());
-  }
+  if (!res.ok) throw await apiError(res, url);
 
   if (res.status === 204) return undefined as T;
   const text = await res.text();
   if (!text.trim()) return undefined as T;
   return JSON.parse(text) as T;
+}
+
+/**
+ * Отказ Redmine — в ApiError: список errors из JSON, иначе начало текста ответа. Вынесено из request(),
+ * потому что загрузка файла (uploads.json) уходит не JSON-телом, а байтами, но отказы у неё те же.
+ */
+async function apiError(res: Response, url: URL): Promise<ApiError> {
+  const text = await res.text();
+  let details: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (isRecord(parsed) && Array.isArray(parsed.errors)) details = parsed.errors.map(String);
+  } catch {
+    if (text.trim()) details = [text.slice(0, 300).replace(/\s+/g, " ")];
+  }
+  if (res.status === 401) details.unshift("неверный или просроченный API-ключ");
+  if (res.status === 403) details.unshift("недостаточно прав у владельца ключа");
+  if (res.status === 404) details.unshift("объект не найден или REST API отключён в настройках Redmine");
+  return new ApiError(res.status, details, url.toString());
 }
 
 async function fetchAll<T>(rm: Resolved, path: string, key: string, query: Query, max = 500): Promise<T[]> {
@@ -327,6 +335,20 @@ type Issue = {
   allowed_statuses?: IdName[];
   /** Связи с другими задачами — приходят при include=relations. */
   relations?: IssueRelation[];
+  /** Приватная задача видна не всем участникам проекта; старые инстансы поле не отдают. */
+  is_private?: boolean;
+  /** Вложения — приходят при include=attachments. */
+  attachments?: IssueAttachment[];
+};
+
+/** Вложение задачи так, как его отдаёт Redmine при include=attachments. */
+export type IssueAttachment = {
+  id: number;
+  filename: string;
+  filesize: number;
+  content_type?: string | null;
+  author?: IdName;
+  created_on?: string;
 };
 
 type TimeEntry = {
@@ -7091,6 +7113,1059 @@ async function cmdComment(rm: Resolved, args: Args): Promise<void> {
   emit({ issue: id, added: true }, () => `Комментарий добавлен к #${id}: ${issueUrl(rm, id)}`);
 }
 
+// ─────────────────────────── файлы к задаче ───────────────────────────
+
+/*
+ * Файлы прикладывает сам человек — своим ключом из профиля, с его правами. Служебной учётной
+ * записи и подмены пользователя (X-Redmine-Switch-User) здесь нет и быть не должно: тогда Redmine
+ * сам решает, можно ли этому человеку писать в задачу, автором вложения в истории стоит он же,
+ * а отказ значит ровно то, что ему здесь писать нельзя, — обходить его нечем и незачем.
+ *
+ * Байты приходят из файла на диске (--file) или по короткоживущей одноразовой ссылке (--url):
+ * так их отдаёт инструмент портала, когда сотрудник переслал файл боту в мессенджере. Строка
+ * запроса такой ссылки — пропуск к файлу. Её не печатают нигде — ни в выводе, ни в ошибках,
+ * ни в сохранённой копии: только хост и путь.
+ */
+
+const ATTACH_USAGE =
+  'attach <задача|ссылка на задачу> (--file <путь> | --url <https-ссылка>)… [--note "…" | --note-file <файл>] [--yes]';
+
+/** Права, с которыми Redmine принимает вложение к задаче: хватает любого из двух. */
+export const ATTACH_PERMISSIONS = "«Добавление примечаний» или «Редактирование задач»";
+
+/** Без этой строки предпросмотр не показывается: приватных вложений в Redmine не бывает. */
+export const ATTACH_AUDIENCE_WARNING = "Файлы и примечание увидят все, кому видна задача, в том числе клиент.";
+
+/**
+ * Пределы скачивания по ссылке. Файл крупнее предела в Redmine всё равно не ляжет (предел вложений
+ * там обычно на порядок меньше), а держать в памяти гигабайты ради отказа незачем.
+ */
+export type LinkLimits = { maxBytes: number; headersMs: number; idleMs: number; totalMs: number; redirects: number };
+export const LINK_LIMITS: LinkLimits = {
+  maxBytes: 200 * 1024 * 1024,
+  headersMs: 30_000,
+  idleMs: 60_000,
+  totalMs: 10 * 60_000,
+  redirects: 5,
+};
+
+/**
+ * Копия файла, скачанного для предпросмотра. Ссылка одноразовая: предпросмотр её уже потратил,
+ * и повтор с --yes обязан взять ту же копию — ровно те байты, что видел человек. После записи копия
+ * удаляется; брошенные копии старше суток удаляет следующий запуск attach.
+ */
+export const LINK_KEEP_MS = 24 * 60 * 60 * 1000;
+const ATTACH_DIR = join(CONFIG_DIR, "attach");
+
+export type AttachInput = {
+  issue: string;
+  files: string[];
+  links: URL[];
+  note: { text: string } | { file: string } | null;
+};
+
+/** Ссылка для человека: хост и путь. Строку запроса и якорь не показываем никогда — в них пропуск к файлу. */
+export function showLink(link: URL): string {
+  let path = link.pathname;
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    // Битая процентная кодировка — путь показывается как есть.
+  }
+  return `${link.host}${path}`;
+}
+
+/** Ссылка на файл: только https — строка запроса несёт пропуск к файлу и открытым текстом по сети не ходит. */
+export function parseLink(raw: string, position: number): URL {
+  let link: URL;
+  try {
+    link = new URL(raw);
+  } catch {
+    // Саму строку не повторяем: в ней может быть пропуск к файлу.
+    throw new UserError(`--url №${position} не разбирается как адрес: нужна полная ссылка вида https://<хост>/<путь>.`);
+  }
+  if (link.protocol !== "https:") {
+    throw new UserError(
+      `--url №${position} (${link.protocol}//${showLink(link)}): принимаются только ссылки https — строка запроса ` +
+        "несёт пропуск к файлу, а по незащищённому соединению он ушёл бы открытым текстом. Ничего не скачано.",
+    );
+  }
+  return link;
+}
+
+export function readAttach(args: Args): AttachInput {
+  const fromPositional = args.positional[0];
+  const issue = (fromPositional ?? str(args, "issue"))?.trim();
+  if (!issue) throw new UserError(`Укажите задачу: redmine.ts ${ATTACH_USAGE}`);
+  noExtraWords(args, fromPositional === undefined ? 0 : 1, '--file "Акт сверки.pdf"');
+
+  // Флаг без значения — почти всегда потерянный аргумент, а не намерение: молча пропускать его нельзя.
+  const bare: Record<string, string> = {
+    file: "Флаг --file без пути: --file <путь к файлу>.",
+    url: "Флаг --url без ссылки: --url <https-ссылка>.",
+    note:
+      "Флаг --note без текста. Если текст был: PowerShell выбрасывает пустое значение аргумента, " +
+      "а длинный текст надёжнее передать файлом — --note-file <файл>.",
+    "note-file": "Флаг --note-file без пути к файлу.",
+  };
+  for (const [flag, message] of Object.entries(bare)) {
+    if (args.flags.get(flag) === true) throw new UserError(message);
+  }
+
+  // Повторяемые флаги берутся целиком, без деления по запятым: запятая бывает и в имени файла, и в ссылке.
+  const files = (args.repeated.get("file") ?? []).map((f) => f.trim()).filter(Boolean);
+  const rawLinks = (args.repeated.get("url") ?? []).map((u) => u.trim()).filter(Boolean);
+  if (files.length === 0 && rawLinks.length === 0) {
+    throw new UserError(`Нечего прикладывать: --file <путь> или --url <https-ссылка>, флаги повторяются.\n  ${ATTACH_USAGE}`);
+  }
+  const seenFiles = new Set<string>();
+  for (const file of files) {
+    const full = resolve(file);
+    if (seenFiles.has(full)) throw new UserError(`Файл ${full} указан дважды: в задачу он лёг бы два раза.`);
+    seenFiles.add(full);
+  }
+  const links = rawLinks.map((raw, index) => parseLink(raw, index + 1));
+  const seenLinks = new Set<string>();
+  for (const link of links) {
+    if (seenLinks.has(link.href)) throw new UserError(`Ссылка ${showLink(link)} указана дважды: в задачу файл лёг бы два раза.`);
+    seenLinks.add(link.href);
+  }
+
+  const text = str(args, "note");
+  const file = str(args, "note-file");
+  if (text !== undefined && file !== undefined) {
+    throw new UserError('Примечание задаётся одним способом: --note "…" или --note-file <файл>, не обоими сразу.');
+  }
+  const note = file !== undefined ? { file } : text !== undefined ? { text } : null;
+  return { issue, files, links, note };
+}
+
+// ── имя и тип файла по ответу сервера ──
+
+/** Байты строки, где каждый знак — байт: так fetch отдаёт значения заголовков. null — знак шире байта. */
+function headerBytes(text: string): Uint8Array | null {
+  const out = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code > 0xff) return null;
+    out[i] = code;
+  }
+  return out;
+}
+
+/** Процентная кодировка RFC 5987 → байты. Знак вне кодировки — байтом, если он в байт помещается. */
+function percentBytes(text: string): Uint8Array {
+  const out: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const hex = text.slice(i + 1, i + 3);
+    if (text[i] === "%" && /^[0-9a-f]{2}$/i.test(hex)) {
+      out.push(parseInt(hex, 16));
+      i += 2;
+      continue;
+    }
+    const code = text.charCodeAt(i);
+    if (code <= 0xff) out.push(code);
+    else out.push(...new TextEncoder().encode(text[i]!));
+  }
+  return new Uint8Array(out);
+}
+
+/** filename*=<кодировка>'<язык>'<значение>. null — значение не разбирается или кодировка рантайму неизвестна. */
+function decodeExtended(value: string): string | null {
+  const parts = value.match(/^([^']*)'[^']*'(.*)$/);
+  if (!parts) return null;
+  const charset = (parts[1] ?? "").trim().toLowerCase() || "utf-8";
+  try {
+    return new TextDecoder(charset, { fatal: true }).decode(percentBytes(parts[2] ?? ""));
+  } catch {
+    // Кодировка вроде windows-1251, которой Bun не знает, — откат на filename без звёздочки.
+    return null;
+  }
+}
+
+/** filename без звёздочки: многие серверы кладут туда UTF-8 как есть, а fetch читает заголовок побайтно. */
+function decodePlainFilename(value: string): string {
+  const bytes = headerBytes(value);
+  if (!bytes || !bytes.some((b) => b >= 0x80)) return value;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Имя файла из Content-Disposition (RFC 6266). filename* по RFC 5987 главнее filename: только в нём
+ * кириллица передаётся без потерь. null — заголовка нет или имени в нём нет.
+ */
+export function dispositionFilename(header: string | null): string | null {
+  if (!header) return null;
+  const params = new Map<string, string>();
+  const text = `;${header}`;
+  const re = /;\s*([^\s=;]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;]*))/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const key = m[1]!.toLowerCase();
+    if (params.has(key)) continue;
+    params.set(key, m[2] !== undefined ? m[2].replace(/\\(.)/g, "$1") : (m[3] ?? "").trim());
+  }
+  const extended = params.get("filename*");
+  const fromExtended = extended ? decodeExtended(extended) : null;
+  if (fromExtended?.trim()) return fromExtended;
+  const plain = params.get("filename");
+  return plain?.trim() ? decodePlainFilename(plain) : null;
+}
+
+/** Имя без пути и управляющих знаков: заголовок чужого сервера не должен задавать каталоги. */
+export function cleanFileName(raw: string): string {
+  const base = raw.split(/[\\/]/).pop() ?? "";
+  return base.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+}
+
+/**
+ * Имя так, как его сохранит Redmine (Attachment#sanitize_filename): знаки / ? % * : | " ' < > и переводы
+ * строк заменяются подчёркиванием. Приводится заранее — тогда предпросмотр показывает ровно то имя, что
+ * ляжет в задачу, а сверка после записи сравнивает с ним, а не с исходным.
+ */
+export function redmineFileName(name: string): string {
+  return name.replace(/[/?%*:|"'<>\n\r]+/g, "_");
+}
+
+/** Имя из пути ссылки — когда сервер не прислал Content-Disposition. */
+export function linkFileName(link: URL): string | null {
+  const last = link.pathname.split("/").filter(Boolean).pop();
+  if (!last) return null;
+  try {
+    return decodeURIComponent(last);
+  } catch {
+    return last;
+  }
+}
+
+/** Тип файла: из Content-Type, а если его нет или он ничего не говорит — по расширению имени. */
+export function fileType(header: string | null, name: string): string {
+  const essence = (header ?? "").split(";")[0]!.trim().toLowerCase();
+  if (/^[\w.+-]+\/[\w.+-]+$/.test(essence) && essence !== "application/octet-stream") return essence;
+  // Bun.file(name).type смотрит только на расширение: файл с таким путём не открывается и может не существовать.
+  return Bun.file(name).type.split(";")[0]!.trim() || "application/octet-stream";
+}
+
+/** Размер для человека: 812 Б, 1,5 КБ, 37 МБ. */
+export function formatBytes(n: number): string {
+  if (n < 1024) return `${n} Б`;
+  const units = ["КБ", "МБ", "ГБ"];
+  let value = n / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toLocaleString("ru-RU", { maximumFractionDigits: value < 10 ? 1 : 0 })} ${units[unit]}`;
+}
+
+function duration(ms: number): string {
+  return ms < 60_000 ? `${(ms / 1000).toLocaleString("ru-RU")} с` : `${(ms / 60_000).toLocaleString("ru-RU")} мин`;
+}
+
+// ── скачивание по ссылке ──
+
+/** Ответ сервера по ссылке — словами. Одноразовая ссылка гаснет после первого скачивания и по сроку. */
+export function explainLinkStatus(status: number, shown: string): string {
+  if (status === 404 || status === 410) {
+    return (
+      `По ссылке ${shown} файла уже нет (ответ ${status}): ссылка истекла или уже использована — такие ссылки ` +
+      "одноразовые и короткоживущие. Ничего не приложено. Попросите новую ссылку."
+    );
+  }
+  if (status === 401 || status === 403) {
+    return (
+      `Ссылка ${shown} отклонена (ответ ${status}): срок её действия истёк или пропуск в ней не принят. ` +
+      "Ничего не приложено. Попросите новую ссылку."
+    );
+  }
+  if (status === 429 || status >= 500) {
+    return (
+      `Сервер не отдал файл по ссылке ${shown} (ответ ${status}): сбой или перегрузка на его стороне. ` +
+      "Ничего не приложено. Повторите позже; если ссылка к тому времени истечёт — попросите новую."
+    );
+  }
+  return `По ссылке ${shown} файл не получен (ответ ${status}). Ничего не приложено. Попросите новую ссылку.`;
+}
+
+/** Чужой текст ошибки — без строк ссылок: Bun кладёт полный адрес и в сообщения, и в свойства ошибок. */
+export function redactLinks(text: string, links: URL[]): string {
+  let out = text;
+  for (const link of links) {
+    for (const secret of [link.href, link.search, link.hash, ...link.searchParams.values()]) {
+      if (secret.length >= 4) out = out.split(secret).join("…");
+    }
+  }
+  return out;
+}
+
+export type LinkFile = { bytes: Uint8Array; name: string; type: string; shown: string };
+
+/** fetch в том объёме, что нужен скачиванию; в самопроверке подменяется. */
+export type Fetcher = (
+  input: URL,
+  init: { redirect: "manual"; signal: AbortSignal; headers: Record<string, string> },
+) => Promise<Response>;
+
+/**
+ * Скачивает файл по ссылке. Перенаправления проходятся вручную: каждый шаг обязан быть https, иначе
+ * пропуск к файлу (или подписанный адрес хранилища, куда ведёт ссылка) ушёл бы открытым текстом.
+ * Ключ Redmine сюда не передаётся: у ссылки свой хозяин, и знать его ключ ему незачем.
+ */
+export async function downloadLink(link: URL, limits: LinkLimits = LINK_LIMITS, fetcher: Fetcher = fetch): Promise<LinkFile> {
+  const shown = showLink(link);
+  const seen: URL[] = [link];
+  const controller = new AbortController();
+  // Приведение, а не аннотация: значение меняют таймеры, и без него TypeScript счёл бы его навсегда null.
+  let stopped = null as "headers" | "idle" | "total" | null;
+  const stop = (why: "headers" | "idle" | "total"): void => {
+    stopped ??= why;
+    controller.abort();
+  };
+  const overall = setTimeout(() => stop("total"), limits.totalMs);
+  let idle = setTimeout(() => stop("headers"), limits.headersMs);
+  const tooBig = (declared: number | null): string =>
+    `Файл по ссылке ${shown}${declared === null ? "" : ` (${formatBytes(declared)})`} больше предела ` +
+    `${formatBytes(limits.maxBytes)} — скачивание остановлено, ничего не приложено. Такой файл прикладывают ` +
+    "в интерфейсе Redmine, если его предел вложений это позволяет.";
+
+  const follow = async (): Promise<Response> => {
+    let current = link;
+    for (let hop = 0; ; hop++) {
+      const res = await fetcher(current, { redirect: "manual", signal: controller.signal, headers: { Accept: "*/*" } });
+      const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+      if (location === null) return res;
+      await res.body?.cancel().catch(() => undefined);
+      if (hop >= limits.redirects) {
+        throw new UserError(
+          `Ссылка ${shown} перенаправляет больше ${limits.redirects} раз — скачивание остановлено, ничего не приложено. ` +
+            "Попросите новую ссылку.",
+        );
+      }
+      let next: URL;
+      try {
+        next = new URL(location, current);
+      } catch {
+        throw new UserError(`Ссылка ${shown} перенаправляет на адрес, который не разбирается. Ничего не приложено.`);
+      }
+      seen.push(next);
+      if (next.protocol !== "https:") {
+        throw new UserError(
+          `Ссылка ${shown} перенаправляет на незащищённый адрес ${next.protocol}//${showLink(next)} — скачивание ` +
+            "остановлено: пропуск к файлу ушёл бы по сети открытым текстом. Ничего не приложено.",
+        );
+      }
+      current = next;
+    }
+  };
+
+  try {
+    const res = await follow();
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new UserError(explainLinkStatus(res.status, shown));
+    }
+    const declared = Number(res.headers.get("content-length") ?? Number.NaN);
+    if (Number.isFinite(declared) && declared > limits.maxBytes) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new UserError(tooBig(declared));
+    }
+    clearTimeout(idle);
+    idle = setTimeout(() => stop("idle"), limits.idleMs);
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    const reader = res.body?.getReader();
+    while (reader) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limits.maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new UserError(tooBig(null));
+      }
+      chunks.push(value);
+      clearTimeout(idle);
+      idle = setTimeout(() => stop("idle"), limits.idleMs);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const name = cleanFileName(dispositionFilename(res.headers.get("content-disposition")) ?? linkFileName(link) ?? "") || "файл";
+    return { bytes, name, type: fileType(res.headers.get("content-type"), name), shown };
+  } catch (error) {
+    if (error instanceof UserError) throw error;
+    const later = "Ничего не приложено. Повторите; если ссылка к тому времени истечёт — попросите новую.";
+    if (stopped === "headers") throw new UserError(`Ссылка ${shown} не ответила за ${duration(limits.headersMs)} — скачивание остановлено. ${later}`);
+    if (stopped === "idle") throw new UserError(`Скачивание ${shown} замерло: ${duration(limits.idleMs)} без данных — остановлено. ${later}`);
+    if (stopped === "total") throw new UserError(`Скачивание ${shown} не уложилось в ${duration(limits.totalMs)} — остановлено. ${later}`);
+    // Код ошибки безопасен и полезен; текст — только без строк ссылок.
+    const code = isRecord(error) && typeof error.code === "string" ? `${error.code}: ` : "";
+    const message = redactLinks(error instanceof Error ? error.message : String(error), seen);
+    throw new UserError(`Не удалось скачать ${shown} — ${code}${message}. ${later}`);
+  } finally {
+    clearTimeout(overall);
+    clearTimeout(idle);
+  }
+}
+
+/** Есть ли в тексте пропуск из ссылки: сама ссылка или значение любого её параметра. */
+export function linkInText(text: string, link: URL): boolean {
+  if (text.includes(link.href)) return true;
+  for (const value of link.searchParams.values()) {
+    if (value.length >= 8 && text.includes(value)) return true;
+  }
+  return false;
+}
+
+// ── копии скачанного до отправки ──
+
+type KeptMeta = { name: string; type: string; size: number; shown: string; savedAt: string };
+type Kept = { meta: KeptMeta; path: string };
+
+/** Имя копии — хеш ссылки: сама ссылка с пропуском на диск не пишется. */
+function keptPaths(link: URL): { data: string; meta: string } {
+  const key = new Bun.CryptoHasher("sha256").update(link.href).digest("hex");
+  return { data: join(ATTACH_DIR, `${key}.bin`), meta: join(ATTACH_DIR, `${key}.json`) };
+}
+
+async function keepLink(link: URL, file: LinkFile): Promise<Kept> {
+  // Каталог и файлы — только для владельца: в них чужие документы.
+  await mkdir(ATTACH_DIR, { recursive: true, mode: 0o700 });
+  const paths = keptPaths(link);
+  const meta: KeptMeta = {
+    name: file.name,
+    type: file.type,
+    size: file.bytes.byteLength,
+    shown: file.shown,
+    savedAt: new Date().toISOString(),
+  };
+  await writeFile(paths.data, file.bytes, { mode: 0o600 });
+  await writeFile(paths.meta, JSON.stringify(meta), { mode: 0o600 });
+  return { meta, path: paths.data };
+}
+
+async function keptLink(link: URL, now = Date.now()): Promise<Kept | null> {
+  const paths = keptPaths(link);
+  try {
+    const raw: unknown = JSON.parse(await readFile(paths.meta, "utf8"));
+    if (!isRecord(raw)) return null;
+    const { name, type, size, shown, savedAt } = raw;
+    if (typeof name !== "string" || typeof type !== "string" || typeof size !== "number") return null;
+    if (typeof shown !== "string" || typeof savedAt !== "string") return null;
+    if (now - Date.parse(savedAt) > LINK_KEEP_MS) return null;
+    if ((await stat(paths.data)).size !== size) return null;
+    return { meta: { name, type, size, shown, savedAt }, path: paths.data };
+  } catch {
+    return null;
+  }
+}
+
+async function forgetLink(link: URL): Promise<void> {
+  const paths = keptPaths(link);
+  await removePath(paths.data, { force: true });
+  await removePath(paths.meta, { force: true });
+}
+
+/** Копии старше суток удаляются при каждом запуске attach: чужие документы не должны копиться в домашнем каталоге. */
+async function pruneKeptLinks(now = Date.now()): Promise<void> {
+  let names: string[];
+  try {
+    names = await readdir(ATTACH_DIR);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const path = join(ATTACH_DIR, name);
+    try {
+      if (now - (await stat(path)).mtimeMs > LINK_KEEP_MS) await removePath(path, { force: true });
+    } catch {
+      // Удалили параллельно — не важно.
+    }
+  }
+}
+
+// ── предпросмотр ──
+
+/** Проверка одного права вместе с его названием — чтобы предпросмотр назвал то право, что действительно есть. */
+export type NamedRights = { permission: string; check: RightsCheck };
+
+/** Вложение ложится, если есть хотя бы одно из прав: сводим проверки по каждому праву в одну. */
+export function mergeRights(list: NamedRights[]): NamedRights {
+  const admin = list.find((r) => r.check.state === "admin");
+  if (admin) return { permission: ATTACH_PERMISSIONS, check: admin.check };
+  const granting = list.find((r) => r.check.state === "yes");
+  if (granting) return granting;
+  const unknown = list.find((r) => r.check.state === "unknown");
+  return { permission: ATTACH_PERMISSIONS, check: (unknown ?? list[0])?.check ?? { state: "unknown", roles: [] } };
+}
+
+/** Кто увидит вложение: оно наследует видимость задачи, своей приватности у файла нет. */
+export function describeAttachAudience(projectPublic: boolean | null, issuePrivate: boolean | null): string {
+  const project =
+    projectPublic === true
+      ? "проект ПУБЛИЧНЫЙ — задачу видят все пользователи с учётной записью на инстансе, включая заказчиков"
+      : projectPublic === false
+        ? "проект закрытый — задачу видят участники проекта по своим ролям, в том числе заказчики, если они участники"
+        : "публичность проекта прочитать не удалось";
+  const issue =
+    issuePrivate === true
+      ? "задача ПРИВАТНАЯ — из них только автор, исполнитель и роли, которым видны все задачи"
+      : issuePrivate === false
+        ? "задача не приватная"
+        : "приватность задачи инстанс не сообщает";
+  return `${project}; ${issue}`;
+}
+
+export type AttachFile = {
+  kind: "file" | "url";
+  /** Откуда: путь к файлу или хост и путь ссылки — без строки запроса. */
+  from: string;
+  /** Имя, под которым файл ляжет в Redmine. */
+  name: string;
+  /** Исходное имя, если Redmine его изменит. */
+  original?: string;
+  type: string;
+  size: number;
+  /** Для ссылки: взята копия, скачанная прошлым предпросмотром, — ссылку повторно не открывали. */
+  kept?: boolean;
+};
+
+export type AttachContext = {
+  instance: string;
+  issue: { id: number; subject: string; url: string; status: string; isPrivate: boolean | null; attachments: number };
+  project: { id: number; name: string; identifier: string; isPublic: boolean | null };
+  /** Владелец ключа: от его имени уйдут файлы и примечание. */
+  author: string;
+  rights: NamedRights;
+  files: AttachFile[];
+  note: string | null;
+  audience: Audience;
+  /** Сколько предупреждений напечатала проверка (запреты до предпросмотра не доходят). */
+  warnings: number;
+};
+
+export function attachPreview(ctx: AttachContext): string {
+  const total = ctx.files.reduce((sum, f) => sum + f.size, 0);
+  const rows: string[][] = [
+    ["Задача", `#${ctx.issue.id} — ${ctx.issue.subject}`],
+    ["Адрес", ctx.issue.url],
+    ["Статус", `${ctx.issue.status}; вложений сейчас: ${ctx.issue.attachments}`],
+    ["Проект", projectTitle(ctx.project)],
+    ["Видимость", describeAttachAudience(ctx.project.isPublic, ctx.issue.isPrivate)],
+    ["Автор", `${ctx.author} — владелец ключа: файлы и примечание уйдут от его имени и с его правами`],
+    ["Права", rightsText(ctx.rights.check, ctx.rights.permission)],
+    [
+      "Проверка",
+      `аудитория «${ctx.audience === "client" ? "заказчик" : "внутренняя"}» — ` +
+        (ctx.warnings === 0 ? "замечаний нет" : `предупреждений ${ctx.warnings} (напечатаны выше)`) +
+        "; проверены примечание и имена файлов, содержимое файлов — нет",
+    ],
+  ];
+  const list = ctx.files.map((f, index) => {
+    const name = f.original ? `${f.original} → в Redmine «${f.name}»` : f.name;
+    const from =
+      f.kind === "file"
+        ? `файл ${f.from}`
+        : `ссылка ${f.from} — ${f.kept ? "копия, скачанная прошлым предпросмотром" : "скачана для предпросмотра"}`;
+    return `  ${index + 1}. ${name} · ${formatBytes(f.size)} · ${f.type}\n     ${from}`;
+  });
+  const tail = [
+    ATTACH_AUDIENCE_WARNING,
+    "Участники и наблюдатели задачи получат уведомление. Убрать вложение потом можно только в интерфейсе",
+    "(право «Редактирование задач»), а письмо к тому времени уже уйдёт.",
+  ];
+  if (ctx.files.some((f) => f.kind === "url")) {
+    tail.push(
+      "Ссылки одноразовые: скачанное хранится до отправки (не дольше суток), повтор с --yes возьмёт эти копии",
+      "и ссылки повторно не откроет.",
+    );
+  }
+  return (
+    `ВЛОЖЕНИЯ К ЗАДАЧЕ #${ctx.issue.id} · инстанс ${ctx.instance}\n${table(rows)}\n` +
+    `${RULE}\nФАЙЛЫ (${ctx.files.length}, всего ${formatBytes(total)}):\n${list.join("\n")}\n` +
+    (ctx.note !== null
+      ? `${RULE}\nПРИМЕЧАНИЕ (уйдёт в историю задачи одной записью с файлами):\n${RULE}\n${ctx.note.trim()}\n`
+      : `${RULE}\nПримечания нет: в истории задачи будет только запись о файлах.\n`) +
+    `${RULE}\n${tail.join("\n")}`
+  );
+}
+
+// ── запись, отказы, сверка ──
+
+/** Номер вложения: Redmine 3.4+ отдаёт его в ответе, а токен загрузки всегда имеет вид «<номер>.<подпись>». */
+export function uploadId(raw: unknown, token: string): number | null {
+  if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) return raw;
+  const found = token.match(/^(\d+)\./);
+  return found ? Number(found[1]) : null;
+}
+
+/**
+ * POST /uploads.json: тело — байты файла, тип строго application/octet-stream (иначе Redmine отвечает 406).
+ * В ответ — токен, которым файл потом привязывается к задаче. Тело читается с диска, в память целиком не грузится.
+ */
+async function uploadFile(rm: Resolved, source: { name: string; path: string }): Promise<{ token: string; id: number | null }> {
+  const url = new URL("uploads.json", rm.base);
+  url.searchParams.set("filename", source.name);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "X-Redmine-API-Key": rm.apiKey, Accept: "application/json", "Content-Type": "application/octet-stream" },
+    body: Bun.file(source.path),
+  });
+  if (!res.ok) throw await apiError(res, url);
+  const data: unknown = await res.json().catch(() => null);
+  const upload = isRecord(data) && isRecord(data.upload) ? data.upload : null;
+  const token = typeof upload?.token === "string" ? upload.token : "";
+  if (!token) {
+    throw new UserError(`Redmine принял файл «${source.name}», но не вернул токен загрузки — привязать его к задаче нечем. Ничего не приложено.`);
+  }
+  return { token, id: uploadId(upload?.id, token) };
+}
+
+export type AttachStage = "upload" | "attach";
+
+export type AttachRejection = {
+  stage: AttachStage;
+  issue: number;
+  instance: string;
+  file?: { name: string; size: number };
+  /** Сколько файлов уже загружено: к задаче они не привязаны и в ней не видны. */
+  uploaded: number;
+};
+
+/** Отказ Redmine при загрузке или привязке — словами: чего не хватает и что делать. null — объяснить нечем. */
+export function explainAttachRejection(status: number, details: string[], ctx: AttachRejection): string | null {
+  const file = ctx.file ? `«${ctx.file.name}» (${formatBytes(ctx.file.size)})` : "";
+  const nothing =
+    "Ничего не приложено" +
+    (ctx.uploaded === 1
+      ? ": уже загруженный файл к задаче не привязан и в ней не виден."
+      : ctx.uploaded > 1
+        ? `: уже загруженные файлы (${ctx.uploaded}) к задаче не привязаны и в ней не видны.`
+        : ".");
+  const said = details.filter((d) => !/^недостаточно прав|^объект не найден|^неверный или просроченный/.test(d)).join("; ");
+  if (status === 401) {
+    return (
+      `Redmine не принял ключ инстанса ${ctx.instance}: он неверный или отозван. ${nothing}\n` +
+      "  Перевыпустите ключ в профиле Redmine («Моя учётная запись → Ключ доступа к API») и обновите конфиг."
+    );
+  }
+  if (ctx.stage === "upload") {
+    if (status === 403) {
+      return (
+        `Файл ${file} не загружен: у владельца ключа нет права загружать файлы на инстансе ${ctx.instance}. ${nothing}\n` +
+        `  Загрузку разрешают права ${ATTACH_PERMISSIONS} (или «Добавление задач») хотя бы в одном проекте —\n` +
+        "  их выдаёт администратор Redmine или менеджер проекта. Обходного пути нет."
+      );
+    }
+    if (status === 404) {
+      return (
+        `Инстанс ${ctx.instance} не принимает файлы через API: адреса загрузки нет — REST API выключен ` +
+        `или Redmine слишком старый. ${nothing}`
+      );
+    }
+    if (status === 413) {
+      return (
+        `Файл ${file} не принят: сервер Redmine или прокси перед ним ограничивает размер запроса, и файл в этот ` +
+        `предел не уложился. ${nothing}\n` +
+        "  Предел поднимает администратор сервера; иначе — уменьшить файл (архив, сжатие) и приложить заново."
+      );
+    }
+    if (status === 422) {
+      const flat = details.join("; ");
+      if (/maximum allowed file size|exceeds the maximum|превышает максимально допустим|максимальн\S* размер/i.test(flat)) {
+        const limit = flat.match(/\(([^()]*\d[^()]*)\)/)?.[1];
+        return (
+          `Файл ${file} больше предела вложений, заданного в настройках Redmine${limit ? ` (${limit})` : ""}. ${nothing}\n` +
+          "  Предел меняет администратор: «Администрирование → Настройки → Файлы → Максимальный размер вложений».\n" +
+          "  Иначе — уменьшить файл (архив, сжатие) и приложить заново."
+        );
+      }
+      if (/extension|расширени/i.test(flat)) {
+        return (
+          `Файл ${file} не принят: его расширение запрещено настройками Redmine ` +
+          `(«Администрирование → Настройки → Файлы»). ${nothing}\n` +
+          "  Можно упаковать файл в архив разрешённого типа и приложить архив."
+        );
+      }
+      return `Redmine не принял файл ${file}: ${said || "без пояснения"}. ${nothing}`;
+    }
+    return null;
+  }
+  if (status === 403) {
+    return (
+      `Redmine отказал в правке #${ctx.issue}: у владельца ключа нет права менять эту задачу. ${nothing}\n` +
+      `  Нужно право ${ATTACH_PERMISSIONS} в её проекте; в закрытом проекте задачи только для чтения.\n` +
+      "  Права входят в роль проекта — выдаёт их администратор Redmine или менеджер проекта. Обходного пути нет:\n" +
+      "  файл прикладывает тот, у кого право есть, — своим ключом."
+    );
+  }
+  if (status === 404) {
+    return `Задачи #${ctx.issue} на инстансе ${ctx.instance} нет либо она закрыта от владельца ключа. ${nothing}`;
+  }
+  if (status === 422) {
+    return (
+      `Redmine не сохранил изменения #${ctx.issue}: ${said || "без пояснения"}. ${nothing}\n` +
+      "  Проверка касается всей задачи, а не только файлов: пустое обязательное поле, удалённое значение категории\n" +
+      "  или версии, недопустимый статус — пока такое значение не поправлено в интерфейсе, задача не сохраняется."
+    );
+  }
+  return null;
+}
+
+async function withAttachErrors<T>(ctx: AttachRejection, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (error instanceof ApiError) {
+      const explained = explainAttachRejection(error.status, error.details, ctx);
+      if (explained) throw new UserError(explained);
+    }
+    throw error;
+  }
+}
+
+/** Запись истории задачи — в том объёме, что нужен сверке примечания. */
+export type AttachJournal = { id: number; user?: IdName; notes?: string | null; details?: JournalDetail[] };
+
+export type AttachCheck = { ok: boolean; text: string; landed: IssueAttachment[] };
+
+function sameNote(a: string | null | undefined, b: string): boolean {
+  return normalizeLineBreaks(a ?? "").trim() === normalizeLineBreaks(b).trim();
+}
+
+/**
+ * Сверка после записи. Redmine отвечает 204 и тогда, когда вложение не легло (токен не нашёлся, у роли нет
+ * права), и тогда, когда примечание молча отброшено (есть «Редактирование задач», но нет «Добавление
+ * примечаний»). Верить можно только перечитанной задаче.
+ */
+export function checkAttachWrite(
+  after: { attachments?: IssueAttachment[]; journals?: AttachJournal[] } | null,
+  expected: { files: { name: string; size: number; id: number | null }[]; before: number[]; note: string | null },
+): AttachCheck {
+  if (!after) {
+    return {
+      ok: false,
+      text: "РАСХОЖДЕНИЕ: Redmine ответил успехом, но задача не перечиталась — проверьте вложения в интерфейсе.",
+      landed: [],
+    };
+  }
+  const all = after.attachments ?? [];
+  const fresh = all.filter((a) => !expected.before.includes(a.id));
+  const used = new Set<number>();
+  const landed: IssueAttachment[] = [];
+  const problems: string[] = [];
+  const renamed: string[] = [];
+  for (const want of expected.files) {
+    const hit =
+      (want.id !== null ? all.find((a) => a.id === want.id) : undefined) ??
+      fresh.find((a) => !used.has(a.id) && a.filename === want.name && a.filesize === want.size);
+    if (!hit) {
+      problems.push(`«${want.name}» в задаче нет`);
+      continue;
+    }
+    used.add(hit.id);
+    landed.push(hit);
+    if (hit.filesize !== want.size) {
+      problems.push(`«${want.name}» лёг размером ${formatBytes(hit.filesize)} вместо ${formatBytes(want.size)}`);
+    }
+    if (hit.filename !== want.name) renamed.push(`«${want.name}» → «${hit.filename}»`);
+  }
+
+  let noteText = "";
+  const note = expected.note;
+  if (note !== null) {
+    const ids = new Set(landed.map((a) => a.id));
+    const journals = after.journals ?? [];
+    // Запись истории, в которой Redmine отметил наши вложения, — та самая, куда должно было лечь примечание.
+    const carrier = journals.find((j) => (j.details ?? []).some((d) => d.property === "attachment" && ids.has(Number(d.name))));
+    if (carrier) {
+      if (sameNote(carrier.notes, note)) noteText = " Примечание записано в той же записи истории.";
+      else if (!(carrier.notes ?? "").trim()) {
+        problems.push(
+          "примечание не записано: Redmine молча отбрасывает его, когда у владельца ключа нет права «Добавление примечаний»",
+        );
+      } else problems.push("примечание в истории задачи отличается от отправленного");
+    } else if (journals.some((j) => sameNote(j.notes, note))) {
+      noteText = " Примечание записано.";
+    } else {
+      problems.push("примечания в истории задачи нет");
+    }
+  }
+
+  if (problems.length > 0) {
+    return {
+      ok: false,
+      text:
+        `РАСХОЖДЕНИЕ: Redmine ответил успехом, но ${problems.join("; ")}. ` +
+        `Легло ${landed.length} из ${expected.files.length}; проверьте задачу в интерфейсе.`,
+      landed,
+    };
+  }
+  const authors = [...new Set(landed.map((a) => a.author?.name).filter((n): n is string => Boolean(n)))];
+  return {
+    ok: true,
+    text:
+      `Сверка: в задаче ${landed.length} из ${expected.files.length}` +
+      (authors.length > 0 ? `, автор вложений — ${authors.join(", ")}` : "") +
+      "." +
+      noteText +
+      (renamed.length > 0 ? ` Redmine сохранил под другим именем: ${renamed.join(", ")}.` : ""),
+    landed,
+  };
+}
+
+// ── команда ──
+
+type AttachSource = AttachFile & { path: string; link?: URL };
+
+async function attachNote(input: AttachInput): Promise<string | null> {
+  const source = input.note;
+  if (source === null) return null;
+  if ("file" in source) {
+    const text = await readTextFile(source.file, "Примечание");
+    if (!text.trim()) {
+      throw new UserError(`Примечание: файл ${source.file} пуст. Пустой файл — не то же самое, что отсутствие флага --note-file.`);
+    }
+    return text;
+  }
+  if (!source.text.trim()) throw new UserError("Примечание пустое. Без примечания — уберите флаг --note.");
+  return source.text;
+}
+
+/** Задача по номеру или ссылке. Адрес другого профиля переключает инстанс, если --instance с ним не спорит. */
+async function attachTarget(rm: Resolved, raw: string, args: Args): Promise<{ rm: Resolved; id: number }> {
+  const known = await instanceRefs();
+  // Текущий инстанс известен всегда — даже заданный только переменными окружения, без профиля.
+  if (!known.some((k) => k.base.toLowerCase() === rm.base.toLowerCase())) known.push({ name: rm.name, base: rm.base });
+  const ref = parseIssueRef(raw, known);
+  if (ref.id <= 0) throw new UserError(`Номер задачи — положительное число, получено "${raw}".`);
+  if (ref.foreignHost) {
+    throw new UserError(
+      `Адрес ${ref.raw} не принадлежит ни одному профилю из конфига (хост ${ref.foreignHost}). Профили: redmine.ts instances.`,
+    );
+  }
+  if (!ref.instance || ref.instance === rm.name) return { rm, id: ref.id };
+  if (str(args, "instance") !== undefined) {
+    throw new UserError(
+      `Ссылка на задачу ведёт на инстанс ${ref.instance}, а --instance задаёт ${rm.name}. Уберите --instance или поправьте ссылку.`,
+    );
+  }
+  return { rm: await resolveInstance(ref.instance), id: ref.id };
+}
+
+async function loadAttachIssue(rm: Resolved, id: number): Promise<Issue> {
+  try {
+    return (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`, { include: "attachments" })).issue;
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
+      throw new UserError(
+        `Задача #${id} на инстансе ${rm.name} недоступна: её нет либо она закрыта от владельца ключа. Ничего не приложено.\n` +
+          `  Если номер верный, проверьте второй инстанс: redmine.ts issue ${id} --instance <профиль>.`,
+      );
+    }
+    throw error;
+  }
+}
+
+type AttachProject = { id: number; name: string; identifier: string; isPublic: boolean | null; status: number | null };
+
+/** Свежая карточка проекта: закрыт ли он и публичен ли — сегодняшнее состояние, а не суточный кэш. */
+async function attachProject(rm: Resolved, ref: IdName): Promise<AttachProject> {
+  try {
+    const p = await freshProject(rm, ref.id);
+    return {
+      id: p.id,
+      name: p.name,
+      identifier: p.identifier,
+      isPublic: typeof p.is_public === "boolean" ? p.is_public : null,
+      status: typeof p.status === "number" ? p.status : null,
+    };
+  } catch (error) {
+    if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
+      return { id: ref.id, name: ref.name, identifier: String(ref.id), isPublic: null, status: null };
+    }
+    throw error;
+  }
+}
+
+async function localSource(raw: string): Promise<AttachSource> {
+  const path = resolve(raw);
+  const info = await stat(path).catch(() => null);
+  if (!info) throw new UserError(`Файл не найден: ${path}. Ничего не приложено.`);
+  if (!info.isFile()) throw new UserError(`${path} — не файл (каталог или устройство): прикладывается только файл.`);
+  if (info.size === 0) throw new UserError(`Файл ${path} пуст (0 байт): прикладывать нечего.`);
+  if (info.size > LINK_LIMITS.maxBytes) {
+    throw new UserError(
+      `Файл ${path} (${formatBytes(info.size)}) больше предела ${formatBytes(LINK_LIMITS.maxBytes)}: такой прикладывают ` +
+        "в интерфейсе Redmine, если его предел вложений это позволяет.",
+    );
+  }
+  const original = cleanFileName(basename(path)) || "файл";
+  const name = redmineFileName(original);
+  return {
+    kind: "file",
+    from: path,
+    name,
+    ...(name !== original ? { original } : {}),
+    type: fileType(null, original),
+    size: info.size,
+    path,
+  };
+}
+
+async function linkSource(link: URL): Promise<AttachSource> {
+  let kept = await keptLink(link);
+  const reused = kept !== null;
+  if (kept === null) {
+    const file = await downloadLink(link);
+    if (file.bytes.byteLength === 0) {
+      throw new UserError(`По ссылке ${file.shown} пришёл пустой файл (0 байт): прикладывать нечего. Попросите новую ссылку.`);
+    }
+    kept = await keepLink(link, file);
+  }
+  const name = redmineFileName(kept.meta.name);
+  return {
+    kind: "url",
+    from: kept.meta.shown,
+    name,
+    ...(name !== kept.meta.name ? { original: kept.meta.name } : {}),
+    type: kept.meta.type,
+    size: kept.meta.size,
+    kept: reused,
+    path: kept.path,
+    link,
+  };
+}
+
+/** То, что можно показать и отдать в --json: без пути к копии и без самой ссылки. */
+function publicFile(source: AttachSource): AttachFile {
+  const { path: _path, link: _link, ...shown } = source;
+  return shown;
+}
+
+async function cmdAttach(given: Resolved, args: Args): Promise<void> {
+  const input = readAttach(args);
+
+  // Примечание проверяется до сети: запрещённый текст не должен стоить одноразовой ссылки.
+  const note = await attachNote(input);
+  const findings: Finding[] = [];
+  if (note !== null) {
+    const leaked = input.links.find((link) => linkInText(note, link));
+    if (leaked) {
+      throw new UserError(
+        `В примечании одноразовая ссылка ${showLink(leaked)}: по ней файл заберёт тот, кто прочитает задачу первым, ` +
+          "а у остальных она уже не откроется. Уберите её из текста — файл и так ляжет вложением. Ничего не отправлено.",
+      );
+    }
+    findings.push(...checkOutgoing({ примечание: note }, args));
+  }
+
+  const { rm, id } = await attachTarget(given, input.issue, args);
+  const issue = await loadAttachIssue(rm, id);
+  const project = await attachProject(rm, issue.project);
+  if (project.status === PROJECT_STATUS.closed) {
+    throw new UserError(
+      `Проект ${projectTitle(project)} закрыт: его задачи доступны только для чтения, приложить файлы нельзя.\n` +
+        `  Сначала открыть проект: redmine.ts reopen-project ${project.identifier} --instance ${rm.name}`,
+    );
+  }
+  const me = await currentUser(rm);
+  const scope = project.isPublic === null ? { id: project.id } : { id: project.id, is_public: project.isPublic };
+  const rights = mergeRights([
+    { permission: "«Добавление примечаний»", check: await keyRights(rm, scope, "add_issue_notes", false) },
+    { permission: "«Редактирование задач»", check: await keyRights(rm, scope, "edit_issues", false) },
+  ]);
+
+  const sources: AttachSource[] = [];
+  for (const file of input.files) sources.push(await localSource(file));
+  await pruneKeptLinks();
+  for (const link of input.links) sources.push(await linkSource(link));
+  // Имена файлов видны в задаче так же, как текст: та же проверка, что у примечания.
+  findings.push(...checkOutgoing({ "имена файлов": sources.map((s) => s.name).join("\n") }, args));
+
+  const preview = attachPreview({
+    instance: rm.name,
+    issue: {
+      id,
+      subject: issue.subject,
+      url: issueUrl(rm, id),
+      status: issue.status.name,
+      isPrivate: typeof issue.is_private === "boolean" ? issue.is_private : null,
+      attachments: (issue.attachments ?? []).length,
+    },
+    project: { id: project.id, name: project.name, identifier: project.identifier, isPublic: project.isPublic },
+    author: `${me.firstname} ${me.lastname} (${me.login}, id=${me.id})`,
+    rights,
+    files: sources.map(publicFile),
+    note,
+    audience: str(args, "audience") === "internal" ? "internal" : "client",
+    warnings: findings.length,
+  });
+  const hint =
+    input.links.length > 0
+      ? "та же команда с флагом --yes (скачанное по ссылкам возьмётся из сохранённых копий, ссылки повторно не открываются)"
+      : "та же команда с флагом --yes";
+  if (!requireConfirmation(args, preview, hint)) return;
+
+  // Сначала загружаются все файлы, потом одна правка задачи: либо ложится всё одной записью истории, либо ничего.
+  const uploaded: { source: AttachSource; token: string; id: number | null }[] = [];
+  for (const source of sources) {
+    const result = await withAttachErrors(
+      { stage: "upload", issue: id, instance: rm.name, file: { name: source.name, size: source.size }, uploaded: uploaded.length },
+      () => uploadFile(rm, source),
+    );
+    uploaded.push({ source, ...result });
+  }
+  const patch: Record<string, unknown> = {
+    uploads: uploaded.map((u) => ({ token: u.token, filename: u.source.name, content_type: u.source.type })),
+  };
+  if (note !== null) patch.notes = note;
+  await withAttachErrors({ stage: "attach", issue: id, instance: rm.name, uploaded: uploaded.length }, () =>
+    request(rm, "PUT", `issues/${id}.json`, undefined, { issue: patch }),
+  );
+  // Записано — копии скачанного больше не нужны: чужие документы не лежат на диске дольше дела.
+  for (const source of sources) if (source.link) await forgetLink(source.link);
+
+  let after: Issue | null = null;
+  try {
+    after = (
+      await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`, { include: note !== null ? "attachments,journals" : "attachments" })
+    ).issue;
+  } catch {
+    // Не перечиталась — сверка так и скажет.
+  }
+  const check = checkAttachWrite(after, {
+    files: uploaded.map((u) => ({ name: u.source.name, size: u.source.size, id: u.id })),
+    before: (issue.attachments ?? []).map((a) => a.id),
+    note,
+  });
+  emit(
+    {
+      instance: rm.name,
+      issue: id,
+      url: issueUrl(rm, id),
+      attached: check.landed.map((a) => ({ id: a.id, filename: a.filename, filesize: a.filesize })),
+      note: note !== null,
+      check: { ok: check.ok, text: check.text },
+    },
+    () =>
+      (check.ok
+        ? `Приложено к #${id}: ${plural(check.landed.length, ["файл", "файла", "файлов"])} · инстанс ${rm.name}`
+        : `Redmine принял запрос по #${id}, но сверка не сошлась · инстанс ${rm.name}`) +
+      `\n${issueUrl(rm, id)}\n` +
+      check.landed.map((a, index) => `  ${index + 1}. ${a.filename} · ${formatBytes(a.filesize)} · вложение ${a.id}\n`).join("") +
+      check.text,
+  );
+  if (!check.ok) process.exitCode = 1;
+}
+
 // ─────────────────────── входящие: новое и сроки ──────────────────────
 
 type InboxEvent = {
@@ -8033,7 +9108,7 @@ function cmdHelp(): void {
 
 Общие флаги: --instance <имя|хост>  --all-instances (для inbox/due)  --json  --no-cache
 
-ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: команды log, batch, comment, create-issue, create-tree,
+ЗАПИСЬ ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ: команды log, batch, comment, attach, create-issue, create-tree,
 update-issue, edit, create-project, update-project, archive-project, close-project,
 reopen-project, relate, unrelate, add-member, update-member, remove-member, wiki-update,
 wiki-delete, create-version без --yes печатают полный предпросмотр и ничего не отправляют.
@@ -8147,6 +9222,12 @@ Wiki проекта
         готовая строка со ссылкой на задачу — для вставки в текст на другом инстансе
   detect-markup [--project X]       какая разметка принята на инстансе (textile/markdown/html)
   comment <id> --text "..."|--text-file f [--private] [--dry-run]
+  attach <id|ссылка на задачу> (--file f | --url <https-ссылка>)… [--note "…"|--note-file f] [--dry-run]
+        приложить файлы от имени и с правами владельца ключа — одной записью истории с примечанием;
+        --file и --url повторяются и смешиваются; ссылка — только https, её строка запроса (пропуск
+        к файлу) нигде не печатается; одноразовую ссылку предпросмотр скачивает один раз и держит копию
+        в ~/.redmine/attach до отправки (не дольше суток) — повтор с --yes берёт её; предел 200 МБ на файл;
+        примечание и имена файлов проходят проверку текста; после записи вложения перечитываются
   update-issue <id> [--status имя] [--done N] [--note текст|--note-file f] [--assignee me|id|имя] [--due дата]
                [--subject "..."] [--description "..."|--description-file f] [--parent N|none] [--estimated 8]
                [--version <имя|id|none>] [--dry-run]
@@ -8387,6 +9468,7 @@ async function main(): Promise<void> {
     xref: cmdXref,
     "detect-markup": cmdDetectMarkup,
     comment: cmdComment,
+    attach: cmdAttach,
     log: cmdLog,
     pending: cmdPending,
     batch: cmdBatch,
