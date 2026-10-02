@@ -129,7 +129,37 @@ import {
   type WikiDeleteContext,
   type CreateVersionContext,
 } from "./redmine.ts";
-import { posix, win32 } from "node:path";
+import {
+  readAttach,
+  parseLink,
+  showLink,
+  dispositionFilename,
+  cleanFileName,
+  redmineFileName,
+  linkFileName,
+  fileType,
+  formatBytes,
+  explainLinkStatus,
+  redactLinks,
+  downloadLink,
+  linkInText,
+  mergeRights,
+  describeAttachAudience,
+  attachPreview,
+  uploadId,
+  explainAttachRejection,
+  checkAttachWrite,
+  ATTACH_AUDIENCE_WARNING,
+  ATTACH_PERMISSIONS,
+  LINK_LIMITS,
+  type Fetcher,
+  type AttachContext,
+  type IssueAttachment,
+  type AttachJournal,
+} from "./redmine.ts";
+import { join, posix, win32 } from "node:path";
+import { mkdir, mkdtemp, readdir, rm as removePath, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 let passed = 0;
 const failures: string[] = [];
@@ -2096,6 +2126,699 @@ check("сверка вехи: инстанс не отдал статус — н
   check("422: повтор одного поля даёт одну подсказку", explainTimeEntryRejection(["Comment cannot be blank", "Комментарий не может быть пустым"]).length, 1);
   check("422: два поля дают две подсказки", explainTimeEntryRejection(["Activity cannot be blank", "Comment cannot be blank"]).length, 2);
   check("422: пустой список отказов — пустой ответ", explainTimeEntryRejection([]).length, 0);
+}
+
+// ── файлы к задаче: разбор ввода ──────────────────────────────────────
+{
+  const LINK = "https://files.example.com/files/inbox/akt.pdf?link=TOKEN-ONE-TIME-0001";
+  const input = readAttach(
+    parseArgs(["attach", "#25127", "--file", "a.txt", "--url", LINK, "--file", "Акт, сентябрь.pdf", "--note", "Текст"]),
+  );
+  check("attach: задача из первого слова", input.issue, "#25127");
+  // Запятая — часть имени файла, а не разделитель списка, как у --role и --tracker.
+  check("attach: --file повторяется, запятая не делит имя", input.files, ["a.txt", "Акт, сентябрь.pdf"]);
+  check("attach: --url разобран как адрес", input.links.map((l) => l.host), ["files.example.com"]);
+  check("attach: --note принят", input.note, { text: "Текст" });
+  check("attach: --note-file принят", readAttach(parseArgs(["attach", "1", "--file", "a", "--note-file", "n.html"])).note, {
+    file: "n.html",
+  });
+  check("attach: без примечания", readAttach(parseArgs(["attach", "1", "--url", LINK])).note, null);
+
+  const fails = (argv: string[]): string => errorText(() => readAttach(parseArgs(argv)));
+  check("attach: без задачи — ошибка", fails(["attach", "--file", "a"]).includes("Укажите задачу"), true);
+  check("attach: без файлов и ссылок — ошибка", fails(["attach", "7"]).includes("Нечего прикладывать"), true);
+  check("attach: лишнее слово — ошибка", fails(["attach", "7", "a.txt"]).includes("Лишние слова"), true);
+  check("attach: --file без пути — ошибка", fails(["attach", "7", "--file", "--yes"]).includes("--file без пути"), true);
+  check("attach: --note без текста — ошибка", fails(["attach", "7", "--file", "a", "--note"]).includes("--note без текста"), true);
+  check(
+    "attach: --note и --note-file сразу — ошибка",
+    fails(["attach", "7", "--file", "a", "--note", "x", "--note-file", "n.html"]).includes("одним способом"),
+    true,
+  );
+  check("attach: файл дважды — ошибка", fails(["attach", "7", "--file", "a.txt", "--file", "./a.txt"]).includes("дважды"), true);
+  check("attach: ссылка дважды — ошибка", fails(["attach", "7", "--url", LINK, "--url", LINK]).includes("дважды"), true);
+
+  // Только https: строка запроса — пропуск к файлу, и в ошибке её быть не должно.
+  const plainHttp = fails(["attach", "7", "--url", "http://files.example.com/files/a.pdf?link=TOKEN-HTTP-0002"]);
+  check("attach: http отклоняется", plainHttp.includes("только ссылки https"), true);
+  check("attach: в отказе по http нет пропуска", plainHttp.includes("TOKEN-HTTP-0002"), false);
+  check("attach: в отказе по http есть хост и путь", plainHttp.includes("files.example.com/files/a.pdf"), true);
+  const broken = errorText(() => parseLink("https://files example.com/f?link=TOKEN-BROKEN-0003", 2));
+  check("attach: неразборчивая ссылка — ошибка с номером флага", broken.includes("--url №2"), true);
+  check("attach: неразборчивая ссылка не повторяется в ошибке", broken.includes("TOKEN-BROKEN-0003"), false);
+
+  check(
+    "attach: ссылка для человека — хост и путь, без запроса и якоря",
+    showLink(new URL("https://files.example.com/files/%D0%B0%D0%BA%D1%82.pdf?link=TOKEN-0004#x")),
+    "files.example.com/files/акт.pdf",
+  );
+  const tokenLink = new URL(LINK);
+  check("attach: пропуск в примечании находится", linkInText("Скачать: TOKEN-ONE-TIME-0001", tokenLink), true);
+  check("attach: ссылка целиком в примечании находится", linkInText(`см. ${LINK}`, tokenLink), true);
+  check("attach: хост и путь в примечании — не пропуск", linkInText("files.example.com/files/inbox/akt.pdf", tokenLink), false);
+  check(
+    "attach: пропуск вычищается из чужого текста ошибки",
+    redactLinks(`fetch failed: ${LINK}`, [tokenLink]).includes("TOKEN-ONE-TIME-0001"),
+    false,
+  );
+}
+
+// ── файлы к задаче: имя и тип по ответу сервера ───────────────────────
+{
+  // filename* (RFC 5987) главнее filename: только в нём кириллица доходит без потерь.
+  check(
+    "имя файла: filename* главнее filename",
+    dispositionFilename("attachment; filename=\"akt.pdf\"; filename*=UTF-8''%D0%90%D0%BA%D1%82%20%E2%84%965.pdf"),
+    "Акт №5.pdf",
+  );
+  check(
+    "имя файла: filename* первым — тот же результат",
+    dispositionFilename("attachment; filename*=utf-8''%D0%90%D0%BA%D1%82.pdf; filename=\"akt.pdf\""),
+    "Акт.pdf",
+  );
+  check("имя файла: кавычки и экранирование", dispositionFilename('attachment; filename="a \\"b\\" c.pdf"'), 'a "b" c.pdf');
+  check("имя файла: ISO-8859-1 в filename*", dispositionFilename("attachment; filename*=iso-8859-1'fr'%E9t%E9.txt"), "été.txt");
+  check(
+    "имя файла: неизвестная рантайму кодировка — откат на filename",
+    dispositionFilename("attachment; filename*=windows-1251''%EE%F2.txt; filename=\"ot.txt\""),
+    "ot.txt",
+  );
+  // Сервер положил UTF-8 в filename как есть, а fetch читает заголовок побайтно.
+  const bytewise = String.fromCharCode(...new TextEncoder().encode("отчёт.pdf"));
+  check("имя файла: UTF-8 в filename без звёздочки", dispositionFilename(`attachment; filename="${bytewise}"`), "отчёт.pdf");
+  check("имя файла: без пробела после ;", dispositionFilename("attachment;filename=plain.txt"), "plain.txt");
+  check("имя файла: inline без имени", dispositionFilename("inline"), null);
+  check("имя файла: заголовка нет", dispositionFilename(null), null);
+
+  check("имя файла: путь из заголовка отрезается", cleanFileName("../../etc/passwd"), "passwd");
+  check("имя файла: путь Windows отрезается", cleanFileName("C:\\Users\\x\\a.txt"), "a.txt");
+  check("имя файла: управляющие знаки убираются", cleanFileName("a\u0000b\u001f.txt"), "ab.txt");
+  check("имя файла: как сохранит Redmine", redmineFileName('Отчёт: итоги?.pdf'), "Отчёт_ итоги_.pdf");
+  check("имя файла: подряд идущие знаки — одно подчёркивание", redmineFileName('a<>"b.txt'), "a_b.txt");
+  check("имя файла: из пути ссылки", linkFileName(new URL("https://h.example.com/files/%D0%B0.pdf?link=x")), "а.pdf");
+  check("имя файла: у корня ссылки имени нет", linkFileName(new URL("https://h.example.com/?link=x")), null);
+
+  check("тип файла: из Content-Type без параметров", fileType("application/pdf; charset=binary", "x"), "application/pdf");
+  check("тип файла: octet-stream уточняется по расширению", fileType("application/octet-stream", "a.pdf"), "application/pdf");
+  check("тип файла: без заголовка — по расширению", fileType(null, "отчёт.txt"), "text/plain");
+  check("тип файла: незнакомое расширение", fileType(null, "обработка.epf"), "application/octet-stream");
+
+  check("размер: байты", formatBytes(812), "812 Б");
+  check("размер: килобайты с запятой", formatBytes(1536), "1,5 КБ");
+  check("размер: предел скачивания", formatBytes(LINK_LIMITS.maxBytes), "200 МБ");
+}
+
+// ── файлы к задаче: отказы словами ────────────────────────────────────
+{
+  check("ссылка 410: попросить новую", explainLinkStatus(410, "h/p").includes("Попросите новую ссылку"), true);
+  check("ссылка 404: попросить новую", explainLinkStatus(404, "h/p").includes("истекла или уже использована"), true);
+  check("ссылка 403: попросить новую", explainLinkStatus(403, "h/p").includes("Попросите новую ссылку"), true);
+  check("ссылка 503: повторить позже", explainLinkStatus(503, "h/p").includes("Повторите позже"), true);
+
+  const at = { issue: 25127, instance: "company", uploaded: 0 };
+  const file = { name: "Акт.pdf", size: 6 * 1024 * 1024 };
+  const said = (status: number, details: string[], stage: "upload" | "attach", extra: Partial<typeof at> = {}): string =>
+    explainAttachRejection(status, details, { ...at, ...extra, stage, ...(stage === "upload" ? { file } : {}) }) ?? "";
+  check("отказ 403 загрузки: право словами", said(403, ["недостаточно прав у владельца ключа"], "upload").includes("нет права загружать файлы"), true);
+  check("отказ 403 привязки: право словами", said(403, [], "attach").includes("нет права менять эту задачу"), true);
+  check("отказ 403 привязки: какое право", said(403, [], "attach").includes(ATTACH_PERMISSIONS), true);
+  check("отказ 403 привязки: без кода и стека", /HTTP|\bat\s/.test(said(403, [], "attach")), false);
+  const tooBigEn = said(422, ["This file cannot be uploaded because it exceeds the maximum allowed file size (5 MB)"], "upload");
+  check("отказ 422: предел вложений по-английски", tooBigEn.includes("больше предела вложений"), true);
+  check("отказ 422: предел назван", tooBigEn.includes("(5 MB)"), true);
+  check("отказ 422: размер файла назван", tooBigEn.includes("6 МБ"), true);
+  const tooBigRu = said(422, ["Этот файл нельзя загрузить, так как он превышает максимально допустимый размер (5 МБ)"], "upload");
+  check("отказ 422: предел вложений по-русски", tooBigRu.includes("больше предела вложений") && tooBigRu.includes("(5 МБ)"), true);
+  check("отказ 422: запрещённое расширение", said(422, ["Attachment extension exe is not allowed"], "upload").includes("расширение запрещено"), true);
+  check("отказ 422: незнакомая причина передаётся как есть", said(422, ["Что-то иное"], "upload").includes("Что-то иное"), true);
+  check("отказ 413: предел сервера или прокси", said(413, [], "upload").includes("прокси"), true);
+  check("отказ 422 привязки: проверка всей задачи", said(422, ["Срок не может быть пустым"], "attach").includes("касается всей задачи"), true);
+  check("отказ после загрузки: загруженное не видно в задаче", said(403, [], "attach", { uploaded: 2 }).includes("(2) к задаче не привязаны"), true);
+  check("отказ после загрузки: один файл — в единственном числе", said(403, [], "attach", { uploaded: 1 }).includes("загруженный файл к задаче не привязан"), true);
+  check("отказ 403 привязки: «не приложено» не повторяется", said(403, [], "attach").includes("не приложены"), false);
+  check("отказ 401: ключ", said(401, [], "upload").includes("неверный или отозван"), true);
+  check("отказ 500: объяснять нечем", explainAttachRejection(500, [], { ...at, stage: "attach" }), null);
+
+  check("номер вложения из ответа", uploadId(7, "7.ab12"), 7);
+  check("номер вложения из токена", uploadId(undefined, "12.ff00"), 12);
+  check("номер вложения: токен без номера", uploadId(undefined, "zz"), null);
+}
+
+// ── файлы к задаче: права, видимость, предпросмотр ────────────────────
+{
+  const notes = "«Добавление примечаний»";
+  const edit = "«Редактирование задач»";
+  const no = { state: "no" as const, roles: ["Наблюдатель"] };
+  const yes = { state: "yes" as const, roles: ["Исполнитель"] };
+  const unknown = { state: "unknown" as const, roles: [], note: "права ролей этому ключу не видны" };
+  const granted = mergeRights([{ permission: notes, check: no }, { permission: edit, check: yes }]);
+  check("права вложений: хватает одного из двух", granted.check.state, "yes");
+  check("права вложений: названо то право, что есть", granted.permission, edit);
+  check("права вложений: неизвестно важнее «нет»", mergeRights([{ permission: notes, check: no }, { permission: edit, check: unknown }]).check.state, "unknown");
+  const denied = mergeRights([{ permission: notes, check: no }, { permission: edit, check: no }]);
+  check("права вложений: нет обоих — нет, названы оба", [denied.check.state, denied.permission], ["no", ATTACH_PERMISSIONS]);
+  check("права вложений: администратор", mergeRights([{ permission: notes, check: no }, { permission: edit, check: { state: "admin", roles: [] } }]).check.state, "admin");
+
+  check("видимость: публичный проект", describeAttachAudience(true, false).includes("ПУБЛИЧНЫЙ"), true);
+  check("видимость: приватная задача", describeAttachAudience(false, true).includes("ПРИВАТНАЯ"), true);
+  check("видимость: старый инстанс", describeAttachAudience(false, null).includes("не сообщает"), true);
+
+  const ctx: AttachContext = {
+    instance: "company",
+    issue: { id: 25127, subject: "Сверка остатков", url: "https://redmine.example.com/issues/25127", status: "В работе", isPrivate: false, attachments: 3 },
+    project: { id: 77, name: "Пример", identifier: "primer", isPublic: false },
+    author: "Иван Петров (ivanov, id=5)",
+    rights: { permission: notes, check: yes },
+    files: [
+      { kind: "file", from: "/tmp/отчёт.txt", name: "отчёт.txt", type: "text/plain", size: 812 },
+      {
+        kind: "url",
+        from: "files.example.com/files/inbox/akt.pdf",
+        name: "Акт_ сентябрь.pdf",
+        original: "Акт: сентябрь.pdf",
+        type: "application/pdf",
+        size: 1536,
+        kept: false,
+      },
+    ],
+    note: "Акт сверки за сентябрь.",
+    audience: "client",
+    warnings: 0,
+  };
+  const text = attachPreview(ctx);
+  check("предпросмотр вложений: заголовок", text.startsWith("ВЛОЖЕНИЯ К ЗАДАЧЕ #25127 · инстанс company"), true);
+  check("предпросмотр вложений: предупреждение о клиенте", text.includes(ATTACH_AUDIENCE_WARNING), true);
+  check("предпросмотр вложений: автор — владелец ключа", text.includes("Иван Петров (ivanov, id=5) — владелец ключа"), true);
+  check("предпросмотр вложений: размеры и типы", text.includes("812 Б · text/plain") && text.includes("1,5 КБ · application/pdf"), true);
+  check("предпросмотр вложений: переименование видно", text.includes("Акт: сентябрь.pdf → в Redmine «Акт_ сентябрь.pdf»"), true);
+  check("предпросмотр вложений: примечание целиком", text.includes("ПРИМЕЧАНИЕ") && text.includes("Акт сверки за сентябрь."), true);
+  check("предпросмотр вложений: про одноразовые ссылки", text.includes("ссылки повторно не откроет"), true);
+  check("предпросмотр вложений: закрытый проект назван", text.includes("проект закрытый"), true);
+  check("предпросмотр вложений: без примечания", attachPreview({ ...ctx, note: null }).includes("Примечания нет"), true);
+}
+
+// ── файлы к задаче: сверка после записи ───────────────────────────────
+{
+  const me = { id: 5, name: "Иван Петров" };
+  const a101: IssueAttachment = { id: 101, filename: "отчёт.txt", filesize: 812, author: me };
+  const a102: IssueAttachment = { id: 102, filename: "Акт.pdf", filesize: 1536, author: me };
+  const journal = (notes: string, ids: number[]): AttachJournal => ({
+    id: 900,
+    user: me,
+    notes,
+    details: ids.map((id) => ({ property: "attachment", name: String(id), old_value: null, new_value: "x" })),
+  });
+  const wanted = {
+    files: [
+      { name: "отчёт.txt", size: 812, id: 101 },
+      { name: "Акт.pdf", size: 1536, id: 102 },
+    ],
+    before: [50],
+    note: "Акт сверки.",
+  };
+  const ok = checkAttachWrite({ attachments: [{ id: 50, filename: "old", filesize: 1 }, a101, a102], journals: [journal("Акт сверки.\r\n", [101, 102])] }, wanted);
+  check("сверка вложений: легли оба", ok.ok, true);
+  check("сверка вложений: итог словами", ok.text.includes("в задаче 2 из 2") && ok.text.includes("автор вложений — Иван Петров"), true);
+  check("сверка вложений: примечание в той же записи", ok.text.includes("в той же записи истории"), true);
+
+  const missing = checkAttachWrite({ attachments: [a101], journals: [journal("Акт сверки.", [101])] }, wanted);
+  check("сверка вложений: не лёг один — расхождение", missing.ok, false);
+  check("сверка вложений: какой не лёг", missing.text.includes("РАСХОЖДЕНИЕ") && missing.text.includes("«Акт.pdf» в задаче нет"), true);
+
+  // Есть «Редактирование задач», нет «Добавление примечаний»: файлы легли, текст Redmine молча выбросил.
+  const dropped = checkAttachWrite({ attachments: [a101, a102], journals: [journal("", [101, 102])] }, wanted);
+  check("сверка вложений: примечание выброшено — расхождение", dropped.ok, false);
+  check("сверка вложений: причина названа", dropped.text.includes("«Добавление примечаний»"), true);
+
+  const smaller = checkAttachWrite({ attachments: [a101, { ...a102, filesize: 1000 }], journals: [journal("Акт сверки.", [101, 102])] }, wanted);
+  check("сверка вложений: другой размер — расхождение", smaller.ok, false);
+
+  // Старый инстанс не вернул номер: вложение находится по имени и размеру среди новых.
+  const byName = checkAttachWrite(
+    { attachments: [a101, a102] },
+    { files: [{ name: "Акт.pdf", size: 1536, id: null }], before: [101], note: null },
+  );
+  check("сверка вложений: без номера — по имени и размеру", byName.ok && byName.landed[0]?.id === 102, true);
+  const renamed = checkAttachWrite({ attachments: [{ ...a101, filename: "отчет.txt" }] }, { files: [{ name: "отчёт.txt", size: 812, id: 101 }], before: [], note: null });
+  check("сверка вложений: другое имя — не расхождение, но сказано", renamed.ok && renamed.text.includes("под другим именем"), true);
+  check("сверка вложений: задача не перечиталась", checkAttachWrite(null, wanted).ok, false);
+}
+
+// ── файлы к задаче: скачивание по ссылке без сети ─────────────────────
+{
+  const LINK = new URL("https://files.example.com/files/inbox/akt.pdf?link=TOKEN-FETCH-0005");
+  const limits = { ...LINK_LIMITS, maxBytes: 10, headersMs: 30, idleMs: 30, totalMs: 1000 };
+  const asyncError = async (run: () => Promise<unknown>): Promise<string> => {
+    try {
+      await run();
+      return "";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
+  const calls: { url: string; redirect: string; key: boolean }[] = [];
+  const serve =
+    (routes: Record<string, () => Response>): Fetcher =>
+    async (input, init) => {
+      calls.push({ url: input.href, redirect: init.redirect, key: "X-Redmine-API-Key" in init.headers });
+      const route = routes[input.pathname];
+      return route ? route() : new Response("нет", { status: 404 });
+    };
+
+  const fine = await downloadLink(
+    LINK,
+    limits,
+    serve({
+      "/files/inbox/akt.pdf": () => new Response(null, { status: 302, headers: { Location: "https://store.example.com/b/1?X-Sig=SIGNED-0006" } }),
+      "/b/1": () =>
+        new Response("12345", {
+          headers: { "Content-Type": "application/pdf", "Content-Disposition": "attachment; filename*=UTF-8''%D0%90%D0%BA%D1%82.pdf" },
+        }),
+    }),
+  );
+  check("скачивание: перенаправление на https пройдено", new TextDecoder().decode(fine.bytes), "12345");
+  check("скачивание: имя из filename*", fine.name, "Акт.pdf");
+  check("скачивание: тип из Content-Type", fine.type, "application/pdf");
+  check("скачивание: показан хост и путь исходной ссылки", fine.shown, "files.example.com/files/inbox/akt.pdf");
+  check("скачивание: перенаправления — вручную", calls.every((c) => c.redirect === "manual"), true);
+  check("скачивание: ключ Redmine хозяину ссылки не уходит", calls.some((c) => c.key), false);
+
+  const downgrade = await asyncError(() =>
+    downloadLink(LINK, limits, serve({ "/files/inbox/akt.pdf": () => new Response(null, { status: 302, headers: { Location: "http://store.example.com/b/1?X-Sig=SIGNED-0007" } }) })),
+  );
+  check("скачивание: перенаправление на http остановлено", downgrade.includes("незащищённый адрес"), true);
+  check("скачивание: подпись перенаправления не напечатана", downgrade.includes("SIGNED-0007"), false);
+
+  const byPath = await downloadLink(LINK, limits, serve({ "/files/inbox/akt.pdf": () => new Response("1") }));
+  check("скачивание: без Content-Disposition — имя из пути", byPath.name, "akt.pdf");
+
+  const declared = await asyncError(() =>
+    downloadLink(LINK, limits, serve({ "/files/inbox/akt.pdf": () => new Response("1", { headers: { "Content-Length": "999999" } }) })),
+  );
+  check("скачивание: заявленный размер больше предела", declared.includes("больше предела"), true);
+  const streamed = await asyncError(() =>
+    downloadLink(
+      LINK,
+      limits,
+      serve({
+        "/files/inbox/akt.pdf": () =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(new Uint8Array(6));
+                controller.enqueue(new Uint8Array(6));
+                controller.close();
+              },
+            }),
+          ),
+      }),
+    ),
+  );
+  check("скачивание: поток больше предела останавливается", streamed.includes("больше предела"), true);
+
+  const gone = await asyncError(() => downloadLink(LINK, limits, serve({ "/files/inbox/akt.pdf": () => new Response("", { status: 410 }) })));
+  check("скачивание: 410 — попросить новую ссылку", gone.includes("Попросите новую ссылку"), true);
+  check("скачивание: в отказе нет пропуска", gone.includes("TOKEN-FETCH-0005"), false);
+
+  const hang: Fetcher = (_input, init) =>
+    new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+  const slow = await asyncError(() => downloadLink(LINK, limits, hang));
+  check("скачивание: сервер молчит — остановка по времени", slow.includes("не ответила за"), true);
+
+  // Bun кладёт полный адрес в свойства ошибки fetch: в текст отказа он попасть не должен.
+  const refused: Fetcher = async (input) => {
+    throw Object.assign(new Error(`Unable to connect: ${input.href}`), { code: "ConnectionRefused", path: input.href });
+  };
+  const offline = await asyncError(() => downloadLink(LINK, limits, refused));
+  check("скачивание: сетевой сбой — код назван", offline.includes("ConnectionRefused"), true);
+  check("скачивание: сетевой сбой — пропуск вычищен", offline.includes("TOKEN-FETCH-0005"), false);
+}
+
+// ── файлы к задаче: живой прогон CLI против поддельного Redmine ───────
+{
+  // Ссылки принимаются только https, поэтому и поддельный сервер — https: сертификат выпускается здесь же
+  // на время прогона. Он самоподписанный, и проверку цепочки отключает переменная окружения — только
+  // у дочернего процесса CLI. Ни одного запроса за пределы 127.0.0.1 прогон не делает.
+  const der = (tag: number, ...parts: Uint8Array[]): Uint8Array => {
+    const body = concatBytes(parts);
+    const n = body.length;
+    const len = n < 0x80 ? [n] : n < 0x100 ? [0x81, n] : [0x82, n >> 8, n & 0xff];
+    return concatBytes([new Uint8Array([tag, ...len]), body]);
+  };
+  function concatBytes(parts: Uint8Array[]): Uint8Array {
+    const out = new Uint8Array(parts.reduce((sum, p) => sum + p.length, 0));
+    let offset = 0;
+    for (const p of parts) {
+      out.set(p, offset);
+      offset += p.length;
+    }
+    return out;
+  }
+  const oid = (dotted: string): Uint8Array => {
+    const [a = 0, b = 0, ...rest] = dotted.split(".").map(Number);
+    const bytes = [40 * a + b];
+    for (const n of rest) {
+      const group = [n & 0x7f];
+      for (let v = n >>> 7; v > 0; v >>>= 7) group.unshift((v & 0x7f) | 0x80);
+      bytes.push(...group);
+    }
+    return der(0x06, new Uint8Array(bytes));
+  };
+  const integer = (raw: Uint8Array): Uint8Array => {
+    let start = 0;
+    while (start < raw.length - 1 && raw[start] === 0) start++;
+    const body = raw.slice(start);
+    return der(0x02, (body[0] ?? 0) & 0x80 ? concatBytes([new Uint8Array([0]), body]) : body);
+  };
+  const utcTime = (d: Date): Uint8Array =>
+    der(0x17, new TextEncoder().encode(d.toISOString().replace(/[-:T]/g, "").slice(2, 14) + "Z"));
+  const pem = (label: string, bytes: Uint8Array): string =>
+    `-----BEGIN ${label}-----\n${Buffer.from(bytes).toString("base64").replace(/.{64}/g, "$&\n").replace(/\n?$/, "\n")}-----END ${label}-----\n`;
+
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const name = der(0x30, der(0x31, der(0x30, oid("2.5.4.3"), der(0x0c, new TextEncoder().encode("localhost")))));
+  const algorithm = der(0x30, oid("1.2.840.10045.4.3.2")); // ecdsa-with-SHA256
+  const now = Date.now();
+  const tbs = der(
+    0x30,
+    integer(new Uint8Array([1])),
+    algorithm,
+    name,
+    der(0x30, utcTime(new Date(now - 3_600_000)), utcTime(new Date(now + 86_400_000))),
+    name,
+    new Uint8Array(await crypto.subtle.exportKey("spki", pair.publicKey)),
+  );
+  // Копия — ради типа: WebCrypto принимает только массив поверх обычного ArrayBuffer.
+  const raw = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, new Uint8Array(tbs)));
+  const signature = der(0x30, integer(raw.slice(0, 32)), integer(raw.slice(32)));
+  const cert = der(0x30, tbs, algorithm, der(0x03, concatBytes([new Uint8Array([0]), signature])));
+  const key = new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
+
+  // ── поддельный Redmine и раздача файлов по одноразовым ссылкам ──
+  const API_KEY = "selftest-key-not-a-secret";
+  const LINK_TOKEN = "TOKEN-LIVE-ONE-TIME-0008";
+  const GONE_TOKEN = "TOKEN-LIVE-EXPIRED-0009";
+  const linkBody = new TextEncoder().encode("%PDF-1.4 акт сверки за сентябрь");
+  type Seen = { method: string; path: string; query: URLSearchParams; key: string | null; type: string | null; body: Uint8Array };
+  const seen: Seen[] = [];
+  const served = new Set<string>();
+  type Stored = IssueAttachment & { token: string };
+  const uploads: Stored[] = [];
+  const issues = new Map<number, { attachments: Stored[]; journals: AttachJournal[] }>([
+    [7, { attachments: [], journals: [] }],
+    [8, { attachments: [], journals: [] }],
+    [9, { attachments: [], journals: [] }], // в закрытом проекте 78
+  ]);
+  const author = { id: 5, name: "Иван Петров" };
+  const json = (data: unknown, status = 200): Response => Response.json(data, { status });
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    tls: { cert: pem("CERTIFICATE", cert), key: pem("PRIVATE KEY", key) },
+    async fetch(req) {
+      const url = new URL(req.url);
+      const body = new Uint8Array(await req.arrayBuffer());
+      seen.push({
+        method: req.method,
+        path: url.pathname,
+        query: url.searchParams,
+        key: req.headers.get("X-Redmine-API-Key"),
+        type: req.headers.get("Content-Type"),
+        body,
+      });
+      const path = url.pathname;
+
+      // Раздача по одноразовой ссылке: второй раз та же ссылка уже не отдаёт файл.
+      if (path.startsWith("/files/")) {
+        const token = url.searchParams.get("link") ?? "";
+        if (token !== LINK_TOKEN || served.has(token)) return new Response("ссылка использована", { status: 410 });
+        served.add(token);
+        return new Response(linkBody, {
+          headers: {
+            "Content-Type": "application/pdf",
+            "Content-Disposition": `attachment; filename="akt.pdf"; filename*=UTF-8''${encodeURIComponent("Акт сверки №5.pdf")}`,
+          },
+        });
+      }
+      if (req.headers.get("X-Redmine-API-Key") !== API_KEY) return new Response("", { status: 401 });
+
+      if (path === "/users/current.json") {
+        if (url.searchParams.get("include") === "memberships") {
+          return json({ user: { id: 5, admin: false, memberships: [{ project: { id: 77, name: "Пример" }, roles: [{ id: 3, name: "Исполнитель" }] }] } });
+        }
+        return json({ user: { id: 5, login: "ivanov", firstname: "Иван", lastname: "Петров", api_key: "not-for-output" } });
+      }
+      if (path === "/roles.json") return json({ roles: [{ id: 3, name: "Исполнитель" }] });
+      if (path === "/roles/3.json") return json({ role: { id: 3, name: "Исполнитель", permissions: ["view_issues", "add_issue_notes"] } });
+      if (path === "/projects/77.json") {
+        return json({ project: { id: 77, name: "Пример", identifier: "primer", status: 1, is_public: false } });
+      }
+      if (path === "/projects/78.json") {
+        return json({ project: { id: 78, name: "Архив работ", identifier: "arkhiv", status: 5, is_public: false } });
+      }
+      if (path === "/uploads.json" && req.method === "POST") {
+        if (req.headers.get("Content-Type") !== "application/octet-stream") return new Response("", { status: 406 });
+        const filename = url.searchParams.get("filename") ?? "";
+        if (filename === "big.bin") {
+          return json({ errors: ["This file cannot be uploaded because it exceeds the maximum allowed file size (5 MB)"] }, 422);
+        }
+        const id = 100 + uploads.length + 1;
+        const stored: Stored = { id, filename, filesize: body.length, author, token: `${id}.c0ffee${id}` };
+        uploads.push(stored);
+        return json({ upload: { id, token: stored.token } }, 201);
+      }
+      const issueMatch = path.match(/^\/issues\/(\d+)\.json$/);
+      const issueId = issueMatch ? Number(issueMatch[1]) : 0;
+      const state = issues.get(issueId);
+      if (state && req.method === "GET") {
+        const include = url.searchParams.get("include") ?? "";
+        return json({
+          issue: {
+            id: issueId,
+            subject: "Сверка остатков",
+            project: issueId === 9 ? { id: 78, name: "Архив работ" } : { id: 77, name: "Пример" },
+            tracker: { id: 1, name: "Задача" },
+            status: { id: 2, name: "В работе" },
+            priority: { id: 2, name: "Нормальный" },
+            author,
+            done_ratio: 0,
+            is_private: false,
+            created_on: "2026-10-01T10:00:00Z",
+            updated_on: "2026-10-01T10:00:00Z",
+            ...(include.includes("attachments") ? { attachments: state.attachments.map(({ token: _t, ...a }) => a) } : {}),
+            ...(include.includes("journals") ? { journals: state.journals } : {}),
+          },
+        });
+      }
+      if (state && req.method === "PUT") {
+        if (issueId === 8) return new Response("", { status: 403 });
+        const patch = (JSON.parse(new TextDecoder().decode(body)) as { issue: { notes?: string; uploads?: { token: string }[] } }).issue;
+        const added = (patch.uploads ?? [])
+          .map((u) => uploads.find((s) => s.token === u.token))
+          .filter((s): s is Stored => s !== undefined);
+        state.attachments.push(...added);
+        state.journals.push({
+          id: 900 + state.journals.length,
+          user: author,
+          notes: patch.notes ?? "",
+          details: added.map((a) => ({ property: "attachment", name: String(a.id), old_value: null, new_value: a.filename })),
+        });
+        return new Response(null, { status: 204 });
+      }
+      return new Response("", { status: 404 });
+    },
+  });
+
+  const home = await mkdtemp(join(tmpdir(), "redmine-attach-selftest-"));
+  try {
+    const base = server.url.href;
+    const local = join(home, "отчёт.txt");
+    const localBody = new TextEncoder().encode("Сверка остатков на 30.09\n");
+    await writeFile(local, localBody);
+    const big = join(home, "big.bin");
+    await writeFile(big, new Uint8Array(64));
+    const link = `${base}files/inbox/akt.pdf?link=${LINK_TOKEN}`;
+    const note = "Акт сверки за сентябрь: приложен к задаче, сверка остатков по нему сходится.";
+
+    const cli = async (argv: string[], profileOnly = false): Promise<{ code: number; out: string; err: string }> => {
+      const proc = Bun.spawn([process.execPath, join(import.meta.dir, "redmine.ts"), ...argv], {
+        cwd: home,
+        // Окружение собирается заново: ни конфиг, ни ключи, ни REDMINE_* того, кто запускает проверку, сюда не попадают.
+        env: {
+          PATH: process.env.PATH ?? "",
+          ...(process.env.SYSTEMROOT ? { SYSTEMROOT: process.env.SYSTEMROOT } : {}),
+          HOME: home,
+          USERPROFILE: home,
+          ...(profileOnly ? {} : { REDMINE_URL: base, REDMINE_API_KEY: API_KEY }),
+          NODE_TLS_REJECT_UNAUTHORIZED: "0",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const guardTimer = setTimeout(() => proc.kill(), 30_000);
+      const [out, raw, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+      clearTimeout(guardTimer);
+      // Предупреждение рантайма об отключённой проверке сертификата — про сам прогон, а не про CLI.
+      const err = raw
+        .split("\n")
+        .filter((line) => !line.includes("NODE_TLS_REJECT_UNAUTHORIZED"))
+        .join("\n");
+      return { code, out, err };
+    };
+    const writes = (from: number): Seen[] => seen.slice(from).filter((s) => s.method !== "GET");
+    const linkHits = (): Seen[] => seen.filter((s) => s.path.startsWith("/files/"));
+    const leaks = (r: { out: string; err: string }, token: string): boolean => `${r.out}${r.err}`.includes(token);
+
+    // 1. Предпросмотр: задача ссылкой, свой файл и одноразовая ссылка. В Redmine ничего не пишется.
+    const mark1 = seen.length;
+    const preview = await cli(["attach", `${base}issues/7`, "--file", local, "--url", link, "--note", note]);
+    check("attach CLI: предпросмотр завершается без ошибки", [preview.code, preview.err.trim()], [0, ""]);
+    check("attach CLI: предпросмотр ничего не пишет", writes(mark1).length, 0);
+    check("attach CLI: предпросмотр — заголовок", preview.out.includes("ВЛОЖЕНИЯ К ЗАДАЧЕ #7"), true);
+    check("attach CLI: имя из filename*", preview.out.includes("Акт сверки №5.pdf"), true);
+    check("attach CLI: размер и тип файла по ссылке", preview.out.includes(`${formatBytes(linkBody.length)} · application/pdf`), true);
+    check("attach CLI: размер и тип своего файла", preview.out.includes(`${formatBytes(localBody.length)} · text/plain`), true);
+    check("attach CLI: автор — владелец ключа", preview.out.includes("Иван Петров (ivanov, id=5) — владелец ключа"), true);
+    check("attach CLI: право найдено по роли", preview.out.includes("«Исполнитель» даёт право «Добавление примечаний»"), true);
+    check("attach CLI: предупреждение о клиенте", preview.out.includes(ATTACH_AUDIENCE_WARNING), true);
+    check("attach CLI: примечание показано целиком", preview.out.includes(note), true);
+    check("attach CLI: предпросмотр просит --yes", preview.out.includes("Ничего не отправлено"), true);
+    check("attach CLI: ссылка скачана один раз", linkHits().length, 1);
+    check("attach CLI: ключ Redmine хозяину ссылки не ушёл", linkHits().some((s) => s.key !== null), false);
+    check("attach CLI: пропуск ссылки не напечатан", leaks(preview, LINK_TOKEN), false);
+    check("attach CLI: строка запроса не напечатана", leaks(preview, "link="), false);
+    check("attach CLI: ключ API не напечатан", leaks(preview, API_KEY) || leaks(preview, "not-for-output"), false);
+
+    // 2. Повторный предпросмотр в --json: ссылка уже потрачена, берётся копия; пропуска нет и в JSON.
+    const again = await cli(["attach", "7", "--file", local, "--url", link, "--note", note, "--json"]);
+    check("attach CLI: повторный предпросмотр берёт копию", [again.code, linkHits().length], [0, 1]);
+    check("attach CLI: --json без пропуска ссылки", leaks(again, LINK_TOKEN), false);
+    const againJson = ((): unknown => {
+      try {
+        return JSON.parse(again.out);
+      } catch {
+        return null; // Не JSON — проверка ниже провалится словами, а не обрушит самопроверку.
+      }
+    })();
+    check("attach CLI: --json — это предпросмотр", (againJson as { dryRun?: boolean } | null)?.dryRun, true);
+
+    // 3. Запись: ровно две загрузки и одна правка задачи; ссылка повторно не открывается.
+    const mark3 = seen.length;
+    const sent = await cli(["attach", "7", "--file", local, "--url", link, "--note", note, "--yes"]);
+    const done = writes(mark3);
+    check("attach CLI: запись завершается без ошибки", [sent.code, sent.err.trim()], [0, ""]);
+    check(
+      "attach CLI: уходят ровно две загрузки и одна правка задачи",
+      done.map((s) => `${s.method} ${s.path}${s.query.get("filename") ? ` ${s.query.get("filename")}` : ""}`),
+      ["POST /uploads.json отчёт.txt", "POST /uploads.json Акт сверки №5.pdf", "PUT /issues/7.json"],
+    );
+    check("attach CLI: загрузка — байтами octet-stream", done.slice(0, 2).map((s) => s.type), ["application/octet-stream", "application/octet-stream"]);
+    check("attach CLI: загрузка — ключом владельца", done.every((s) => s.key === API_KEY), true);
+    // Без «!»: если запросов меньше ожидаемого, проверки должны провалиться словами, а не обрушить самопроверку.
+    const sameBytes = (a: Uint8Array | undefined, b: Uint8Array): boolean => a !== undefined && Buffer.from(a).equals(Buffer.from(b));
+    check("attach CLI: свой файл ушёл байт в байт", sameBytes(done[0]?.body, localBody), true);
+    check("attach CLI: файл по ссылке ушёл байт в байт", sameBytes(done[1]?.body, linkBody), true);
+    type PutBody = { issue?: { notes?: string; uploads?: { token: string; filename: string; content_type: string }[] } };
+    const putBody = ((): PutBody | null => {
+      try {
+        return JSON.parse(new TextDecoder().decode(done[2]?.body)) as PutBody;
+      } catch {
+        return null;
+      }
+    })();
+    check("attach CLI: примечание в той же правке", putBody?.issue?.notes, note);
+    check(
+      "attach CLI: токены загрузок, имена и типы в правке",
+      putBody?.issue?.uploads,
+      [
+        { token: uploads[0]?.token, filename: "отчёт.txt", content_type: "text/plain" },
+        { token: uploads[1]?.token, filename: "Акт сверки №5.pdf", content_type: "application/pdf" },
+      ],
+    );
+    check("attach CLI: ссылка повторно не открывалась", linkHits().length, 1);
+    check("attach CLI: сверка после записи", sent.out.includes("Сверка: в задаче 2 из 2") && sent.out.includes("в той же записи истории"), true);
+    check("attach CLI: после записи пропуска в выводе нет", leaks(sent, LINK_TOKEN), false);
+    check(
+      "attach CLI: копия скачанного удалена после записи",
+      await readdir(join(home, ".redmine", "attach")).catch(() => ["(каталога копий нет — предпросмотр ничего не сохранил)"]),
+      [],
+    );
+
+    // 4. Истёкшая ссылка: словами и с просьбой о новой; ничего не пишется.
+    const mark4 = seen.length;
+    const expired = await cli(["attach", "7", "--url", `${base}files/inbox/old.pdf?link=${GONE_TOKEN}`]);
+    check("attach CLI: истёкшая ссылка — отказ", expired.code, 1);
+    check("attach CLI: истёкшая ссылка — попросить новую", expired.err.includes("Попросите новую ссылку"), true);
+    check("attach CLI: истёкшая ссылка — пропуск не напечатан", leaks(expired, GONE_TOKEN), false);
+    check("attach CLI: истёкшая ссылка — ничего не записано", writes(mark4).length, 0);
+
+    // 5. Нет права менять задачу (403 на правку): словами, без кода и стека.
+    const mark5 = seen.length;
+    const forbidden = await cli(["attach", "8", "--file", local, "--yes"]);
+    check("attach CLI: 403 — отказ", forbidden.code, 1);
+    check("attach CLI: 403 — право словами", forbidden.err.includes("нет права менять эту задачу") && forbidden.err.includes(ATTACH_PERMISSIONS), true);
+    check("attach CLI: 403 — без сырого ответа и стека", /HTTP 403|\n\s+at /.test(forbidden.err), false);
+    check("attach CLI: 403 — загрузка была, правка отклонена", writes(mark5).map((s) => s.method), ["POST", "PUT"]);
+
+    // 6. Файл больше предела вложений Redmine (422 на загрузке): словами, правка задачи не уходит.
+    const mark6 = seen.length;
+    const tooBig = await cli(["attach", "7", "--file", big, "--yes"]);
+    check("attach CLI: 422 — отказ", tooBig.code, 1);
+    check("attach CLI: 422 — предел словами", tooBig.err.includes("больше предела вложений") && tooBig.err.includes("(5 MB)"), true);
+    check("attach CLI: 422 — правка задачи не ушла", writes(mark6).map((s) => s.method), ["POST"]);
+
+    // 7. Ссылка http: отказ до любого запроса, пропуск не печатается.
+    const mark7 = seen.length;
+    const insecure = await cli(["attach", "7", "--url", `http://127.0.0.1:${server.port}/files/x.pdf?link=TOKEN-LIVE-HTTP-0010`]);
+    check("attach CLI: http — отказ до сети", [insecure.code, seen.length - mark7], [1, 0]);
+    check("attach CLI: http — пропуск не напечатан", leaks(insecure, "TOKEN-LIVE-HTTP-0010"), false);
+
+    // 8. Ссылка в примечании и запрещённый текст останавливаются до скачивания: ссылка не тратится.
+    const fresh = `${base}files/inbox/new.pdf?link=TOKEN-LIVE-FRESH-0011`;
+    const leaked = await cli(["attach", "7", "--url", fresh, "--note", `Файл: ${fresh}`]);
+    check("attach CLI: ссылка в примечании — отказ", [leaked.code, leaked.err.includes("одноразовая ссылка")], [1, true]);
+    check("attach CLI: ссылка в примечании — пропуск не напечатан", leaks(leaked, "TOKEN-LIVE-FRESH-0011"), false);
+    const secretNote = await cli(["attach", "7", "--url", fresh, "--note", "Пароль от админки: Zx9kLm2025q"]);
+    check("attach CLI: запрещённый текст примечания — отказ", [secretNote.code, secretNote.err.includes("Отправка остановлена")], [1, true]);
+    check("attach CLI: до скачивания дело не дошло", linkHits().filter((s) => s.path.endsWith("new.pdf")).length, 0);
+
+    // 9. Имя файла видно в задаче так же, как текст, и проходит ту же проверку.
+    const mark9 = seen.length;
+    const leakyName = join(home, "пароль Zx9kLm2025q.txt");
+    await writeFile(leakyName, "x");
+    const named = await cli(["attach", "7", "--file", leakyName, "--yes"]);
+    check("attach CLI: запрещённое имя файла — отказ", [named.code, named.err.includes("Отправка остановлена")], [1, true]);
+    check("attach CLI: запрещённое имя файла — поле названо", named.err.includes("(имена файлов)"), true);
+    check("attach CLI: запрещённое имя файла — ничего не записано", writes(mark9).length, 0);
+
+    // 10. Задача в закрытом проекте: только чтение — остановка до любой записи.
+    const mark10 = seen.length;
+    const closed = await cli(["attach", "9", "--file", local, "--yes"]);
+    check("attach CLI: закрытый проект — отказ до записи", [closed.code, closed.err.includes("закрыт"), writes(mark10).length], [1, true, 0]);
+    check("attach CLI: закрытый проект — подсказка reopen-project", closed.err.includes("reopen-project arkhiv"), true);
+
+    // 11. Ссылка на задачу выбирает инстанс сама. Второй профиль — на зарезервированном домене .invalid:
+    // даже ошибка в коде не увела бы запрос к настоящему серверу.
+    await mkdir(join(home, ".redmine"), { recursive: true });
+    await writeFile(
+      join(home, ".redmine", "config.json"),
+      JSON.stringify({
+        default: "second",
+        instances: { first: { url: base, apiKey: API_KEY }, second: { url: "https://second.redmine.invalid/", apiKey: "other" } },
+      }),
+    );
+    const mark11 = seen.length;
+    const switched = await cli(["attach", `${base}issues/7`, "--file", local], true);
+    check("attach CLI: ссылка на задачу переключает инстанс", [switched.code, switched.out.includes("ВЛОЖЕНИЯ К ЗАДАЧЕ #7 · инстанс first")], [0, true]);
+    check("attach CLI: после переключения — ничего не записано", writes(mark11).length, 0);
+    const conflict = await cli(["attach", `${base}issues/7`, "--file", local, "--instance", "second"], true);
+    check("attach CLI: ссылка и --instance спорят — отказ", [conflict.code, conflict.err.includes("ведёт на инстанс first, а --instance задаёт second")], [1, true]);
+    await removePath(join(home, ".redmine", "config.json"), { force: true });
+  } finally {
+    server.stop(true);
+    await removePath(home, { recursive: true, force: true });
+  }
 }
 
 // ── итог ──────────────────────────────────────────────────────────────
