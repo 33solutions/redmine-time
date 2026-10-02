@@ -6149,6 +6149,56 @@ async function cmdCreateIssue(rm: Resolved, args: Args): Promise<void> {
   );
 }
 
+// ── родитель задачи в update-issue ──
+
+/** «none» снимает родителя: Redmine очищает поле пустой строкой — так же, как веху и оценку. */
+export function parentClears(raw: string): boolean {
+  return /^(none|нет|снять|убрать|—|-)$/i.test(raw.trim());
+}
+
+/**
+ * Что просили сделать с родителем: номер новой задачи-родителя или "" — снять родителя.
+ * Разбирается до сети: опечатка в номере останавливает команду, а не выдёргивает задачу из дерева.
+ */
+export function readParentArg(raw: string, issueId: number): number | "" {
+  if (parentClears(raw)) return "";
+  const wanted = issueNumber(raw, "--parent");
+  if (wanted === issueId) throw new UserError(`--parent: задача #${issueId} не может быть родителем самой себе.`);
+  return wanted;
+}
+
+/**
+ * Строка предпросмотра «было → станет». null — менять нечего: снимают родителя, которого нет,
+ * или ставят того, кто уже стоит. Такая правка не отправляется вовсе.
+ */
+export function describeParentChange(wanted: number | "", current: number | undefined): string | null {
+  if (wanted === "") return current === undefined ? null : `#${current} → нет: задача станет задачей верхнего уровня`;
+  if (wanted === current) return null;
+  return `${current === undefined ? "нет" : `#${current}`} → #${wanted}: задача станет подзадачей #${wanted}`;
+}
+
+/** Название права так, как его показывает русский интерфейс Redmine («Роли и права»). */
+export const MANAGE_SUBTASKS_PERMISSION = "«Управление подзадачами»";
+
+/**
+ * Сверка родителя после правки. Без права «Управление подзадачами» или когда рабочий процесс
+ * делает поле «Родительская задача» только для чтения, Redmine молча отбрасывает parent_issue_id
+ * и всё равно отвечает успехом. Верить можно только перечитанной задаче.
+ */
+export function checkIssueParent(after: { id: number } | null | undefined, wanted: number | ""): string {
+  const why =
+    `Обычно так бывает без права ${MANAGE_SUBTASKS_PERMISSION} или когда рабочий процесс ` +
+    "делает поле «Родительская задача» только для чтения.";
+  if (wanted === "") {
+    return after
+      ? `РАСХОЖДЕНИЕ: родителя снять не удалось — задача по-прежнему подзадача #${after.id}. ${why}`
+      : "Сверка: родитель снят — задача верхнего уровня.";
+  }
+  if (!after) return `РАСХОЖДЕНИЕ: Redmine ответил успехом, но родителя у задачи нет (отправлялся #${wanted}). ${why}`;
+  if (after.id !== wanted) return `РАСХОЖДЕНИЕ: родитель задачи — #${after.id}, отправлялся #${wanted}. ${why}`;
+  return `Сверка: задача — подзадача #${wanted}.`;
+}
+
 async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   const raw = args.positional[0] ?? required(args, "issue");
   const id = Number(raw.replace("#", ""));
@@ -6166,14 +6216,18 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   if (description) patch.description = description;
   const subject = str(args, "subject");
   if (subject) patch.subject = subject;
-  const parent = str(args, "parent");
-  if (parent) patch.parent_issue_id = issueNumber(parent, "--parent");
+  const parentRaw = str(args, "parent");
+  if (args.flags.has("parent") && parentRaw === undefined) {
+    throw new UserError("Флаг --parent ожидает номер задачи-родителя или «none»: --parent 25130.");
+  }
+  // Номер разбирается до сети: опечатка не должна выдёргивать задачу из дерева.
+  const parentWanted = parentRaw === undefined ? undefined : readParentArg(parentRaw, id);
   const estimated = str(args, "estimated");
   // «none» и «0» снимают оценку: Redmine очищает поле пустой строкой.
   if (estimated) {
     patch.estimated_hours = /^(none|нет|0)$/i.test(estimated.trim()) ? "" : round2(parseHours(estimated));
   }
-  // Карточка задачи нужна и исполнителю по имени, и вехе по имени — читается один раз на обоих.
+  // Карточка задачи нужна исполнителю по имени, вехе по имени и родителю — читается один раз на всех.
   let issueMemo: Issue | null = null;
   const issueCard = async (): Promise<Issue> =>
     (issueMemo ??= (await request<{ issue: Issue }>(rm, "GET", `issues/${id}.json`)).issue);
@@ -6197,11 +6251,28 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
     patch.fixed_version_id = picked.id;
     labels.fixed_version_id = picked.label;
   }
+  // Родитель показывается «было → станет»: текущего знает только карточка задачи. Правка, которая
+  // ничего не меняет (снять отсутствующего родителя, поставить того же), в Redmine не уходит.
+  let parentNote: string | null = null;
+  if (parentWanted !== undefined) {
+    const change = describeParentChange(parentWanted, (await issueCard()).parent?.id);
+    if (change === null) {
+      parentNote =
+        parentWanted === ""
+          ? `у задачи #${id} родителя нет — снимать нечего`
+          : `задача #${id} уже подзадача #${parentWanted} — менять нечего`;
+    } else {
+      patch.parent_issue_id = parentWanted;
+      labels.parent_issue_id = change;
+    }
+  }
   const due = str(args, "due");
   if (due) patch.due_date = parseDate(due);
   if (Object.keys(patch).length === 0) {
     throw new UserError(
-      "Нечего менять: задайте --status/--done/--note/--description/--subject/--assignee/--due/--parent/--estimated/--version.",
+      parentNote !== null
+        ? `Нечего менять: ${parentNote}.`
+        : "Нечего менять: задайте --status/--done/--note/--description/--subject/--assignee/--due/--parent/--estimated/--version.",
     );
   }
 
@@ -6213,6 +6284,7 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   const preview =
     `ИЗМЕНЕНИЕ #${id} · инстанс ${rm.name}\n${issueUrl(rm, id)}\n` +
     (rows.length ? table(rows) : "(только текст)") +
+    (parentNote ? `\nРодитель: ${parentNote}.` : "") +
     (description
       ? `\n\nНОВОЕ ОПИСАНИЕ (заменит текущее целиком):\n${"─".repeat(60)}\n${description.trim()}\n${"─".repeat(60)}`
       : "") +
@@ -6225,11 +6297,15 @@ async function cmdUpdateIssue(rm: Resolved, args: Args): Promise<void> {
   // Веху Redmine может не принять молча (чужая вехе задача, закрытая веха) — сверяем по перечитанной задаче.
   const versionCheck =
     patch.fixed_version_id === undefined ? null : checkIssueVersion(i.fixed_version, patch.fixed_version_id as number | "");
+  // Родителя Redmine тоже может не принять молча — та же сверка по перечитанной задаче.
+  const parentCheck =
+    patch.parent_issue_id === undefined ? null : checkIssueParent(i.parent, patch.parent_issue_id as number | "");
   emit(i, () =>
     `#${i.id} обновлена: статус ${i.status.name}, готовность ${i.done_ratio}%\n${issueUrl(rm, i.id)}` +
-      (versionCheck ? `\n${versionCheck}` : ""),
+      (versionCheck ? `\n${versionCheck}` : "") +
+      (parentCheck ? `\n${parentCheck}` : ""),
   );
-  if (versionCheck?.startsWith("РАСХОЖДЕНИЕ")) process.exitCode = 1;
+  if (versionCheck?.startsWith("РАСХОЖДЕНИЕ") || parentCheck?.startsWith("РАСХОЖДЕНИЕ")) process.exitCode = 1;
 }
 
 // ─────────────────── разбор зависших задач и закрытие ─────────────────
@@ -9078,7 +9154,7 @@ async function cmdEdit(rm: Resolved, args: Args): Promise<void> {
   const issue = str(args, "issue");
   if (issue) patch.issue_id = issueNumber(issue, "--issue");
   if (Object.keys(patch).length === 0) {
-    throw new UserError("Нечего менять: задайте --hours/--date/--comment/--activity/--issue.");
+    throw new UserError("Нечего менять: задайте --hours/--date/--comment/--comment-file/--activity/--issue.");
   }
 
   checkOutgoing({ комментарий: comment }, args);
@@ -9179,8 +9255,9 @@ Wiki проекта
 Что нового и сроки
   inbox [--since 2026-09-20|-3|12h] [--mark] [--watched] [--authored] [--include-own]
         новые задачи на мне, новые комментарии и изменения; --mark запоминает отметку «просмотрено»
-  due [--days 14] [--all] [--project X] [--anyone]
-        задачи на мне со сроками: просроченные, сегодня, ближайшие
+  due [--days 14] [--all] [--project X] [--anyone] [--exclude-status "A,B"] [--stale] [--stale-days 90]
+        задачи на мне со сроками: просроченные, сегодня, ближайшие. Просроченные больше чем на 90 дней
+        скрыты: --stale покажет их, --stale-days меняет порог; --exclude-status убирает статусы через запятую
 
 Сделанное по истории git
   repos list | repos add [--path .] --instance <профиль> --project <проект> [--client "<организация>"]
@@ -9231,11 +9308,12 @@ Wiki проекта
   update-issue <id> [--status имя] [--done N] [--note текст|--note-file f] [--assignee me|id|имя] [--due дата]
                [--subject "..."] [--description "..."|--description-file f] [--parent N|none] [--estimated 8]
                [--version <имя|id|none>] [--dry-run]
-        тему, описание, родителя и оценку команда меняет давно — в справке их не было,
-        и приходилось искать флаги в коде;
+        --parent N делает задачу подзадачей #N, --parent none снимает родителя — задача станет
+        задачей верхнего уровня; --estimated none или 0 убирает оценку;
         --version привязывает задачу к вехе проекта (поле «Версия»), --version none снимает её;
         имя вехи ищется среди вех проекта задачи — список: redmine.ts versions <проект>;
-        после записи веха перечитывается: Redmine отвечает успехом и на веху, которую не принял
+        после записи родитель и веха перечитываются: Redmine отвечает успехом и тогда, когда поле
+        не принял (родителя — без права «Управление подзадачами»)
 
 Трудозатраты
   log --issue N --hours 2.5 [--date today|YYYY-MM-DD|-1] [--comment "..."|--comment-file f] [--activity имя] [--dry-run]
@@ -9256,7 +9334,9 @@ Wiki проекта
 Ретроспектива: заполнить прошлое
   backfill-check --project X [--period 2026-07..2026-09|--from --to]
         пробелы: задачи без списаний, месяцы без часов, дни с нечеловеческой нагрузкой
-  edit <entryId> [--hours|--date|--comment|--activity|--issue] [--dry-run]
+  edit <entryId> [--hours H] [--date D] [--comment "..."|--comment-file f] [--activity имя] [--issue N] [--dry-run]
+        комментарий — как у log: --comment-file важнее --comment, в файле одна строка, пустой файл — ошибка;
+        --comment "" стирает пояснение, а на контуре с "requireComment": true отклоняется до отправки
   delete <entryId> --yes
 
 Форматы: часы 2 | 2.5 | 1h30 | 1:30 | 90m; даты YYYY-MM-DD | DD.MM[.YYYY] | today | yesterday | -3;

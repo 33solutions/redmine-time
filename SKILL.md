@@ -458,8 +458,11 @@ bun redmine.ts batch --file entries.json --yes
 ... attach 1234 --url "<ссылка>" --note "…"              # приложить файл; предпросмотр, затем --yes
 ... create-issue --project 33solutions --subject "…" --description-file /tmp/d.html --due +7
 ... update-issue 1234 --status "В работе" --done 60 --note "…"
+... update-issue 1234 --parent 1200                      # сделать подзадачей #1200; --parent none — снять родителя
 ```
 Длинные тексты передавай файлами (`--description-file`, `--text-file`): так не ломается HTML и кавычки. Справочники: `... trackers`, `... statuses`, `... activities`, `... projects`, `... roles`.
+
+Родитель в `update-issue` показывается «было → станет», правка, которая ничего не меняет, не отправляется. После записи задача перечитывается: без права «Управление подзадачами» Redmine отвечает успехом, а родителя не меняет — «РАСХОЖДЕНИЕ» показывай пользователю.
 
 ## Часы от соседних сессий: очередь, а не списание
 
