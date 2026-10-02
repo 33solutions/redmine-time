@@ -129,6 +129,7 @@ import {
   type WikiDeleteContext,
   type CreateVersionContext,
 } from "./redmine.ts";
+import { parentClears, readParentArg, describeParentChange, checkIssueParent, MANAGE_SUBTASKS_PERMISSION } from "./redmine.ts";
 import {
   readAttach,
   parseLink,
@@ -1872,6 +1873,36 @@ check("сверка привязки: снять не удалось", checkIssu
 check("сверка привязки: вехи нет — расхождение", checkIssueVersion(undefined, 11).includes("РАСХОЖДЕНИЕ"), true);
 check("сверка привязки: веха другая — расхождение", checkIssueVersion({ id: 12, name: "2. ЛК" }, 11).includes("РАСХОЖДЕНИЕ"), true);
 
+// ── родитель задачи: update-issue ─────────────────────────────────────
+check("родитель: none снимает", ["none", "нет", "снять", "—", "-"].map((s) => parentClears(s)), [true, true, true, true, true]);
+check("родитель: номер за снятие не принимается", parentClears("25130"), false);
+// Отказ вместо значения — проверка проваливается словами, а не обрушивает самопроверку.
+const parentArgOf = (raw: string, issueId: number): unknown => {
+  try {
+    return readParentArg(raw, issueId);
+  } catch (error) {
+    return `отказ: ${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+check("родитель: none — пустая строка для Redmine", parentArgOf("none", 25140), "");
+check("родитель: номер с решёткой", parentArgOf("#25130", 25140), 25130);
+// Опечатка не должна уходить в Redmine: NaN в JSON — это null, то есть «родителя нет».
+checkThrows("родитель: опечатка в номере — отказ", () => readParentArg("2513o", 25140));
+checkThrows("родитель: задача не родитель самой себе", () => readParentArg("#25140", 25140));
+check("родитель: снять — было → станет", describeParentChange("", 25130), "#25130 → нет: задача станет задачей верхнего уровня");
+check("родитель: снимать нечего — правки нет", describeParentChange("", undefined), null);
+check("родитель: поставить", describeParentChange(25130, undefined), "нет → #25130: задача станет подзадачей #25130");
+check("родитель: перенести", describeParentChange(25131, 25130), "#25130 → #25131: задача станет подзадачей #25131");
+check("родитель: тот же — правки нет", describeParentChange(25130, 25130), null);
+check("сверка родителя: снят", checkIssueParent(undefined, ""), "Сверка: родитель снят — задача верхнего уровня.");
+check("сверка родителя: поставлен", checkIssueParent({ id: 25130 }, 25130), "Сверка: задача — подзадача #25130.");
+// Без права «Управление подзадачами» Redmine отвечает успехом и поле не меняет: без сверки это терялось бы молча.
+const parentStuck = checkIssueParent({ id: 25130 }, "");
+check("сверка родителя: не снялся — расхождение", parentStuck.startsWith("РАСХОЖДЕНИЕ"), true);
+check("сверка родителя: не снялся — право названо", parentStuck.includes(MANAGE_SUBTASKS_PERMISSION), true);
+check("сверка родителя: не поставился — расхождение", checkIssueParent(undefined, 25130).startsWith("РАСХОЖДЕНИЕ"), true);
+check("сверка родителя: другой родитель — расхождение", checkIssueParent({ id: 1 }, 25130).startsWith("РАСХОЖДЕНИЕ"), true);
+
 // ── вехи: список ──────────────────────────────────────────────────────
 check("вехи: сортировка по сроку, без срока — в конец", sortVersions(versionsFixture).map((v) => v.id), [13, 11, 12]);
 check("срок вехи: сегодня", versionDueHint("2026-09-29", "2026-09-29"), "2026-09-29 (сегодня)");
@@ -2456,7 +2487,7 @@ check("сверка вехи: инстанс не отдал статус — н
   check("скачивание: сетевой сбой — пропуск вычищен", offline.includes("TOKEN-FETCH-0005"), false);
 }
 
-// ── файлы к задаче: живой прогон CLI против поддельного Redmine ───────
+// ── живой прогон CLI против поддельного Redmine: вложения и родитель ──
 {
   // Ссылки принимаются только https, поэтому и поддельный сервер — https: сертификат выпускается здесь же
   // на время прогона. Он самоподписанный, и проверку цепочки отключает переменная окружения — только
@@ -2526,10 +2557,15 @@ check("сверка вехи: инстанс не отдал статус — н
   const served = new Set<string>();
   type Stored = IssueAttachment & { token: string };
   const uploads: Stored[] = [];
-  const issues = new Map<number, { attachments: Stored[]; journals: AttachJournal[] }>([
+  // parent — родитель задачи; parentLocked — поле «Родительская задача» Redmine молча не меняет,
+  // как у ключа без права «Управление подзадачами»: отвечает успехом и оставляет как было.
+  type IssueState = { attachments: Stored[]; journals: AttachJournal[]; parent?: number; parentLocked?: boolean };
+  const issues = new Map<number, IssueState>([
     [7, { attachments: [], journals: [] }],
     [8, { attachments: [], journals: [] }],
     [9, { attachments: [], journals: [] }], // в закрытом проекте 78
+    [10, { attachments: [], journals: [], parent: 7 }],
+    [11, { attachments: [], journals: [], parent: 7, parentLocked: true }],
   ]);
   const author = { id: 5, name: "Иван Петров" };
   const json = (data: unknown, status = 200): Response => Response.json(data, { status });
@@ -2608,6 +2644,7 @@ check("сверка вехи: инстанс не отдал статус — н
             is_private: false,
             created_on: "2026-10-01T10:00:00Z",
             updated_on: "2026-10-01T10:00:00Z",
+            ...(state.parent !== undefined ? { parent: { id: state.parent } } : {}),
             ...(include.includes("attachments") ? { attachments: state.attachments.map(({ token: _t, ...a }) => a) } : {}),
             ...(include.includes("journals") ? { journals: state.journals } : {}),
           },
@@ -2615,7 +2652,16 @@ check("сверка вехи: инстанс не отдал статус — н
       }
       if (state && req.method === "PUT") {
         if (issueId === 8) return new Response("", { status: 403 });
-        const patch = (JSON.parse(new TextDecoder().decode(body)) as { issue: { notes?: string; uploads?: { token: string }[] } }).issue;
+        const patch = (
+          JSON.parse(new TextDecoder().decode(body)) as {
+            issue: { notes?: string; uploads?: { token: string }[]; parent_issue_id?: number | string | null };
+          }
+        ).issue;
+        // Пустая строка и null снимают родителя — так Redmine читает parent_issue_id.
+        if ("parent_issue_id" in patch && !state.parentLocked) {
+          const value = patch.parent_issue_id;
+          state.parent = value === "" || value === null || value === undefined ? undefined : Number(value);
+        }
         const added = (patch.uploads ?? [])
           .map((u) => uploads.find((s) => s.token === u.token))
           .filter((s): s is Stored => s !== undefined);
@@ -2817,6 +2863,66 @@ check("сверка вехи: инстанс не отдал статус — н
     const conflict = await cli(["attach", `${base}issues/7`, "--file", local, "--instance", "second"], true);
     check("attach CLI: ссылка и --instance спорят — отказ", [conflict.code, conflict.err.includes("ведёт на инстанс first, а --instance задаёт second")], [1, true]);
     await removePath(join(home, ".redmine", "config.json"), { force: true });
+
+    // ── update-issue --parent: снять родителя, перенести, отказ без права, опечатки ──
+    const bodyOf = (s: Seen | undefined): unknown => {
+      try {
+        return JSON.parse(new TextDecoder().decode(s?.body));
+      } catch {
+        return null; // Не JSON или запроса нет — проверка провалится словами, а не обрушит самопроверку.
+      }
+    };
+
+    // 12. Предпросмотр снятия: «было → станет» по карточке задачи, в Redmine ничего не пишется.
+    const mark12 = seen.length;
+    const unparentPreview = await cli(["update-issue", "10", "--parent", "none"]);
+    check("update-issue CLI: снять родителя — предпросмотр без ошибки", [unparentPreview.code, unparentPreview.err.trim()], [0, ""]);
+    check(
+      "update-issue CLI: снять родителя — было → станет",
+      unparentPreview.out.includes("#7 → нет: задача станет задачей верхнего уровня"),
+      true,
+    );
+    check("update-issue CLI: предпросмотр ничего не пишет", writes(mark12).length, 0);
+
+    // 13. Запись: parent_issue_id уходит пустой строкой и он — единственное поле правки; сверка по перечитанной задаче.
+    const mark13 = seen.length;
+    const unparented = await cli(["update-issue", "10", "--parent", "none", "--yes"]);
+    const put13 = writes(mark13);
+    check("update-issue CLI: снять родителя — без ошибки", [unparented.code, unparented.err.trim()], [0, ""]);
+    check("update-issue CLI: снять родителя — одна правка задачи", put13.map((s) => `${s.method} ${s.path}`), ["PUT /issues/10.json"]);
+    check("update-issue CLI: снять родителя — parent_issue_id пустой строкой", bodyOf(put13[0]), { issue: { parent_issue_id: "" } });
+    check("update-issue CLI: снять родителя — сверка", unparented.out.includes("Сверка: родитель снят — задача верхнего уровня."), true);
+
+    // 14. Родителя уже нет: снимать нечего — отказ словами, правка не уходит.
+    const mark14 = seen.length;
+    const nothing = await cli(["update-issue", "10", "--parent", "none", "--yes"]);
+    check("update-issue CLI: родителя нет — нечего менять", [nothing.code, nothing.err.includes("родителя нет — снимать нечего")], [1, true]);
+    check("update-issue CLI: родителя нет — ничего не записано", writes(mark14).length, 0);
+
+    // 15. Перенос под родителя: номер уходит числом, сверка подтверждает по перечитанной задаче.
+    const mark15 = seen.length;
+    const reparented = await cli(["update-issue", "10", "--parent", "#7", "--yes"]);
+    check("update-issue CLI: перенос под #7 — без ошибки", [reparented.code, reparented.err.trim()], [0, ""]);
+    check("update-issue CLI: перенос под #7 — номер числом", bodyOf(writes(mark15)[0]), { issue: { parent_issue_id: 7 } });
+    check("update-issue CLI: перенос под #7 — сверка", reparented.out.includes("Сверка: задача — подзадача #7."), true);
+
+    // 16. Redmine ответил успехом, но поле не принял (нет права «Управление подзадачами»): РАСХОЖДЕНИЕ и код 1.
+    const mark16 = seen.length;
+    const locked = await cli(["update-issue", "11", "--parent", "none", "--yes"]);
+    check("update-issue CLI: поле не принято — правка ушла", writes(mark16).map((s) => s.method), ["PUT"]);
+    check("update-issue CLI: поле не принято — код 1", locked.code, 1);
+    check("update-issue CLI: поле не принято — расхождение", locked.out.includes("РАСХОЖДЕНИЕ: родителя снять не удалось"), true);
+    check("update-issue CLI: поле не принято — право словами", locked.out.includes(MANAGE_SUBTASKS_PERMISSION), true);
+
+    // 17. Опечатка в номере, задача-родитель самой себе и флаг без значения — отказ до любого запроса.
+    const mark17 = seen.length;
+    const typo = await cli(["update-issue", "10", "--parent", "7a"]);
+    const itself = await cli(["update-issue", "10", "--parent", "10"]);
+    const bare = await cli(["update-issue", "10", "--parent"]);
+    check("update-issue CLI: опечатка в номере родителя — отказ", [typo.code, typo.err.includes("нужен номер задачи числом")], [1, true]);
+    check("update-issue CLI: родитель самой себе — отказ", [itself.code, itself.err.includes("не может быть родителем самой себе")], [1, true]);
+    check("update-issue CLI: --parent без значения — отказ", [bare.code, bare.err.includes("ожидает номер задачи-родителя")], [1, true]);
+    check("update-issue CLI: опечатки остановлены до сети", seen.length - mark17, 0);
   } finally {
     server.stop(true);
     await removePath(home, { recursive: true, force: true });
