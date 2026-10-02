@@ -2198,9 +2198,11 @@ check("сверка вехи: инстанс не отдал статус — н
   );
   check("имя файла: кавычки и экранирование", dispositionFilename('attachment; filename="a \\"b\\" c.pdf"'), 'a "b" c.pdf');
   check("имя файла: ISO-8859-1 в filename*", dispositionFilename("attachment; filename*=iso-8859-1'fr'%E9t%E9.txt"), "été.txt");
+  // Кодировка, которой нет ни в одном рантайме: windows-1251 для этого не годится — свежий Bun её знает,
+  // и проверка зависела бы от версии Bun на машине прогона.
   check(
     "имя файла: неизвестная рантайму кодировка — откат на filename",
-    dispositionFilename("attachment; filename*=windows-1251''%EE%F2.txt; filename=\"ot.txt\""),
+    dispositionFilename("attachment; filename*=x-no-such-charset''%EE%F2.txt; filename=\"ot.txt\""),
     "ot.txt",
   );
   // Сервер положил UTF-8 в filename как есть, а fetch читает заголовок побайтно.
