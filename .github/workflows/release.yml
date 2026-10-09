@@ -55,6 +55,12 @@ jobs:
           AUDIT_INTERNAL_DOMAINS: ${{ secrets.AUDIT_INTERNAL_DOMAINS }}
           AUDIT_ALLOW: ${{ secrets.AUDIT_ALLOW }}
         run: |
+          VERSION="$(cat VERSION)"
+          PLUGIN="$(jq -r .version .claude-plugin/plugin.json)"
+          if [ "$PLUGIN" != "$VERSION" ]; then
+            echo "В .claude-plugin/plugin.json версия ${PLUGIN}, а в VERSION — ${VERSION}: витрина увидела бы старую." >&2
+            exit 1
+          fi
           bun add -d typescript bun-types
           bunx tsc --noEmit
           bun scripts/selftest.ts

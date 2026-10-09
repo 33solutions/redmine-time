@@ -50,3 +50,15 @@ jobs:
             exit 1
           fi
           echo "Версия ${VERSION} описана в журнале изменений."
+
+      - name: Версия плагина совпадает с VERSION
+        run: |
+          # Витрина плагинов читает версию из plugin.json: отстала она — /plugin update
+          # считает установленную копию свежей и обновление не предлагает.
+          VERSION="$(cat VERSION)"
+          PLUGIN="$(jq -r .version .claude-plugin/plugin.json)"
+          if [ "$PLUGIN" != "$VERSION" ]; then
+            echo "В .claude-plugin/plugin.json версия ${PLUGIN}, а в VERSION — ${VERSION}: поднимайте их вместе." >&2
+            exit 1
+          fi
+          echo "plugin.json и VERSION согласованы: ${VERSION}."
