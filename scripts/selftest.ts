@@ -2569,6 +2569,12 @@ check("сверка вехи: инстанс не отдал статус — н
   ]);
   const author = { id: 5, name: "Иван Петров" };
   const json = (data: unknown, status = 200): Response => Response.json(data, { status });
+  // Участники проекта 77 и записи времени. canLogForOthers — право «Учёт времени других пользователей»:
+  // без него Redmine молча отбрасывает user_id и пишет часы на владельца ключа, отвечая 201.
+  const staff = [author, { id: 31, name: "Данил Щетник" }, { id: 32, name: "Олег Смирнов" }];
+  let canLogForOthers = true;
+  type FakeEntry = { id: number; issue_id: number; user_id?: number; hours: number; comments: string; spent_on: string };
+  const timeEntries: (FakeEntry & { owner: { id: number; name: string } })[] = [];
 
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -2606,6 +2612,41 @@ check("сверка вехи: инстанс не отдал статус — н
           return json({ user: { id: 5, admin: false, memberships: [{ project: { id: 77, name: "Пример" }, roles: [{ id: 3, name: "Исполнитель" }] }] } });
         }
         return json({ user: { id: 5, login: "ivanov", firstname: "Иван", lastname: "Петров", api_key: "not-for-output" } });
+      }
+      if (path === "/projects/77/memberships.json") {
+        const memberships = staff.map((u, i) => ({ id: 700 + i, project: { id: 77, name: "Пример" }, user: u, roles: [{ id: 3, name: "Исполнитель" }] }));
+        return json({ memberships, total_count: memberships.length, offset: 0, limit: 100 });
+      }
+      if (path === "/time_entries.json" && req.method === "POST") {
+        const te = (JSON.parse(new TextDecoder().decode(body)) as { time_entry: FakeEntry }).time_entry;
+        // Как в Redmine: user_id — безопасный атрибут только при праве на чужое списание.
+        const owner = (canLogForOthers && staff.find((u) => u.id === te.user_id)) || author;
+        const entry = { ...te, id: 5000 + timeEntries.length, owner };
+        timeEntries.push(entry);
+        return json(
+          {
+            time_entry: {
+              id: entry.id,
+              project: { id: 77, name: "Пример" },
+              issue: { id: te.issue_id },
+              user: owner,
+              activity: { id: 9, name: "Разработка" },
+              hours: te.hours,
+              comments: te.comments,
+              spent_on: te.spent_on,
+              created_on: "2026-10-20T10:00:00Z",
+              updated_on: "2026-10-20T10:00:00Z",
+            },
+          },
+          201,
+        );
+      }
+      if (path === "/time_entries.json" && req.method === "GET") {
+        const issue = Number(url.searchParams.get("issue_id") ?? 0);
+        const list = timeEntries
+          .filter((e) => e.issue_id === issue)
+          .map((e) => ({ id: e.id, issue: { id: e.issue_id }, user: e.owner, hours: e.hours, spent_on: e.spent_on }));
+        return json({ time_entries: list, total_count: list.length, offset: 0, limit: 100 });
       }
       if (path === "/roles.json") return json({ roles: [{ id: 3, name: "Исполнитель" }] });
       if (path === "/roles/3.json") return json({ role: { id: 3, name: "Исполнитель", permissions: ["view_issues", "add_issue_notes"] } });
@@ -2923,6 +2964,71 @@ check("сверка вехи: инстанс не отдал статус — н
     check("update-issue CLI: родитель самой себе — отказ", [itself.code, itself.err.includes("не может быть родителем самой себе")], [1, true]);
     check("update-issue CLI: --parent без значения — отказ", [bare.code, bare.err.includes("ожидает номер задачи-родителя")], [1, true]);
     check("update-issue CLI: опечатки остановлены до сети", seen.length - mark17, 0);
+
+    // 18. Часы за другого сотрудника: имя ищется среди участников проекта задачи.
+    const posts = (from: number): Seen[] => seen.slice(from).filter((s) => s.method === "POST" && s.path === "/time_entries.json");
+    const sentUser = (r: Seen): unknown =>
+      (JSON.parse(new TextDecoder().decode(r.body)) as { time_entry: { user_id?: number } }).time_entry.user_id;
+    const mark18 = seen.length;
+    const forOther = await cli(["log", "--issue", "7", "--hours", "1.5", "--comment", "Сверка остатков", "--user", "Данил Щетник"]);
+    check(
+      "log --user: предпросмотр называет сотрудника и не пишет",
+      [forOther.code, forOther.out.includes("Данил Щетник (id 31) — за другого сотрудника"), posts(mark18).length],
+      [0, true, 0],
+    );
+    check("log --user: предпросмотр предупреждает о праве", forOther.out.includes("ЗА ДРУГОГО СОТРУДНИКА"), true);
+
+    // 19. Право есть — часы легли на сотрудника, сверка молчит.
+    const mark19 = seen.length;
+    const granted = await cli(["log", "--issue", "7", "--hours", "1.5", "--comment", "Сверка остатков", "--user", "Данил Щетник", "--yes"]);
+    check("log --user --yes: записано без ошибки", granted.code, 0);
+    check("log --user --yes: в запросе user_id сотрудника", posts(mark19).map(sentUser), [31]);
+    check(
+      "log --user --yes: часы на сотруднике, расхождения нет",
+      [granted.out.includes("чьи часы: Данил Щетник"), granted.out.includes("РАСХОЖДЕНИЕ")],
+      [true, false],
+    );
+
+    // 20. Права нет — Redmine молча пишет на владельца ключа; команда это ловит и говорит, что делать.
+    canLogForOthers = false;
+    const denied = await cli(["log", "--issue", "7", "--hours", "2", "--comment", "Сверка остатков", "--user", "31", "--yes"]);
+    check("log --user без права: код 1", denied.code, 1);
+    check(
+      "log --user без права: расхождение названо, право названо, удаление подсказано",
+      [
+        denied.out.includes("РАСХОЖДЕНИЕ: часы записаны на Иван Петров"),
+        denied.out.includes("Учёт времени других пользователей"),
+        denied.out.includes("redmine.ts delete"),
+      ],
+      [true, true, true],
+    );
+
+    // 21. Свои часы — без user_id: право на чужое списание не нужно, проверять нечего.
+    const mark21 = seen.length;
+    const own = await cli(["log", "--issue", "7", "--hours", "1", "--comment", "Сверка остатков", "--user", "me", "--yes"]);
+    check("log --user me: user_id не отправляется", [own.code, posts(mark21).map(sentUser)], [0, [undefined]]);
+
+    // 22. Неизвестное имя — отказ до записи.
+    const mark22 = seen.length;
+    const stranger = await cli(["log", "--issue", "7", "--hours", "1", "--comment", "Сверка остатков", "--user", "Пётр Неизвестный", "--yes"]);
+    check("log --user: неизвестное имя — отказ до записи", [stranger.code, posts(mark22).length], [1, 0]);
+
+    // 23. Пачка без права: первое расхождение останавливает отправку за других, свои записи уходят.
+    const batchFile = join(home, "batch.json");
+    await writeFile(
+      batchFile,
+      JSON.stringify([
+        { issue: 7, hours: 1, date: "2026-10-19", comment: "Сверка остатков", user: "Данил Щетник" },
+        { issue: 7, hours: 2, date: "2026-10-19", comment: "Сверка остатков", user: "Олег Смирнов" },
+        { issue: 7, hours: 3, date: "2026-10-19", comment: "Сверка остатков" },
+      ]),
+    );
+    const mark23 = seen.length;
+    const batch = await cli(["batch", "--file", batchFile, "--yes"]);
+    check("batch user без права: код 1", batch.code, 1);
+    check("batch user без права: ушли первая за другого и своя, вторая за другого — нет", posts(mark23).map(sentUser), [31, undefined]);
+    check("batch user без права: остановка названа", batch.out.includes("не отправлены: они легли бы так же"), true);
+    canLogForOthers = true;
   } finally {
     server.stop(true);
     await removePath(home, { recursive: true, force: true });

@@ -8586,6 +8586,8 @@ type LogInput = {
   date: string;
   comment: string;
   activityId?: number;
+  /** Чьи часы. Не задан — владельца ключа; Redmine подставит его сам. */
+  user?: number;
 };
 
 async function buildEntryPayload(rm: Resolved, input: LogInput): Promise<Record<string, unknown>> {
@@ -8598,7 +8600,59 @@ async function buildEntryPayload(rm: Resolved, input: LogInput): Promise<Record<
   else if (input.project !== undefined) te.project_id = await resolveProjectKey(rm, input.project);
   else throw new UserError("Нужен --issue <номер> или --project <проект>.");
   if (input.activityId !== undefined) te.activity_id = input.activityId;
+  if (input.user !== undefined) te.user_id = input.user;
   return te;
+}
+
+/**
+ * Кому списываются часы: «me», номер или имя участника проекта.
+ *
+ * Имя ищется среди участников того проекта, куда пишется время: часы ложатся только тому,
+ * у кого в нём есть право «Учёт времени». Поэтому проект берётся из задачи, а не из профиля.
+ */
+async function resolveEntryUser(
+  rm: Resolved,
+  value: string,
+  target: { issue?: number; project?: string },
+): Promise<IdName> {
+  const raw = value.trim();
+  const me = await currentUser(rm);
+  if (raw === "" || raw === "me") return { id: me.id, name: `${me.firstname} ${me.lastname}`.trim() };
+  const project =
+    target.issue !== undefined
+      ? (await request<{ issue: { project: IdName } }>(rm, "GET", `issues/${target.issue}.json`)).issue.project.id
+      : target.project !== undefined
+        ? await resolveProjectKey(rm, target.project)
+        : undefined;
+  if (project === undefined) {
+    if (/^\d+$/.test(raw)) return { id: Number(raw), name: `#${raw}` };
+    throw new UserError(`Сотрудник "${raw}": не по чему искать — нет ни задачи, ни проекта. Укажите номер: --user <id>.`);
+  }
+  const members = await projectMembers(rm, project);
+  if (members.length === 0 && !/^\d+$/.test(raw)) {
+    throw new UserError(
+      `Сотрудник "${raw}": участники проекта не видны — список пуст или закрыт правами. Укажите номер: --user <id>.`,
+    );
+  }
+  return matchByName(members, raw, "Сотрудник");
+}
+
+/**
+ * Кому на самом деле легла запись.
+ *
+ * Redmine принимает user_id записи времени только от того, кому в проекте разрешён «Учёт времени
+ * других пользователей». Без права поле молча отбрасывается: часы ложатся на владельца ключа,
+ * ответ — 201, как при успехе. Поэтому кому досталась запись, сверяется по ответу, а не
+ * предполагается по запросу.
+ */
+function wrongOwner(rm: Resolved, entry: TimeEntry, wanted: IdName): string | null {
+  if (entry.user.id === wanted.id) return null;
+  return (
+    `РАСХОЖДЕНИЕ: часы записаны на ${entry.user.name} (id ${entry.user.id}), а не на ${wanted.name} (id ${wanted.id}).\n` +
+    `  Redmine молча отбросил сотрудника: у вашей роли в проекте нет права «Учёт времени других пользователей».\n` +
+    `  Запись ${entry.id} лежит на вас. Удалите её — redmine.ts delete ${entry.id} --instance ${rm.name} --yes — ` +
+    `и попросите администратора выдать право; потом повторите списание.`
+  );
 }
 
 /**
@@ -8771,6 +8825,12 @@ async function cmdLog(rm: Resolved, args: Args): Promise<void> {
     comment: await commentArg(args),
     activityId: await resolveActivityId(rm, str(args, "activity")),
   };
+  const userRaw = str(args, "user");
+  const me = await currentUser(rm);
+  const owner = userRaw === undefined ? undefined : await resolveEntryUser(rm, userRaw, input);
+  // Свои часы — без user_id: тогда право на чужое списание не нужно и проверять нечего.
+  const forOther = owner !== undefined && owner.id !== me.id ? owner : undefined;
+  if (forOther) input.user = forOther.id;
   const payload = await buildEntryPayload(rm, input);
   checkOutgoing({ комментарий: input.comment }, args);
 
@@ -8784,6 +8844,7 @@ async function cmdLog(rm: Resolved, args: Args): Promise<void> {
     table([
       ["Дата", String(payload.spent_on)],
       ["Цель", target],
+      ["Чьи часы", forOther ? `${forOther.name} (id ${forOther.id}) — за другого сотрудника` : "ваши"],
       ["Часы", h(Number(payload.hours))],
       ["Вид деятельности", activityName],
       ["Комментарий", String(payload.comments || "—")],
@@ -8793,12 +8854,24 @@ async function cmdLog(rm: Resolved, args: Args): Promise<void> {
     // как раз для того, чтобы посмотреть разбор часов и даты, ничего не отправляя.
     (rm.requireComment && input.comment.trim() === ""
       ? "\n\nОТПРАВКА НЕ ПРОЙДЁТ: на этом контуре комментарий обязателен, а он пуст."
+      : "") +
+    (forOther
+      ? "\n\nЗА ДРУГОГО СОТРУДНИКА: нужно право «Учёт времени других пользователей» в проекте. " +
+        "Без него Redmine запишет часы на вас и ничего не скажет — после записи это сверяется по ответу."
       : "");
   if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
 
   ensureComment(rm, input.comment, "Списание часов");
   const entry = await withTimeEntryErrors(() => postEntry(rm, payload));
-  emit(entry, () => `Записано: ${describeEntry(rm, entry)}`);
+  const mismatch = forOther ? wrongOwner(rm, entry, forOther) : null;
+  emit(
+    mismatch ? { ...entry, ownerMismatch: mismatch } : entry,
+    () =>
+      `Записано: ${describeEntry(rm, entry)}` +
+      (forOther ? `\n  чьи часы: ${entry.user.name}` : "") +
+      (mismatch ? `\n\n${mismatch}` : ""),
+  );
+  if (mismatch) process.exitCode = 1;
 }
 
 type BatchItem = {
@@ -8808,6 +8881,8 @@ type BatchItem = {
   date?: string;
   comment?: string;
   activity?: string;
+  /** Чьи часы: «me», номер или имя участника проекта. Не задан — владельца ключа. */
+  user?: number | string;
 };
 
 async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
@@ -8822,19 +8897,30 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
   if (!Array.isArray(parsed)) throw new UserError("Ожидается JSON-массив записей.");
   const items = parsed as BatchItem[];
 
+  const me = await currentUser(rm);
   const payloads: Record<string, unknown>[] = [];
+  /** Кому предназначена запись с тем же номером; undefined — владельцу ключа. */
+  const owners: (IdName | undefined)[] = [];
   for (const item of items) {
+    const target = {
+      issue: item.issue === undefined ? undefined : Number(String(item.issue).replace("#", "")),
+      project: item.project ?? (item.issue === undefined ? rm.defaultProject : undefined),
+    };
+    const owner = item.user === undefined ? undefined : await resolveEntryUser(rm, String(item.user), target);
+    const forOther = owner !== undefined && owner.id !== me.id ? owner : undefined;
+    owners.push(forOther);
     payloads.push(
       await buildEntryPayload(rm, {
-        issue: item.issue === undefined ? undefined : Number(String(item.issue).replace("#", "")),
-        project: item.project ?? (item.issue === undefined ? rm.defaultProject : undefined),
+        ...target,
         hours: parseHours(String(item.hours)),
         date: parseDate(item.date ?? "today"),
         comment: item.comment ?? "",
         activityId: await resolveActivityId(rm, item.activity),
+        user: forOther?.id,
       }),
     );
   }
+  const anyForOther = owners.some((o) => o !== undefined);
 
   // Пустые комментарии перечисляются все сразу и до предпросмотра: иначе человек правит
   // файл на сорок записей по одной ошибке за прогон, а часть записей уже уйдёт в Redmine.
@@ -8861,19 +8947,25 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
   const preview =
     `СПИСАНИЕ ЧАСОВ ПАЧКОЙ · инстанс ${rm.name} · ${payloads.length} записей, итого ${h(total)}\n` +
     table([
-      ["ДАТА", "ЦЕЛЬ", "ЧАСЫ", "КОММЕНТАРИЙ"],
-      ...payloads.map((p) => [
+      anyForOther ? ["ДАТА", "ЦЕЛЬ", "ЧЬИ", "ЧАСЫ", "КОММЕНТАРИЙ"] : ["ДАТА", "ЦЕЛЬ", "ЧАСЫ", "КОММЕНТАРИЙ"],
+      ...payloads.map((p, i) => [
         String(p.spent_on),
         p.issue_id ? `#${p.issue_id}` : String(p.project_id),
+        ...(anyForOther ? [owners[i] ? clip(owners[i]!.name, 24) : "ваши"] : []),
         h(Number(p.hours)),
-        clip(String(p.comments ?? ""), 60),
+        clip(String(p.comments ?? ""), anyForOther ? 44 : 60),
       ]),
     ]) +
     (byDay.size > 1
       ? `\n\nПО ДНЯМ: ${[...byDay].map(([d, hrs]) => `${d} — ${h(hrs)}`).join(", ")}`
       : `\n\nВсё списание приходится на один день (${[...byDay.keys()][0] ?? "—"}). ` +
         `Если работа шла несколько дней, разнесите её по дням: одна запись на период — огрубление.`) +
-    (warnings.length > 0 ? `\n\nПРОВЕРКА ПРАВДОПОДОБИЯ:\n${warnings.map((w) => `  ${w}`).join("\n")}` : "");
+    (warnings.length > 0 ? `\n\nПРОВЕРКА ПРАВДОПОДОБИЯ:\n${warnings.map((w) => `  ${w}`).join("\n")}` : "") +
+    (anyForOther
+      ? "\n\nЗА ДРУГИХ СОТРУДНИКОВ: нужно право «Учёт времени других пользователей» в проектах записей. " +
+        "Без него Redmine запишет часы на вас и ничего не скажет. Кому легла каждая запись, сверяется по ответу; " +
+        "на первом же расхождении отправка останавливается, чтобы не плодить записи не на тех."
+      : "");
   if (!requireConfirmation(args, preview, "та же команда с флагом --yes")) return;
 
   // Сверка «до и после» имеет смысл только по задачам: суммы проекта меняют и чужие записи.
@@ -8883,9 +8975,23 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
 
   const created: TimeEntry[] = [];
   const failed: { index: number; error: string }[] = [];
+  // Без права на чужое списание Redmine кладёт ВСЕ записи «за другого» на владельца ключа.
+  // Первое расхождение это показывает — дальше отправлять значит множить записи, которые потом удалять.
+  let ownerMismatch: string | null = null;
+  let notSent = 0;
   for (const [index, payload] of payloads.entries()) {
+    if (ownerMismatch && owners[index]) {
+      notSent++;
+      continue;
+    }
     try {
-      created.push(await withTimeEntryErrors(() => postEntry(rm, payload)));
+      const entry = await withTimeEntryErrors(() => postEntry(rm, payload));
+      created.push(entry);
+      const owner = owners[index];
+      if (owner && !ownerMismatch) {
+        const m = wrongOwner(rm, entry, owner);
+        if (m) ownerMismatch = `запись #${index}: ${m}`;
+      }
     } catch (e) {
       failed.push({ index, error: e instanceof Error ? e.message : String(e) });
     }
@@ -8902,8 +9008,8 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
     audit.push({ issue: id, before: wasBefore, after, expected: round2(wasBefore + planned), diff: check.diff, ok: check.ok });
   }
 
-  emit({ created, failed, audit, totalHours: round2(created.reduce((s, e) => s + e.hours, 0)) }, () => {
-    const lines = created.map((e) => describeEntry(rm, e));
+  emit({ created, failed, audit, ownerMismatch, notSent, totalHours: round2(created.reduce((s, e) => s + e.hours, 0)) }, () => {
+    const lines = created.map((e) => describeEntry(rm, e) + (anyForOther ? `\n  чьи часы: ${e.user.name}` : ""));
     if (failed.length) {
       lines.push("", `ОШИБКИ (${failed.length}):`, ...failed.map((f) => `  запись #${f.index}: ${f.error}`));
     }
@@ -8919,9 +9025,15 @@ async function cmdBatch(rm: Resolved, args: Args): Promise<void> {
         ),
       );
     }
+    if (ownerMismatch) {
+      lines.push("", ownerMismatch);
+      if (notSent > 0) {
+        lines.push(`  Остальные записи за других сотрудников — ${notSent} — не отправлены: они легли бы так же.`);
+      }
+    }
     return lines.join("\n");
   });
-  if (failed.length) process.exitCode = 1;
+  if (failed.length || ownerMismatch) process.exitCode = 1;
 }
 
 async function loadEntries(rm: Resolved, args: Args): Promise<{ from: string; to: string; entries: TimeEntry[] }> {
@@ -9316,11 +9428,15 @@ Wiki проекта
         не принял (родителя — без права «Управление подзадачами»)
 
 Трудозатраты
-  log --issue N --hours 2.5 [--date today|YYYY-MM-DD|-1] [--comment "..."|--comment-file f] [--activity имя] [--dry-run]
+  log --issue N --hours 2.5 [--date today|YYYY-MM-DD|-1] [--comment "..."|--comment-file f] [--activity имя]
+      [--user me|id|имя] [--dry-run]
+        --user — чьи часы: участник проекта по имени или номеру. Нужно право «Учёт времени других
+        пользователей»; без него Redmine молча пишет часы на вас — команда сверяет это после записи
         источники комментария по старшинству: --comment-file, затем --comment, затем --message;
         на контуре с "requireComment": true пустой комментарий отклоняется до отправки
   batch [--file entries.json | stdin] [--dry-run]
         JSON-массив: [{"issue":1234,"hours":"1h30","date":"2026-09-21","comment":"...","activity":"Разработка"}]
+        поле "user" — чьи часы, как --user у log; на первом расхождении отправка за других останавливается
   pending list | add | approve <id> | drop <id>       очередь неодобренных трудозатрат
         часы, присланные соседними сессиями, кладутся сюда и в Redmine сами не уходят
         add --from "<сессия>" [--issue N] [--hours H] [--date D] [--comment "..."] [--method "чем замерено"]

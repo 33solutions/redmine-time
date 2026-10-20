@@ -150,6 +150,7 @@ R=~/.claude/skills/redmine-time/scripts/redmine.ts
 bun $R log --issue 1234 --hours 2.5 --comment "Рефакторинг ядра"
 bun $R log --issue 1234 --hours 1h30 --date yesterday --activity "Анализ" --dry-run
 bun $R log --issue 1234 --hours 2 --comment-file c.txt   # комментарий из файла — одна строка
+bun $R log --issue 1234 --hours 2 --comment "…" --user "Данил Щетник"   # часы другого сотрудника
 bun $R edit 4567 --comment-file c.txt --yes              # поправить комментарий записи
 bun $R batch --file entries.json          # пачкой из JSON
 bun $R entries --period week --group issue
