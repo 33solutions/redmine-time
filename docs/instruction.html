@@ -116,13 +116,13 @@
 </table>
 
 <h3>Установка скилла</h3>
-<p>Способов два. От способа зависит, где лежит скилл и как он обновляется (раздел 15).</p>
-<p><b>Из витрины плагинов</b> — обычный путь, если у вас есть доступ к витрине компании (она закрытая). В чате Claude Code:</p>
-<pre>/plugin marketplace add 33solutions/claude-skills
-/plugin install redmine-time@33solutions</pre>
-<p><b>Клонированием репозитория</b> — в каталог навыков:</p>
-<pre>git clone https://github.com/33solutions/redmine-time.git ~/.claude/skills/redmine-time</pre>
-<p>Claude Code подхватит скилл при следующем запуске. Команды в этой инструкции написаны для установки клонированием. Скилл из витрины лежит не в <span class="mono">~/.claude/skills</span>, а в кэше плагинов (<span class="mono">~/.claude/plugins/cache/…</span>): точный каталог Claude Code сообщает при загрузке скилла — подставляйте его вместо <span class="mono">~/.claude/skills/redmine-time</span>. В чате путь указывать не нужно.</p>
+<p>Скилл ставится из витрины плагинов компании (она закрытая: нужен доступ к репозиторию). Один и тот же скилл работает в Claude Code и в Codex.</p>
+<p><b>Claude Code</b> — в терминале:</p>
+<pre>claude plugin marketplace add 33solutions/claude-skills
+claude plugin install redmine-time@33solutions</pre>
+<p><b>Codex</b> — в терминале, затем включите <span class="mono">redmine-time</span> в списке плагинов:</p>
+<pre>codex plugin marketplace add 33solutions/codex-skills</pre>
+<p>Точный каталог установленного скилла среда сообщает при его загрузке; в этой инструкции он обозначен как <span class="mono">&lt;каталог скилла&gt;</span>. В чате путь указывать не нужно.</p>
 
 <h2><span class="num">3</span>Настройка за три шага</h2>
 
@@ -132,7 +132,7 @@
 
 <h3>Шаг 2. Создайте файл конфигурации</h3>
 <pre>mkdir -p ~/.redmine
-cp ~/.claude/skills/redmine-time/config.example.json ~/.redmine/config.json</pre>
+cp "&lt;каталог скилла&gt;/config.example.json" ~/.redmine/config.json</pre>
 <p>Откройте <span class="mono">~/.redmine/config.json</span> и впишите ключи:</p>
 <pre>{
   "default": "work",
@@ -160,8 +160,8 @@ cp ~/.claude/skills/redmine-time/config.example.json ~/.redmine/config.json</pre
 </table>
 
 <h3>Шаг 3. Проверьте связь</h3>
-<pre>bun ~/.claude/skills/redmine-time/scripts/redmine.ts whoami
-bun ~/.claude/skills/redmine-time/scripts/redmine.ts whoami --instance second</pre>
+<pre>bun "&lt;каталог скилла&gt;/scripts/redmine.ts" whoami
+bun "&lt;каталог скилла&gt;/scripts/redmine.ts" whoami --instance second</pre>
 <p>Первая команда проверяет инстанс по умолчанию, вторая — второй. Ответ вида «Пользователь: Иван Иванов (i.ivanov, id=42)» по каждому инстансу означает, что всё готово.</p>
 
 <div class="note"><b>Ключ не попадёт в чужие руки:</b> он хранится только на вашем компьютере в <span class="mono">~/.redmine/config.json</span>, не печатается в выводе и исключён из репозитория через <span class="mono">.gitignore</span>.</div>
@@ -474,7 +474,7 @@ bun ~/.claude/skills/redmine-time/scripts/redmine.ts whoami --instance second</p
 
 <h2><span class="num">13</span>Командная строка</h2>
 <p>Скилл можно использовать и как обычную утилиту — например, в скриптах или по привычке. Полный список: <span class="mono">bun scripts/redmine.ts help</span>.</p>
-<pre>R=~/.claude/skills/redmine-time/scripts/redmine.ts
+<pre>R="&lt;каталог скилла&gt;/scripts/redmine.ts"
 
 bun $R log --issue 25127 --hours 2.5 --comment "Рефакторинг ядра"
 bun $R log --issue 25127 --hours 1h30 --date yesterday --dry-run
@@ -559,7 +559,7 @@ bun $R backfill-check --project primer --period 2026-07..2026-09</pre>
 
 <h3>Windows PowerShell</h3>
 <p>Кириллица в аргументах доходит до скилла целой — это проверено на Windows 11 с PowerShell 5.1. Ломается другое: PowerShell 5.1 молча выбрасывает пустой аргумент, и <span class="mono">--comment ""</span> доходит как флаг без значения — значением становится следующий флаг. Длинные и кириллические тексты надёжнее передавать файлом, записанным явно в UTF-8:</p>
-<pre>$R = "$env:USERPROFILE\.claude\skills\redmine-time\scripts\redmine.ts"
+<pre>$R = "&lt;каталог скилла&gt;\scripts\redmine.ts"
 Set-Content c.txt "Разбор выгрузки и сверка остатков" -Encoding utf8
 bun $R log --issue 25127 --hours 2 --comment-file c.txt --yes</pre>
 <p>Пачку записей — так же: JSON-файлом в UTF-8 (<span class="mono">ConvertTo-Json | Set-Content entries.json -Encoding utf8</span>). Если вместо букв видны <span class="mono">?</span> — текст записан кодировкой без кириллицы; если <span class="mono">�</span> — записан в cp1251, а прочитан как UTF-8: обычно это <span class="mono">Set-Content</span> без <span class="mono">-Encoding utf8</span>. Оба знака появляются на стороне PowerShell, а не в скилле.</p>
@@ -580,39 +580,14 @@ bun $R sessions --gap 120                  # свой порог перерыв�
   <li><b>Это мера присутствия, а не трудозатрат.</b> Внутри отрезка вы могли отвлекаться. Отрезок из одного сообщения длительности не имеет и даёт ноль — скилл считает такие отдельной строкой, а не прячет в итоге.</li>
   <li><b>Порог перерыва называют вместе с результатом.</b> При пороге 30 и 90 минут из одних и тех же сообщений получаются разные часы.</li>
   <li><b>По задачам отрезки раскладываете вы.</b> Скилл намеренно этого не делает: привязка по датам и ключевым словам годится для одного проекта и уверенно разложила бы чужую работу по чужим темам.</li>
-  <li><b>Чего в числах нет:</b> работы вне Claude Code, звонков, машинного времени и всего, что старше срока хранения сессий, — старые записи Claude Code удаляет сам. Отсутствие записей не доказывает, что работы не было.</li>
+  <li><b>Чего в числах нет:</b> работы вне Claude Code и Codex, звонков, машинного времени и всего, что старше срока хранения сессий, — старые записи клиенты удаляют сами. Отсутствие записей не доказывает, что работы не было.</li>
 </ul>
 
 <h2><span class="num">15</span>Обновление</h2>
-<p>Способ обновления зависит от того, как скилл установлен (раздел 2).</p>
-
-<h3>Установлен из витрины плагинов</h3>
-<pre>/plugin update redmine-time@33solutions</pre>
-<p>После обновления Claude Code попросит перезапуск; до него работает прежняя версия. Команда <span class="mono">update.ts</span> и автообновление, описанные ниже, здесь не действуют: копия в кэше плагинов — не репозиторий, обновлять её из git нечем.</p>
-
-<h3>Установлен клонированием</h3>
-<p>Такой скилл обновляется одной командой:</p>
-<pre>bun ~/.claude/skills/redmine-time/scripts/update.ts            # что нового
-bun ~/.claude/skills/redmine-time/scripts/update.ts --apply    # обновиться</pre>
-<p>Если вы правили файлы скилла у себя, обновление не применится и скажет об этом — ваши изменения не затираются.</p>
-<p>Чтобы скилл обновлялся сам — раз в сутки при запуске Claude Code, — добавьте в <span class="mono">~/.claude/settings.json</span> hook. Без него обновление только ручное.</p>
-<pre>{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bun \"$HOME/.claude/skills/redmine-time/scripts/update.ts\" --apply --quiet --if-stale 86400",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  }
-}</pre>
-<p>На Windows вместо <span class="mono">$HOME</span> укажите <span class="mono">$USERPROFILE</span>. Если раздел <span class="mono">hooks</span> в файле уже есть, добавьте запись в него, а не второй раздел. Проверка выполняется не чаще раза в сутки и молчит, когда обновлений нет.</p>
+<p>Скилл обновляется средствами витрины:</p>
+<pre>claude plugin update redmine-time@33solutions      # Claude Code
+codex plugin marketplace upgrade 33solutions       # Codex</pre>
+<p>После обновления перезапустите приложение; до перезапуска работает прежняя версия. Файлы установленного скилла не правьте: следующее обновление их заменит.</p>
 
 <h2><span class="num">16</span>Если что-то не работает</h2>
 <table>

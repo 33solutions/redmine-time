@@ -29,7 +29,7 @@ jobs:
         run: bunx tsc --noEmit
 
       - name: Самопроверка разбора ввода и правил
-        run: bun scripts/selftest.ts
+        run: bun skills/redmine-time/scripts/selftest.ts
 
       - name: Аудит репозитория и истории
         env:
@@ -37,10 +37,10 @@ jobs:
           # иначе проверяющий файл сам раскрывает то, что ищет.
           AUDIT_INTERNAL_DOMAINS: ${{ secrets.AUDIT_INTERNAL_DOMAINS }}
           AUDIT_ALLOW: ${{ secrets.AUDIT_ALLOW }}
-        run: bun scripts/audit-repo.ts --history
+        run: bun skills/redmine-time/scripts/audit-repo.ts --history
 
       - name: Справка CLI запускается
-        run: bun scripts/redmine.ts help > /dev/null
+        run: bun skills/redmine-time/scripts/redmine.ts help > /dev/null
 
       - name: Версия и журнал изменений согласованы
         run: |
@@ -57,6 +57,11 @@ jobs:
           # считает установленную копию свежей и обновление не предлагает.
           VERSION="$(cat VERSION)"
           PLUGIN="$(jq -r .version .claude-plugin/plugin.json)"
+          PORTABLE="$(jq -r .version plugin.json)"
+          if [ "$PORTABLE" != "$VERSION" ]; then
+            echo "В plugin.json версия ${PORTABLE}, а в VERSION — ${VERSION}: поднимайте их вместе." >&2
+            exit 1
+          fi
           if [ "$PLUGIN" != "$VERSION" ]; then
             echo "В .claude-plugin/plugin.json версия ${PLUGIN}, а в VERSION — ${VERSION}: поднимайте их вместе." >&2
             exit 1

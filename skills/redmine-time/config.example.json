@@ -21,7 +21,7 @@
     "acme/core-platform": {
       "instance": "work",
       "project": "core-platform",
-      "client": "ООО «Пример»",
+      "client": "Example GmbH",
       "activity": "Программирование",
       "tracker": "Разработка"
     }
