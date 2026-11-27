@@ -1,5 +1,5 @@
 /**
- * Замер присутствия по транскриптам сессий Claude Code.
+ * Замер присутствия по транскриптам сессий Claude Code и Codex.
  *
  * Сестра `harvest`: та меряет по окнам коммитов, эта — по сообщениям человека. Нужна для работы,
  * не оставившей следа в git: разбор, постановка задач, переписка с заказчиком, настройка систем.
@@ -35,7 +35,11 @@ export type HumanMessage = {
   uuid: string;
   session: string;
   cwd: string;
+  /** Чей транскрипт: Claude Code или Codex. Замер общий, источник виден в выводе. */
+  client: Client;
 };
+
+export type Client = "claude" | "codex";
 
 export type Block = {
   start: string;
@@ -170,7 +174,7 @@ export function cleanText(raw: string): string {
 }
 
 /** Файлы транскриптов сессий: ровно один уровень вложенности, ничего глубже. */
-export async function sessionFiles(home: string): Promise<string[]> {
+export async function claudeSessionFiles(home: string): Promise<string[]> {
   const root = `${home}/.claude/projects`;
   const out: string[] = [];
   const { readdirSync, existsSync } = await import("node:fs");
@@ -184,7 +188,7 @@ export async function sessionFiles(home: string): Promise<string[]> {
   return out.sort();
 }
 
-export async function readHumanMessages(files: string[]): Promise<{ messages: HumanMessage[]; duplicates: number }> {
+export async function readClaudeMessages(files: string[]): Promise<{ messages: HumanMessage[]; duplicates: number }> {
   const seen = new Set<string>();
   const messages: HumanMessage[] = [];
   let duplicates = 0;
@@ -215,11 +219,152 @@ export async function readHumanMessages(files: string[]): Promise<{ messages: Hu
         uuid,
         session: String(r.sessionId ?? ""),
         cwd: String(r.cwd ?? ""),
+        client: "claude",
       });
     }
   }
   messages.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
   return { messages, duplicates };
+}
+
+
+// ── Codex ─────────────────────────────────────────────────────────────
+//
+// Формат замерен на живом каталоге ~/.codex/sessions (Codex Desktop и расширение VS Code,
+// версии 0.154–0.171, 19 файлов), а не взят из описания:
+//
+//   - Файлы лежат по датам: sessions/ГГГГ/ММ/ДД/rollout-*.jsonl. Обход рекурсивный, но берутся
+//     только rollout-*.jsonl.
+//   - Подагенты пишут СВОИ файлы, и в заголовке session_meta у них source — объект
+//     ({subagent: …}), у человека — строка. На замерянной машине 13 файлов из 19 — подагенты
+//     проверки; их 179 «реплик пользователя» — промпты подагенту, а не человек.
+//   - Реплика человека — событие item_completed с item.type = "UserMessage". Записи
+//     response_item с ролью user для счёта не годятся: в них же приходят вставки окружения
+//     (environment_context, AGENTS.md, контекст редактора) — 251 запись против 98 настоящих.
+//   - Ответ человека на вопрос ассистента приходит той же UserMessage в обёртке
+//     <send_user_message_question_reply> с JSON внутри: это действие человека, оно считается,
+//     а текстом служат сами ответы.
+//   - Приложенные файлы дают префикс «# Files mentioned by the user: … ## My request:»: текст
+//     человека — после него.
+
+/** Файлы транскриптов Codex: sessions/ГГГГ/ММ/ДД/rollout-*.jsonl. */
+export async function codexSessionFiles(home: string): Promise<string[]> {
+  const root = `${home}/.codex/sessions`;
+  const { readdirSync, existsSync } = await import("node:fs");
+  if (!existsSync(root)) return [];
+  const out: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = `${dir}/${entry.name}`;
+      if (entry.isDirectory() && depth < 3) walk(path, depth + 1);
+      else if (entry.isFile() && entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl")) out.push(path);
+    }
+  };
+  walk(root, 0);
+  return out.sort();
+}
+
+type CodexLine = {
+  timestamp?: unknown;
+  type?: unknown;
+  payload?: {
+    type?: unknown;
+    id?: unknown;
+    cwd?: unknown;
+    source?: unknown;
+    item?: { type?: unknown; id?: unknown; content?: unknown };
+  };
+};
+
+/** Заголовок сессии Codex: подагент или человек. У подагента source — объект. */
+export function isCodexSubagentMeta(line: unknown): boolean {
+  const r = line as CodexLine;
+  return r?.type === "session_meta" && typeof r.payload?.source === "object" && r.payload?.source !== null;
+}
+
+/** Реплика человека в Codex: событие item_completed с UserMessage и временем. */
+export function isCodexHumanLine(line: unknown): boolean {
+  if (typeof line !== "object" || line === null) return false;
+  const r = line as CodexLine;
+  if (r.type !== "event_msg") return false;
+  if (r.payload?.type !== "item_completed") return false;
+  if (r.payload?.item?.type !== "UserMessage") return false;
+  return typeof r.timestamp === "string" && r.timestamp !== "";
+}
+
+/** Текст реплики Codex: части text, ответы на вопросы и запрос после списка файлов. */
+export function codexText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  const raw = content
+    .map((p) => (typeof p === "object" && p !== null && (p as { type?: string }).type === "text" ? String((p as { text?: string }).text ?? "") : ""))
+    .join("");
+  const reply = raw.match(/<send_user_message_question_reply>([\s\S]*?)(?:<\/send_user_message_question_reply>|$)/);
+  if (reply) {
+    try {
+      const items = JSON.parse(reply[1]!.trim()) as { answer?: unknown }[];
+      return items.map((i) => String(i.answer ?? "")).filter(Boolean).join(" · ");
+    } catch {
+      return ""; // Обёртка без читаемого JSON — человеческого текста в ней не найти.
+    }
+  }
+  const marker = "## My request:";
+  const at = raw.indexOf(marker);
+  if (raw.trimStart().startsWith("# Files mentioned by the user") && at !== -1) return raw.slice(at + marker.length).trim();
+  return raw.trim();
+}
+
+export async function readCodexMessages(files: string[]): Promise<{ messages: HumanMessage[]; duplicates: number }> {
+  const seen = new Set<string>();
+  const messages: HumanMessage[] = [];
+  let duplicates = 0;
+  for (const path of files) {
+    let session = "";
+    let cwd = "";
+    let subagent = false;
+    for (const line of (await Bun.file(path).text()).split("\n")) {
+      if (!line.startsWith("{")) continue;
+      let record: unknown;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const r = record as CodexLine;
+      if (r.type === "session_meta") {
+        subagent = isCodexSubagentMeta(r);
+        session = String(r.payload?.id ?? "");
+        cwd = String(r.payload?.cwd ?? "");
+        continue;
+      }
+      if (subagent || !isCodexHumanLine(r)) continue;
+      const id = String(r.payload?.item?.id ?? "");
+      if (id && seen.has(id)) {
+        duplicates++;
+        continue;
+      }
+      if (id) seen.add(id);
+      const text = cleanText(codexText(r.payload?.item?.content));
+      if (!text) continue;
+      messages.push({ ts: String(r.timestamp), text, uuid: id, session, cwd, client: "codex" });
+    }
+  }
+  return { messages, duplicates };
+}
+
+/** Все транскрипты обоих клиентов, отобранные по --client. */
+export async function sessionFiles(home: string, clients: Client[]): Promise<{ claude: string[]; codex: string[] }> {
+  return {
+    claude: clients.includes("claude") ? await claudeSessionFiles(home) : [],
+    codex: clients.includes("codex") ? await codexSessionFiles(home) : [],
+  };
+}
+
+/** Сообщения человека из обоих клиентов, по времени. */
+export async function readHumanMessages(files: { claude: string[]; codex: string[] }): Promise<{ messages: HumanMessage[]; duplicates: number }> {
+  const a = await readClaudeMessages(files.claude);
+  const b = await readCodexMessages(files.codex);
+  const messages = [...a.messages, ...b.messages].sort((x, y) => (x.ts < y.ts ? -1 : x.ts > y.ts ? 1 : 0));
+  return { messages, duplicates: a.duplicates + b.duplicates };
 }
 
 /**

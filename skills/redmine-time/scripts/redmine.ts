@@ -12,7 +12,7 @@ import { mkdir, readdir, readFile, rm as removePath, stat, writeFile } from "nod
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { guard, scanText, formatFindings, type Audience, type Finding } from "./guard.ts";
 import { harvestRepo, isGitRepo, repoName, draftDescription, plural, type RepoBinding } from "./harvest.ts";
-import { sessionFiles, readHumanMessages, buildBlocks, summarize, localDay, localTime } from "./sessions.ts";
+import { sessionFiles, readHumanMessages, buildBlocks, summarize, localDay, localTime, type Client } from "./sessions.ts";
 
 // ─────────────────────────────── конфиг ───────────────────────────────
 
@@ -806,7 +806,7 @@ export function slugIdentifier(name: string): string {
  * Что не так с идентификатором, или null — если он годится.
  * Правило ровно то же, что у самого Redmine: строчная латиница, цифры, дефис и подчёркивание,
  * не длиннее 100 символов, и запрещён только идентификатор из одних цифр — он неотличим от id
- * проекта в адресе. Цифра в начале при этом допустима: «33 Решения» → `33-resheniya`.
+ * проекта в адресе. Цифра в начале при этом допустима: «33 Склада» → `33-sklada`.
  */
 export function identifierProblem(identifier: string): string | null {
   if (identifier.length === 0) return "он пустой";
@@ -5858,7 +5858,7 @@ async function cmdUnrelate(rm: Resolved, args: Args): Promise<void> {
 
 async function cmdXref(rm: Resolved, args: Args): Promise<void> {
   const raw = args.positional[0] ?? str(args, "issue");
-  if (!raw) throw new UserError("Укажите задачу: redmine.ts xref 25185 --instance ru");
+  if (!raw) throw new UserError("Укажите задачу: redmine.ts xref 25185 --instance company");
   const known = await instanceRefs();
   const ref = parseIssueRef(raw, known);
   if (ref.foreignHost) {
@@ -6902,6 +6902,12 @@ async function cmdRepos(args: Args): Promise<void> {
   );
 }
 
+/** Сообщения по клиентам: видно, сколько замера дал каждый. */
+function byClient(messages: { client: Client }[]): string {
+  const claude = messages.filter((m) => m.client === "claude").length;
+  return `сообщений Claude Code ${claude}, Codex ${messages.length - claude}`;
+}
+
 /**
  * Присутствие по транскриптам сессий.
  *
@@ -6912,9 +6918,19 @@ async function cmdRepos(args: Args): Promise<void> {
 async function cmdSessions(args: Args): Promise<void> {
   const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
   const gap = num(args, "gap") ?? 90;
-  const files = await sessionFiles(home);
-  if (files.length === 0) {
-    throw new UserError(`Транскрипты сессий не найдены: ${home}/.claude/projects/*/*.jsonl`);
+  const clientArg = str(args, "tool") ?? "all";
+  const clients: Client[] =
+    clientArg === "all" ? ["claude", "codex"] : clientArg === "claude" || clientArg === "codex" ? [clientArg] : [];
+  if (clients.length === 0) throw new UserError(`--tool принимает claude, codex или all, получено: ${clientArg}`);
+  const files = await sessionFiles(home, clients);
+  const fileCount = files.claude.length + files.codex.length;
+  if (fileCount === 0) {
+    throw new UserError(
+      "Транскрипты сессий не найдены: " +
+        [clients.includes("claude") ? `${home}/.claude/projects/*/*.jsonl` : "", clients.includes("codex") ? `${home}/.codex/sessions/ГГГГ/ММ/ДД/rollout-*.jsonl` : ""]
+          .filter(Boolean)
+          .join(", "),
+    );
   }
 
   const { messages, duplicates } = await readHumanMessages(files);
@@ -6954,7 +6970,8 @@ async function cmdSessions(args: Args): Promise<void> {
         ["Блоков", `${sum.blocks} (порог перерыва ${gap} мин)`],
         ["Из них без длительности", `${sum.emptyBlocks} — одно сообщение, присутствие не измеряется`],
         ["Сессий", String(sum.sessions)],
-        ["Файлов прочитано", String(files.length)],
+        ["Из них по клиентам", byClient(inRange)],
+        ["Файлов прочитано", `${fileCount} (Claude Code ${files.claude.length}, Codex ${files.codex.length})`],
         ["Повторов отброшено", String(sum.duplicates)],
       ]);
 
@@ -9376,7 +9393,7 @@ Wiki проекта
               [--activity <вид>] [--tracker <трекер>] | repos remove --key <ключ>
   harvest [--repo <путь>] [--period week] [--author me|all|<почта>] [--gap 90] [--min 0.5] [--out <каталог>]
         коммиты за период → куда списать часы и какие задачи завести (черновик, требует правки)
-  sessions [--period week|месяц|A..B] [--gap 90] [--blocks] [--messages]
+  sessions [--period week|месяц|A..B] [--gap 90] [--tool all|claude|codex] [--blocks] [--messages]
         присутствие по сообщениям человека в сессиях: для работы, не оставившей следа в git.
         Это МЕРА ПРИСУТСТВИЯ: блок из одного сообщения даёт ноль, и такие блоки считаются отдельно
 

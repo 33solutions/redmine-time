@@ -57,14 +57,19 @@ jobs:
         run: |
           VERSION="$(cat VERSION)"
           PLUGIN="$(jq -r .version .claude-plugin/plugin.json)"
+          PORTABLE="$(jq -r .version plugin.json)"
+          if [ "$PORTABLE" != "$VERSION" ]; then
+            echo "В plugin.json версия ${PORTABLE}, а в VERSION — ${VERSION}: поднимайте их вместе." >&2
+            exit 1
+          fi
           if [ "$PLUGIN" != "$VERSION" ]; then
             echo "В .claude-plugin/plugin.json версия ${PLUGIN}, а в VERSION — ${VERSION}: витрина увидела бы старую." >&2
             exit 1
           fi
           bun add -d typescript bun-types
           bunx tsc --noEmit
-          bun scripts/selftest.ts
-          bun scripts/audit-repo.ts --history
+          bun skills/redmine-time/scripts/selftest.ts
+          bun skills/redmine-time/scripts/audit-repo.ts --history
 
       - name: Заметки к релизу из журнала изменений
         if: steps.meta.outputs.exists == 'false'
@@ -83,16 +88,17 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "Установка:"
+            echo "Установка в Claude Code:"
             echo ""
-            echo '```bash'
-            echo "git clone https://github.com/${GITHUB_REPOSITORY}.git ~/.claude/skills/redmine-time"
+            echo '```'
+            echo "claude plugin marketplace add 33solutions/claude-skills"
+            echo "claude plugin install redmine-time@33solutions"
             echo '```'
             echo ""
-            echo "Обновление уже установленного скилла:"
+            echo "Установка в Codex:"
             echo ""
-            echo '```bash'
-            echo "bun ~/.claude/skills/redmine-time/scripts/update.ts --apply"
+            echo '```'
+            echo "codex plugin marketplace add 33solutions/codex-skills"
             echo '```'
           } >> RELEASE_NOTES.md
           cat RELEASE_NOTES.md

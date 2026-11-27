@@ -17,13 +17,13 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 /** Файлы с намеренными примерами: там «секреты» синтетические и нужны для тестов, правил и документации. */
-const FIXTURE_FILES = new Set([
-  "scripts/selftest.ts",
-  "scripts/guard.ts",
-  "scripts/audit-repo.ts",
-  "references/safety.md",
-  "references/editorial.md",
-]);
+const FIXTURE_FILES = new Set(
+  // Пути и в нынешней раскладке, и в прежней (до 2.0.0 скилл лежал в корне): аудит истории
+  // встречает файлы по тем путям, что были на момент коммита.
+  ["scripts/selftest.ts", "scripts/guard.ts", "scripts/audit-repo.ts", "references/safety.md", "references/editorial.md"].flatMap(
+    (f) => [f, `skills/redmine-time/${f}`],
+  ),
+);
 
 /**
  * В исходном коде «pwd: value» — это имя поля, а не утечка, поэтому к коду применяются
@@ -99,12 +99,24 @@ const INTERNAL_ALLOW = (auditConfig.allow ?? []).map((source) => new RegExp(sour
  * разрешений в секрете для этого не нужен (его значения не прочитать, а перезапись стёрла бы их).
  */
 const SKILL_NAME = await (async (): Promise<string | null> => {
-  const file = Bun.file("SKILL.md");
+  const file = Bun.file("skills/redmine-time/SKILL.md");
   if (!(await file.exists())) return null;
   const head = (await file.text()).match(/^---\s*\n([\s\S]*?)\n---/);
   const name = head?.[1]?.match(/^name:\s*["']?([\w.-]+)["']?\s*$/m)?.[1];
   return name ?? null;
 })();
+
+/**
+ * Корень домена без поддомена и без пути — публичный сайт правообладателя: он стоит в LICENSE
+ * и в манифестах плагина как адрес автора. Внутренние сервисы живут на поддоменах
+ * (трекер, база знаний), и любое их упоминание — по-прежнему находка, как и любой путь на корне.
+ */
+const INTERNAL_APEX = new Set((auditConfig.internalDomains ?? []).map((d) => d.toLowerCase()));
+function isPublicSite(text: string, match: string, matchEnd: number): boolean {
+  if (!INTERNAL_APEX.has(match.toLowerCase())) return false;
+  const next = text.slice(matchEnd, matchEnd + 2);
+  return !/^\/[\w%~-]/.test(next) && !/^[\w-]/.test(next);
+}
 
 function isSelfLink(text: string, matchEnd: number): boolean {
   return SKILL_NAME !== null && text.startsWith(`/doc/${SKILL_NAME}-`, matchEnd);
@@ -175,6 +187,7 @@ for (const file of files) {
       const around = text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 20);
       if (INTERNAL_ALLOW.some((re) => re.test(around))) continue;
       if (isSelfLink(text, m.index + m[0].length)) continue;
+      if (isPublicSite(text, m[0], m.index + m[0].length)) continue;
       const line = text.slice(0, m.index).split("\n").length;
       problems.push({ file, line, title, detail: m[0] });
     }
@@ -227,6 +240,8 @@ if (process.argv.includes("--history")) {
         const around = text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 20);
         if (INTERNAL_ALLOW.some((re) => re.test(around))) continue;
         if (isSelfLink(text, m.index + m[0].length)) continue;
+        if (isPublicSite(text, m[0], m.index + m[0].length)) continue;
+      if (isPublicSite(text, m[0], m.index + m[0].length)) continue;
         const line = text.slice(0, m.index).split("\n").length;
         problems.push({ file: `история ${where}`, line, title, detail: m[0] });
       }

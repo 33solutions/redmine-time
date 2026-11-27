@@ -10,7 +10,7 @@ import { buildSessions, buildGroups, plural, draftDescription, type Commit } fro
 import { categorize, monthsSince } from "./redmine.ts";
 import { translit, slugIdentifier, identifierProblem } from "./redmine.ts";
 import { explainTimeEntryRejection } from "./redmine.ts";
-import { isHumanRecord, isQueuedHumanRecord, recordText, cleanText, buildBlocks, summarize, type HumanMessage } from "./sessions.ts";
+import { isHumanRecord, isQueuedHumanRecord, recordText, cleanText, buildBlocks, summarize, isCodexHumanLine, isCodexSubagentMeta, codexText, type HumanMessage } from "./sessions.ts";
 import { parseFieldSpec, assignProjectFields, type ProjectField } from "./redmine.ts";
 import { dayTotals, loadWarnings, reconcileHours } from "./redmine.ts";
 import {
@@ -468,7 +468,7 @@ check("идентификатор: края без дефисов", slugIdentifi
 check("идентификатор: длина обрезается", slugIdentifier("а".repeat(120)).length, 100);
 check("идентификатор: хвостовой дефис после обрезки", slugIdentifier("х".repeat(99) + " слово").endsWith("-"), false);
 
-check("идентификатор: название из цифр и слова", slugIdentifier("33 Решения"), "33-resheniya");
+check("идентификатор: название из цифр и слова", slugIdentifier("33 Склада"), "33-sklada");
 
 check("проверка: обычный", identifierProblem("primer-unf_2"), null);
 check("проверка: пустой", identifierProblem("") !== null, true);
@@ -717,7 +717,7 @@ check(
 // ── ссылки на задачи и второй инстанс ─────────────────────────────────
 const known = [
   { name: "company", base: "https://redmine.example.com/" },
-  { name: "ru", base: "https://tracker.example.ru/redmine/" },
+  { name: "ru", base: "https://tracker.example.com/redmine/" },
 ];
 
 check("ссылка: голый номер", parseIssueRef("1234", known), { id: 1234, raw: "1234" });
@@ -733,10 +733,10 @@ check("ссылка: профиль и решётка", parseIssueRef("company:#
   raw: "company:#42",
 });
 check("ссылка: профиль по началу имени", parseIssueRef("comp:42", known).instance, "company");
-check("ссылка: адрес известного инстанса", parseIssueRef("https://tracker.example.ru/redmine/issues/25185", known), {
+check("ссылка: адрес известного инстанса", parseIssueRef("https://tracker.example.com/redmine/issues/25185", known), {
   id: 25185,
   instance: "ru",
-  raw: "https://tracker.example.ru/redmine/issues/25185",
+  raw: "https://tracker.example.com/redmine/issues/25185",
 });
 check(
   "ссылка: адрес с якорем комментария",
@@ -759,19 +759,19 @@ checkThrows("ссылка: не ссылка вовсе", () => parseIssueRef("�
 checkThrows("ссылка: пустая строка", () => parseIssueRef("   ", known));
 
 // Ссылка на второй инстанс не должна потеряться в тексте описания или комментария.
-const others = [{ name: "ru", base: "https://tracker.example.ru/redmine/" }];
+const others = [{ name: "ru", base: "https://tracker.example.com/redmine/" }];
 check(
   "перекрёстные ссылки: находятся в html",
   findCrossInstanceRefs(
-    '<p>Внедрение: <a href="https://tracker.example.ru/redmine/issues/25185">33 Решения #25185</a></p>',
+    '<p>Внедрение: <a href="https://tracker.example.com/redmine/issues/25185">33 Solutions #25185</a></p>',
     others,
   ),
-  [{ instance: "ru", id: 25185, url: "https://tracker.example.ru/redmine/issues/25185" }],
+  [{ instance: "ru", id: 25185, url: "https://tracker.example.com/redmine/issues/25185" }],
 );
 check(
   "перекрёстные ссылки: повтор считается один раз",
   findCrossInstanceRefs(
-    "https://tracker.example.ru/redmine/issues/25185 и ещё раз https://tracker.example.ru/redmine/issues/25185#note-2",
+    "https://tracker.example.com/redmine/issues/25185 и ещё раз https://tracker.example.com/redmine/issues/25185#note-2",
     others,
   ).length,
   1,
@@ -783,47 +783,47 @@ check(
 );
 check(
   "перекрёстные ссылки: адрес проекта — не задача",
-  findCrossInstanceRefs("https://tracker.example.ru/redmine/projects/core", others),
+  findCrossInstanceRefs("https://tracker.example.com/redmine/projects/core", others),
   [],
 );
 check("перекрёстные ссылки: нечего искать без профилей", findCrossInstanceRefs("https://любой/issues/1", []), []);
 check(
   "перекрёстные ссылки: точка в конце предложения не ломает разбор",
-  findCrossInstanceRefs("Подробности в https://tracker.example.ru/redmine/issues/7.", others)[0]?.id,
+  findCrossInstanceRefs("Подробности в https://tracker.example.com/redmine/issues/7.", others)[0]?.id,
   7,
 );
 
 // Строка перекрёстной ссылки: номер без адреса на другом инстансе указывает на чужую задачу.
 const xref = {
-  url: "https://tracker.example.ru/redmine/issues/25185",
+  url: "https://tracker.example.com/redmine/issues/25185",
   id: 25185,
-  project: "33 Решения",
+  project: "33 Solutions",
   subject: "Панель контроля менеджеров: оперативное ядро платформы",
 };
 check(
   "xref: подпись с названием проекта",
   xrefLabel(xref.project, xref.id, xref.subject),
-  "33 Решения #25185 — Панель контроля менеджеров: оперативное ядро платформы",
+  "33 Solutions #25185 — Панель контроля менеджеров: оперативное ядро платформы",
 );
 check(
   "xref: html",
   formatXref(xref),
-  '<a href="https://tracker.example.ru/redmine/issues/25185">33 Решения #25185 — Панель контроля менеджеров: оперативное ядро платформы</a>',
+  '<a href="https://tracker.example.com/redmine/issues/25185">33 Solutions #25185 — Панель контроля менеджеров: оперативное ядро платформы</a>',
 );
 check(
   "xref: markdown",
   formatXref(xref, "markdown"),
-  "[33 Решения #25185 — Панель контроля менеджеров: оперативное ядро платформы](https://tracker.example.ru/redmine/issues/25185)",
+  "[33 Solutions #25185 — Панель контроля менеджеров: оперативное ядро платформы](https://tracker.example.com/redmine/issues/25185)",
 );
 check(
   "xref: textile",
   formatXref(xref, "textile"),
-  '"33 Решения #25185 — Панель контроля менеджеров: оперативное ядро платформы":https://tracker.example.ru/redmine/issues/25185',
+  '"33 Solutions #25185 — Панель контроля менеджеров: оперативное ядро платформы":https://tracker.example.com/redmine/issues/25185',
 );
 check(
   "xref: разметка темы не ломает ссылку",
   formatXref({ ...xref, subject: 'Обмен <b>«ЮЛ & ИП»</b>' }),
-  '<a href="https://tracker.example.ru/redmine/issues/25185">33 Решения #25185 — Обмен &lt;b&gt;«ЮЛ &amp; ИП»&lt;/b&gt;</a>',
+  '<a href="https://tracker.example.com/redmine/issues/25185">33 Solutions #25185 — Обмен &lt;b&gt;«ЮЛ &amp; ИП»&lt;/b&gt;</a>',
 );
 check("xref: адрес в строке есть всегда", formatXref(xref).includes(xref.url), true);
 
@@ -1291,7 +1291,7 @@ check("wiki: первая буква заглавная", wikiTitle("как_по
 check("wiki: знаки , . / ? ; | : удаляются", wikiTitle("Итоги: 2026/09, v1.2?"), "Итоги_202609_v12");
 check(
   "wiki: название из адреса страницы",
-  wikiTitle("https://redmine.example.ru/projects/x/wiki/%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%BA%D0%B0"),
+  wikiTitle("https://redmine.example.com/projects/x/wiki/%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%BA%D0%B0"),
   "Поддержка",
 );
 checkThrows("wiki: пустое название", () => wikiTitle(" ./ "));
@@ -2056,6 +2056,34 @@ check("сверка вехи: инстанс не отдал статус — н
   check("whoami: известные поля сохранены", safe, { id: 5, login: "ivanov", firstname: "Иван", lastname: "Иванов", mail: "i@example.com", admin: false });
 }
 
+// ── замер присутствия по сессиям Codex ────────────────────────────────
+{
+  // Формат замерен на живом каталоге ~/.codex/sessions: см. комментарий в sessions.ts.
+  const line = {
+    timestamp: "2026-11-27T09:00:00.000Z", type: "event_msg",
+    payload: { type: "item_completed", item: { type: "UserMessage", id: "u1", content: [{ type: "text", text: "обнови список" }] } },
+  };
+  check("codex: реплика человека принимается", isCodexHumanLine(line), true);
+  check("codex: ответ ассистента отвергается", isCodexHumanLine({ ...line, payload: { ...line.payload, item: { ...line.payload.item, type: "AgentMessage" } } }), false);
+  check("codex: другое событие отвергается", isCodexHumanLine({ ...line, payload: { ...line.payload, type: "task_started" } }), false);
+  // Вставки окружения приходят записями response_item — их считать нельзя.
+  check("codex: response_item не считается", isCodexHumanLine({ ...line, type: "response_item" }), false);
+  check("codex: запись без времени отвергается", isCodexHumanLine({ ...line, timestamp: undefined }), false);
+  check("codex: подагент распознаётся по source-объекту",
+    isCodexSubagentMeta({ type: "session_meta", payload: { source: { subagent: { other: "guardian" } } } }), true);
+  check("codex: сессия человека — source-строка",
+    isCodexSubagentMeta({ type: "session_meta", payload: { source: "vscode" } }), false);
+  check("codex: текст реплики", codexText(line.payload.item.content), "обнови список");
+  check("codex: ответ на вопрос — это ответы",
+    codexText([{ type: "text", text: '<send_user_message_question_reply>\n[{"question":"Язык?","answer":"Только русский"},{"question":"Объём?","answer":"демо"}]\n</send_user_message_question_reply>' }]),
+    "Только русский · демо");
+  check("codex: обёртка с битым JSON даёт пустой текст",
+    codexText([{ type: "text", text: "<send_user_message_question_reply>не json</send_user_message_question_reply>" }]), "");
+  check("codex: после списка файлов берётся запрос",
+    codexText([{ type: "text", text: "\n# Files mentioned by the user:\n\n## a.png: C:/a.png\n\n## My request:\n\nчто на скрине" }]), "что на скрине");
+  check("codex: картинка без текста даёт пустой текст", codexText([{ type: "local_image", path: "a.png" }]), "");
+}
+
 // ── замер присутствия по сессиям ──────────────────────────────────────
 {
   const human = {
@@ -2122,7 +2150,7 @@ check("сверка вехи: инстанс не отдал статус — н
       cleanText("смотри <pasted_content id=\"1\">много текста</pasted_content> вот это").includes("вот это") &&
       !cleanText("смотри <pasted_content id=\"1\">много текста</pasted_content> вот это").includes("много текста"), true);
 
-  const msg = (ts: string): HumanMessage => ({ ts, text: "x", uuid: ts, session: "s", cwd: "" });
+  const msg = (ts: string): HumanMessage => ({ ts, text: "x", uuid: ts, session: "s", cwd: "", client: "claude" });
   const blocks = buildBlocks([msg("2026-09-24T10:00:00Z"), msg("2026-09-24T10:30:00Z"), msg("2026-09-24T14:00:00Z")], 90);
   check("сессии: перерыв больше порога начинает новый блок", blocks.length, 2);
   check("сессии: длительность блока — от первого до последнего", blocks[0]!.hours, 0.5);

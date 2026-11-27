@@ -13,5 +13,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["scripts/**/*.ts"]
+  "include": ["skills/redmine-time/scripts/**/*.ts"]
 }
