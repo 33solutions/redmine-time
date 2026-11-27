@@ -3,8 +3,8 @@
   "description": "Redmine: задачи и трудозатраты. Списание часов с замером, задачи и деревья подзадач, файлы к задачам, отчёты по списанному и недобору, входящие и сроки, участники и роли, wiki проекта. Любой уходящий текст проверяется на секреты, персональные данные и внутреннюю кухню до отправки.",
   "version": "2.0.0",
   "author": {
-    "name": "33 Solutions Company Limited",
-    "url": "https://33solutions.company"
+    "name": "Andrew Berlin",
+    "url": "https://github.com/the-berlin"
   },
   "homepage": "https://github.com/33solutions/redmine-time",
   "repository": "https://github.com/33solutions/redmine-time",
