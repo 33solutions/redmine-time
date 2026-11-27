@@ -313,8 +313,6 @@ bun $R pending drop p4 --why "дубль"     # убрать, ничего не 
 
 ```powershell
 $R = "<каталог скилла>\scripts\redmine.ts"
-edmine.ts"
-edmine.ts"
 Set-Content c.txt "Разбор выгрузки и сверка остатков" -Encoding utf8
 bun $R log --issue 1234 --hours 2 --comment-file c.txt --yes
 ```
